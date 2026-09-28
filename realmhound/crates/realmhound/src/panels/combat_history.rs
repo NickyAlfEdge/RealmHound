@@ -13,7 +13,9 @@ use std::time::Instant;
 use chrono::{Local, TimeZone, Utc};
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
-    assets::{get_asset_manager, get_dungeon_portal_map, BossGroup, CatalogEntry},
+    assets::{
+        get_asset_manager, get_dungeon_portal_map, is_hp_uncapped_boss, BossGroup, CatalogEntry,
+    },
     combat::{
         build_bundle, sanitize_player_name, CombatDatabase, DamageProvenance,
         DamageTakenProvenance, EncounterRecord, FightQuery, FightRecord, FightSelection,
@@ -39,6 +41,59 @@ const CARD_HEIGHT: f32 = 52.0;
 /// damage column. The Messenger aux representative (45365) is
 /// excluded since guard damage is only tracked on the main O3 body.
 const O3_BOSS_TYPE: i32 = 45363;
+
+/// Boss starting HP a fight's damage shares reconcile against, or 0 when the HP
+/// is not a real damage pool. Moonlight Village mechanics bosses floor
+/// invulnerable and are scored by a completion marker instead of a death, so
+/// their nominal max HP is never removed; a 0 pool makes the participant table
+/// show each player's raw share of the tracked total rather than a fraction of
+/// that fake pool (and suppresses the "Unattributed" HP-gap row).
+fn share_hp_pool(boss_object_type: i32, boss_start_hp: i32) -> i64 {
+    if is_hp_uncapped_boss(boss_object_type) {
+        0
+    } else {
+        boss_start_hp as i64
+    }
+}
+
+/// The overlaid text on a boss HP bar. An uncapped boss (Moonlight Village
+/// mechanics boss) has no finite pool, so it reads `<party damage> / ∞`;
+/// ordinary bosses read `<start HP> / <max HP>`, or nothing when no HP was ever
+/// registered.
+fn boss_bar_label(
+    boss_object_type: i32,
+    start_hp: i64,
+    max_hp: i64,
+    damage: i64,
+) -> Option<String> {
+    if is_hp_uncapped_boss(boss_object_type) {
+        Some(format!("{} / ∞", fmt_thousands(damage)))
+    } else if max_hp > 0 {
+        Some(format!(
+            "{} / {}",
+            fmt_thousands(start_hp),
+            fmt_thousands(max_hp)
+        ))
+    } else {
+        None
+    }
+}
+
+/// The HP segment of a boss row header in a grouped encounter. An uncapped boss
+/// has no finite HP, so its row shows the party's total damage instead of an HP
+/// fraction.
+fn boss_row_hp_label(
+    boss_object_type: i32,
+    boss_start_hp: i32,
+    boss_max_hp: i32,
+    damage: i64,
+) -> String {
+    if is_hp_uncapped_boss(boss_object_type) {
+        format!("Damage {}", fmt_thousands(damage))
+    } else {
+        format!("HP {}/{}", boss_start_hp, boss_max_hp)
+    }
+}
 
 /// Cached autocomplete data (distinct bosses/dungeons) for search suggestions.
 #[derive(Default)]
@@ -2260,6 +2315,7 @@ impl CombatHistoryPanel {
                     fight.boss_object_type,
                     fight.boss_start_hp as i64,
                     fight.boss_max_hp as i64,
+                    fight.total_damage(),
                 );
 
                 ui.add_space(6.0);
@@ -2383,7 +2439,7 @@ impl CombatHistoryPanel {
                     ctx,
                     &fight.participants,
                     "combat_detail_table",
-                    fight.boss_start_hp as i64,
+                    share_hp_pool(fight.boss_object_type, fight.boss_start_hp),
                     fight.killed,
                     !fight.killed,
                     fight.boss_object_type == O3_BOSS_TYPE,
@@ -2496,6 +2552,12 @@ impl CombatHistoryPanel {
     /// yellow diamond + boss portrait overlapping the bar's right end. Returns
     /// the x offset (from the left edge) where the bar starts, so the meta text
     /// below can be aligned with it.
+    ///
+    /// Moonlight Village mechanics bosses have no finite HP pool (they floor
+    /// invulnerable and are cleared by the encounter's own mechanic), so their
+    /// bar is drawn full green and labelled `<party damage> / ∞` instead of a
+    /// start/max HP fraction. `damage` is the total damage dealt by every
+    /// participant, used only for that label.
     fn draw_boss_hp_bar(
         &self,
         ui: &mut egui::Ui,
@@ -2504,6 +2566,7 @@ impl CombatHistoryPanel {
         boss_type: i32,
         start_hp: i64,
         max_hp: i64,
+        damage: i64,
     ) -> f32 {
         const YELLOW: Color32 = Color32::from_rgb(0xff, 0xc1, 0x00);
         const DARK_YELLOW: Color32 = Color32::from_rgb(0xab, 0x83, 0x00);
@@ -2546,8 +2609,12 @@ impl CombatHistoryPanel {
         // Dark background for the whole bar.
         painter.rect_filled(bar_rect, ROUNDING, DARK_BG);
 
-        // Colored fill proportional to discovered/max HP.
-        let frac = if max_hp > 0 {
+        // Colored fill proportional to discovered/max HP. An uncapped boss has no
+        // finite pool, so its bar is drawn full as an "infinite" bar.
+        let uncapped = is_hp_uncapped_boss(boss_type);
+        let frac = if uncapped {
+            1.0
+        } else if max_hp > 0 {
             (start_hp as f32 / max_hp as f32).clamp(0.0, 1.0)
         } else {
             0.0
@@ -2576,9 +2643,9 @@ impl CombatHistoryPanel {
         );
 
         // HP numbers, centered in the bar area left of the diamond: yellow text
-        // with a 1px black outline.
-        if max_hp > 0 {
-            let text = format!("{} / {}", fmt_thousands(start_hp), fmt_thousands(max_hp));
+        // with a 1px black outline. An uncapped boss reads "<damage> / ∞": the
+        // party's total damage against an unlimited pool.
+        if let Some(text) = boss_bar_label(boss_type, start_hp, max_hp, damage) {
             let font = egui::FontId::proportional(15.0);
             let text_cx = (bar_rect.left() + (bar_rect.right() - DIAMOND * 0.5)) * 0.5;
             let center = egui::pos2(text_cx, bar_rect.center().y);
@@ -2620,9 +2687,13 @@ impl CombatHistoryPanel {
             ui.id().with("boss_hp_bar_tooltip"),
             egui::Sense::hover(),
         );
-        bar_resp.hover_tip(
-            "Boss's HP at the start of the fight / Boss's max HP registered during the fight",
-        );
+        bar_resp.hover_tip(if uncapped {
+            "This boss never loses HP -- it is cleared by the encounter's own \
+             mechanic -- so its HP is effectively infinite. The number shown is \
+             the total damage dealt by the party."
+        } else {
+            "Boss's HP at the start of the fight / Boss's max HP registered during the fight"
+        });
 
         bar_inset
     }
@@ -3306,12 +3377,18 @@ impl CombatHistoryPanel {
                 let portal_id = portal_map.get_portal_id(&enc.dungeon).unwrap_or(0);
 
                 // The HP bar reflects the main boss identified above.
-                let (anchor_start, anchor_max) = enc
+                let (anchor_start, anchor_max, anchor_damage) = enc
                     .phases
                     .iter()
                     .find(|p| Some(p.id) == anchor_id)
-                    .map(|p| (p.boss_start_hp as i64, p.boss_max_hp as i64))
-                    .unwrap_or((0, 0));
+                    .map(|p| {
+                        (
+                            p.boss_start_hp as i64,
+                            p.boss_max_hp as i64,
+                            p.total_damage(),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0));
 
                 let bar_inset = self.draw_boss_hp_bar(
                     ui,
@@ -3320,6 +3397,7 @@ impl CombatHistoryPanel {
                     icon_type,
                     anchor_start,
                     anchor_max,
+                    anchor_damage,
                 );
 
                 ui.add_space(6.0);
@@ -3479,14 +3557,21 @@ impl CombatHistoryPanel {
                     } else {
                         ("Escaped", Color32::GRAY)
                     };
+                    let phase_name = match phase.aux_member_count {
+                        Some(count) if count > 0 => format!("{} x{count}", phase.boss_name),
+                        _ => phase.boss_name.clone(),
+                    };
+                    // An uncapped boss (Moonlight Village mechanics bosses) has no
+                    // finite HP, so its row shows the party's total damage instead
+                    // of an HP fraction.
+                    let phase_hp = boss_row_hp_label(
+                        phase.boss_object_type,
+                        phase.boss_start_hp,
+                        phase.boss_max_hp,
+                        phase.total_damage(),
+                    );
                     let header = format!(
-                        "{arrow}  {name}   HP {start}/{max}   {dur}",
-                        name = match phase.aux_member_count {
-                            Some(count) if count > 0 => format!("{} x{count}", phase.boss_name),
-                            _ => phase.boss_name.clone(),
-                        },
-                        start = phase.boss_start_hp,
-                        max = phase.boss_max_hp,
+                        "{arrow}  {phase_name}   {phase_hp}   {dur}",
                         dur = fmt_duration(phase.duration_ms()),
                     );
                     ui.horizontal(|ui| {
@@ -3526,7 +3611,7 @@ impl CombatHistoryPanel {
                             ctx,
                             &phase.participants,
                             &format!("phase_table_{}", phase.id),
-                            phase.boss_start_hp as i64,
+                            share_hp_pool(phase.boss_object_type, phase.boss_start_hp),
                             phase.killed,
                             !enc.killed,
                             phase.boss_object_type == O3_BOSS_TYPE,
@@ -3623,7 +3708,48 @@ fn assign_drops_exclusive(
 
 #[cfg(test)]
 mod tests {
-    use super::assign_drops_exclusive;
+    use super::{assign_drops_exclusive, boss_bar_label, boss_row_hp_label, share_hp_pool};
+
+    #[test]
+    fn hp_uncapped_bosses_share_against_tracked_total() {
+        // Moonlight Village mechanics bosses have no real HP pool: the share
+        // denominator is 0 so the table uses the tracked total, not the boss HP.
+        for boss in [20450, 20451, 20452, 20493] {
+            assert_eq!(share_hp_pool(boss, 720_000), 0);
+        }
+        // Ordinary bosses keep reconciling against their starting HP.
+        assert_eq!(share_hp_pool(0x10E4, 12_000), 12_000);
+    }
+
+    #[test]
+    fn hp_uncapped_boss_bar_reads_damage_over_infinity() {
+        // The top bar labels an uncapped boss by the party's damage against an
+        // unlimited pool, and stays a full bar.
+        assert_eq!(
+            boss_bar_label(20450, 720_000, 720_000, 515_998).as_deref(),
+            Some("515,998 / ∞")
+        );
+        // Ordinary bosses keep the start/max HP label; no HP -> no label.
+        assert_eq!(
+            boss_bar_label(0x10E4, 8_000, 12_000, 12_000).as_deref(),
+            Some("8,000 / 12,000")
+        );
+        assert_eq!(boss_bar_label(0x10E4, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn hp_uncapped_boss_row_shows_total_damage_only() {
+        // The row header drops the HP fraction for an uncapped boss and prints
+        // the summed damage once.
+        assert_eq!(
+            boss_row_hp_label(20452, 720_000, 720_000, 511_088),
+            "Damage 511,088"
+        );
+        assert_eq!(
+            boss_row_hp_label(0x10E4, 8_000, 12_000, 12_000),
+            "HP 8000/12000"
+        );
+    }
 
     #[test]
     fn bag_after_third_kill_links_only_to_that_fight() {

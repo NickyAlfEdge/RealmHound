@@ -2522,7 +2522,13 @@ impl CombatTracker {
         // down proportionally so shares are preserved and the total matches the
         // boss HP (exact for a solo kill). Only shrinks totals, never inflates,
         // so it is a no-op for crowded fights where we saw less than the full HP.
-        if fight.killed {
+        //
+        // Moonlight Village mechanics bosses are exempt: they never lose HP (the
+        // encounter is scored by a completion marker, not a death), so their
+        // nominal max HP is not the damage they absorbed. Capping there would
+        // truncate the party's real output, so raw damage is kept as-is and
+        // shares are later taken against the tracked total.
+        if fight.killed && !crate::assets::is_hp_uncapped_boss(fight.boss_object_type) {
             cap_overkill(&mut participants, fight.boss_start_hp as i64);
         }
 
@@ -6783,6 +6789,56 @@ mod tests {
         assert_eq!(
             done[0].participants[0].provenance,
             DamageProvenance::SelfComputed
+        );
+    }
+
+    #[test]
+    fn mv_boss_damage_is_not_capped_to_nominal_hp() {
+        // Moonlight Village mechanics bosses floor invulnerable -- their nominal
+        // max HP is not the damage they absorbed -- so the party's raw damage must
+        // survive finalize untouched instead of being trimmed to the boss HP.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 180_000), stat(StatType::HP, 180_000)],
+            ),
+            100,
+        );
+        // One other player plus the local player, together far above the nominal
+        // 180000 HP pool.
+        t.on_damage(500, 600, 250_000, 110);
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 200_000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 120);
+        // MV Dungeon Complete marker scores the dancer as completed.
+        t.on_object_spawn(
+            15598,
+            20658,
+            &status(
+                15598,
+                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
+            ),
+            400,
+        );
+        let done = t.on_tick(450);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].killed);
+        assert_eq!(
+            done[0].total_damage(),
+            450_000,
+            "raw damage kept, not capped to the nominal 180000 HP"
         );
     }
 

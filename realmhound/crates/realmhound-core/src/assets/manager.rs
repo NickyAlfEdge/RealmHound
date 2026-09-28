@@ -618,6 +618,18 @@ pub fn is_invuln_finish_boss(id: i32) -> bool {
         .any(|(_, targets)| targets.contains(&id))
 }
 
+/// Moonlight Village mechanics bosses: the three dancers (Sage Genji 20450,
+/// Dancer Miko 20451, Drummer Kaguya 20452) and the secret boss Kitsune Umi
+/// (20493). Their XML `MaxHitPoints` is only a nominal figure -- they floor
+/// invulnerable instead of dying and the encounter is scored by a completion
+/// marker -- so the HP they carry is not a real damage pool. The combat engine
+/// must not cap damage to it (the party's overkill is really absorbed by an
+/// effectively-infinite pool) and the UI must express each player's share of
+/// the party's tracked total rather than a fraction of that fake pool.
+pub fn is_hp_uncapped_boss(id: i32) -> bool {
+    matches!(id, 20450 | 20451 | 20452 | 20493)
+}
+
 /// Towering Perfection (Sprite Forest realm event) types. The tower repeatedly
 /// splits, re-spawning its core (47909), the two Imperfection segments -- Lower
 /// (47916) and Upper (47917) -- and its four Toppled Cube segments (44894 /

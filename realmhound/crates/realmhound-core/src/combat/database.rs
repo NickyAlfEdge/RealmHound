@@ -80,6 +80,11 @@ impl FightRecord {
     pub fn duration_ms(&self) -> i64 {
         (self.ended_at - self.started_at).max(0)
     }
+
+    /// Total attributed damage across the fight's participants.
+    pub fn total_damage(&self) -> i64 {
+        self.participants.iter().map(|p| p.damage).sum()
+    }
 }
 
 /// A running per-dungeon time counter row. Accumulated independently of the

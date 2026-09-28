@@ -77,7 +77,7 @@ pub use manager::{
     encounter_completion_any, encounter_for_boss_type, encounter_headline_only,
     encounter_ids_matching_name, encounter_loot_completes, encounter_realm_grouped,
     encounter_supports_loot_completion, find_assets_dir, get_asset_manager,
-    get_resources_assets_stamp, is_dedup_prone_boss, is_invuln_finish_boss,
+    get_resources_assets_stamp, is_dedup_prone_boss, is_hp_uncapped_boss, is_invuln_finish_boss,
     is_legacy_lod_ivory_boss, is_optional_secondary_boss_type, is_post_boss_bonus_type,
     is_second_coming_boss, is_second_coming_transition_taunt, is_treasure_crate_type,
     lod_dragon_chest_pairs, loot_emitter_for_boss, parse_grave_tier, prismimic_display_name,
