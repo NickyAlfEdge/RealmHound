@@ -1670,6 +1670,7 @@ impl LootDatabase {
                 &b.items,
                 b.map_seed,
                 b.timestamp,
+                false,
             ) {
                 updates.push((b.id, t, n));
             }

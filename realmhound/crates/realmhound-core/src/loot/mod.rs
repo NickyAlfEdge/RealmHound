@@ -241,6 +241,32 @@ pub const SPECTRAL_PENITENTIARY_NAME: &str = "Spectral Penitentiary";
 /// Dungeon name for Moonlight Village, matching the stored dungeon label.
 pub const MOONLIGHT_VILLAGE_NAME: &str = "Moonlight Village";
 
+/// The invisible Moonlight Village objects that hand out the run's loot and XP.
+/// `MV Dungeon Complete` covers the three dancers (its loot pools the whole run),
+/// `MV Umi Complete` covers Kitsune Umi. Both spawn at the *start* of the
+/// encounter and stay invisible, so a bag proximity-tagged to one of them carries
+/// no attribution meaning -- only the clear makes them emit.
+pub const MV_DUNGEON_COMPLETE_OBJECT_TYPE: i32 = 0x50B2;
+pub const MV_UMI_COMPLETE_OBJECT_TYPE: i32 = 0xC0BB;
+
+/// Display name for Kitsune Umi, matching Combat History's boss name, used when
+/// the asset catalog is unavailable.
+pub const MV_UMI_NAME: &str = "Kitsune Umi";
+
+/// True if a bag's proximity source carries no attribution meaning of its own in
+/// Moonlight Village: nothing (the droppers are invisible, so a nearby bag is
+/// usually left Unknown) or one of the dancers / the invisible loot emitters.
+/// The dancers never drop loot personally -- `MV Dungeon Complete` pools the whole
+/// run -- but they are still standing where the droppers are when the clear loot
+/// lands, so proximity pins bags to whichever dancer is nearest and the result is
+/// arbitrary. A bag pinned to anything else (a fishing crate, say) is left alone.
+pub fn is_mv_neutral_loot_source(object_type: i32) -> bool {
+    object_type == 0
+        || object_type == MV_DUNGEON_COMPLETE_OBJECT_TYPE
+        || object_type == MV_UMI_COMPLETE_OBJECT_TYPE
+        || crate::assets::is_mv_boss(object_type)
+}
+
 /// Dungeon name for Oryx's Sanctuary, matching the stored dungeon label.
 pub const ORYX_SANCTUARY_NAME: &str = "Oryx's Sanctuary";
 

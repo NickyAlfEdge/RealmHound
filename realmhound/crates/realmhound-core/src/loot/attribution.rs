@@ -10,8 +10,6 @@ use crate::protocol::data::WorldPosData;
 pub mod boss_ids {
     /// Kitsune Umi (Moonlight Village)
     pub const UMI_KITSUNE: i32 = 20493;
-    /// Dancer Miko (Moonlight Village)
-    pub const MIKO_DANCER: i32 = 20451;
     /// Void Entity (The Void)
     pub const VOID_ENTITY: i32 = 45076;
     /// Bridge Sentinel (The Shatters)
@@ -75,6 +73,12 @@ pub struct LootAttributionManager {
 
     /// Fabricated entities created this tick for attribution
     fabricated_this_tick: Vec<LootEntity>,
+
+    /// Map seed of the instance in which Kitsune Umi was engaged (0 = none).
+    /// Her loot is emitted by the invisible `MV Umi Complete` dropper, but the
+    /// fight itself never completes until that loot is recorded, so the bag
+    /// cannot be resolved from recorded kills -- it is resolved from this latch.
+    mv_umi_instance: i32,
 }
 
 impl LootAttributionManager {
@@ -87,10 +91,12 @@ impl LootAttributionManager {
             remaining_ticks: 0,
             current_tick_seed: -1,
             fabricated_this_tick: Vec::new(),
+            mv_umi_instance: 0,
         }
     }
 
-    /// Clear all state (on map change).
+    /// Clear all state (on map change). The Kitsune Umi latch is per-instance
+    /// state too, so a new instance starts with it cleared.
     pub fn clear(&mut self) {
         self.next_tick_mob_id = -1;
         self.next_tick_seed = -1;
@@ -98,6 +104,7 @@ impl LootAttributionManager {
         self.remaining_ticks = 0;
         self.current_tick_seed = -1;
         self.fabricated_this_tick.clear();
+        self.mv_umi_instance = 0;
     }
 
     /// Handle a text packet to check for attribution triggers.
@@ -105,6 +112,12 @@ impl LootAttributionManager {
     ///
     pub fn handle_text_packet(&mut self, name: &str, text: &str, map_seed: i32) -> bool {
         if let Some(trigger) = Self::check_text_trigger(name, text) {
+            // Kitsune Umi announces her phase with this line, which is the only
+            // in-band signal that the optional secret boss was engaged. Latch the
+            // instance: everything her invisible dropper emits afterwards is hers.
+            if trigger.mob_id == boss_ids::UMI_KITSUNE && map_seed != 0 {
+                self.mv_umi_instance = map_seed;
+            }
             self.open_window(trigger.mob_id, map_seed, trigger.ticks, trigger.variant);
             true
         } else {
@@ -112,21 +125,19 @@ impl LootAttributionManager {
         }
     }
 
+    /// Whether Kitsune Umi was engaged in the instance identified by `map_seed`.
+    pub fn mv_umi_latched(&self, map_seed: i32) -> bool {
+        map_seed != 0 && self.mv_umi_instance == map_seed
+    }
+
     /// Check if a text packet matches any attribution trigger.
     pub fn check_text_trigger(name: &str, text: &str) -> Option<AttributionTrigger> {
-        // Kitsune Umi (Moonlight Village)
+        // Kitsune Umi (Moonlight Village). The line is her phase's opening
+        // announcement, so the window opens as she is engaged; the persistent
+        // latch in `handle_text_packet` covers the loot that lands much later.
         if name == "#Kitsune Umi" && text == "This fully concludes the Moonlight Festival!" {
             return Some(AttributionTrigger {
                 mob_id: boss_ids::UMI_KITSUNE,
-                ticks: 2,
-                variant: None,
-            });
-        }
-
-        // Dancer Miko (Moonlight Village)
-        if name == "#Dancer Miko" && text == "Thank you all for coming tonight." {
-            return Some(AttributionTrigger {
-                mob_id: boss_ids::MIKO_DANCER,
                 ticks: 2,
                 variant: None,
             });
@@ -283,12 +294,10 @@ impl LootAttributionManager {
                 fab.loot_mob_id_override = Some(format!("{}{}", fab.object_type, suffix));
             }
         } else if self.fabricated_this_tick.len() > 1 {
-            // Multiple fabricated without forced variant = HM for Umi/Miko
+            // Multiple fabricated without forced variant = the hard-mode twin
             for fab in &mut self.fabricated_this_tick {
                 if fab.object_type == boss_ids::UMI_KITSUNE {
                     fab.loot_mob_id_override = Some("20493HM".to_string());
-                } else if fab.object_type == boss_ids::MIKO_DANCER {
-                    fab.loot_mob_id_override = Some("20451HM".to_string());
                 }
             }
         }
@@ -405,6 +414,33 @@ mod tests {
         assert!(triggered);
         assert!(mgr.has_attribution_window());
         assert_eq!(mgr.attribution_mob_id(), Some(boss_ids::UMI_KITSUNE));
+        // Engaging Umi latches her instance: her dropper's loot lands long after
+        // the 2-tick window, and her fight is never completed before it.
+        assert!(mgr.mv_umi_latched(12345));
+        assert!(!mgr.mv_umi_latched(999));
+        assert!(!mgr.mv_umi_latched(0));
+    }
+
+    #[test]
+    fn umi_latch_is_per_instance() {
+        let mut mgr = LootAttributionManager::new();
+        mgr.handle_text_packet(
+            "#Kitsune Umi",
+            "This fully concludes the Moonlight Festival!",
+            12345,
+        );
+        assert!(mgr.mv_umi_latched(12345));
+
+        // A new instance (or a disconnect) starts with no Umi engagement.
+        mgr.clear();
+        assert!(!mgr.mv_umi_latched(12345));
+    }
+
+    #[test]
+    fn non_umi_triggers_do_not_latch_umi() {
+        let mut mgr = LootAttributionManager::new();
+        mgr.handle_text_packet("#Void Entity", "You fools... You can never truly defeat me! I am in all of you! I AM all of you!", 12345);
+        assert!(!mgr.mv_umi_latched(12345));
     }
 
     #[test]
