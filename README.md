@@ -1,11 +1,20 @@
-# RealmHound 🐕
+# RealmHound 
 
 A high-performance packet capture and analysis tool for **Realm of the Mad
 God** (RotMG). RealmHound organizes data received by your game client and
 presents your account data and observed activity in a clearer, more usable
 way. It does not access server-side information unavailable to your client.
 
-RealmHound Discord link: https://discord.gg/4zdy5Z4Sfd
+Got any questions, suggestions or other feedback? 
+Join our Discord!
+
+<img width="64" height="64" alt="discord" src="https://github.com/user-attachments/assets/6ad4035f-4e66-4ee1-be19-54330adc2cde" /> 
+
+**[<img width="18" height="14" alt="discord_logo" src="https://github.com/user-attachments/assets/cab1a267-41db-4727-a91e-27813f284ef9" /> RealmHound](https://discord.gg/4zdy5Z4Sfd)**
+
+
+
+
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
