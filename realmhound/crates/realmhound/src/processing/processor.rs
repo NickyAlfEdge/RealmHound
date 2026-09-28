@@ -1348,6 +1348,18 @@ impl PacketProcessor {
                             }
                         }
 
+                        // Moonlight Village's Leisurely Mode is announced with a
+                        // server notification when the group consumes a Tofu
+                        // Delicacy; the run's card is labelled with it. Notifications
+                        // are not routed into GameEvents, so feed it straight in.
+                        if let ParsedPacket::Notification(notification) = parsed {
+                            if realmhound_core::assets::is_mv_leisurely_mode_notification(
+                                &notification.message,
+                            ) {
+                                self.combat.on_mv_leisurely_mode();
+                            }
+                        }
+
                         // Route through PacketRouter (all packet types)
                         match self.router.route(parsed, &mut self.session) {
                             RouteResult::Routed(events) => {

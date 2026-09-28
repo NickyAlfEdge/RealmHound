@@ -275,6 +275,13 @@ impl CombatManager {
         }
     }
 
+    /// The group activated Moonlight Village's Leisurely Mode by consuming a Tofu
+    /// Delicacy (announced with a server notification). The run's fights are
+    /// labelled with it on the card.
+    pub fn on_mv_leisurely_mode(&mut self) {
+        self.tracker.on_mv_leisurely_mode();
+    }
+
     /// Latch `killed` on every persisted encounter run matching a buffered
     /// loot-completion signal. Idempotent: a run stays killed once set.
     fn apply_pending_loot_completions(&mut self) {
@@ -648,6 +655,7 @@ mod tests {
             local_close_calls: 0,
             aux_member_count: None,
             spirits: 0,
+            leisurely: false,
             participants,
         }
     }

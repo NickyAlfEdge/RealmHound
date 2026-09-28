@@ -13,7 +13,10 @@ use std::time::Instant;
 use chrono::{Local, TimeZone, Utc};
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
-    assets::{get_asset_manager, get_dungeon_portal_map, is_mv_boss, BossGroup, CatalogEntry},
+    assets::{
+        get_asset_manager, get_dungeon_portal_map, is_mv_boss, BossGroup, CatalogEntry,
+        DungeonPortalMap,
+    },
     combat::{
         build_bundle, sanitize_player_name, CombatDatabase, DamageProvenance,
         DamageTakenProvenance, EncounterRecord, FightQuery, FightRecord, FightSelection,
@@ -97,6 +100,19 @@ fn boss_row_hp_label(
         }
     } else {
         format!("HP {}/{}", boss_start_hp, boss_max_hp)
+    }
+}
+
+/// The dungeon name shown as a card/header title. Moonlight Village runs played
+/// in Leisurely Mode (a Tofu Delicacy was consumed) are marked, since the mode
+/// shortens the dance phases and cuts the loot -- such a run is not comparable
+/// with a normal clear.
+fn dungeon_display_name(portal_map: &DungeonPortalMap, dungeon: &str, leisurely: bool) -> String {
+    let name = portal_map.normalize_dungeon_name(dungeon);
+    if leisurely {
+        format!("{name} (Leisurely)")
+    } else {
+        name
     }
 }
 
@@ -1721,6 +1737,8 @@ impl CombatHistoryPanel {
                     cui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 let dungeon_label = portal_map.normalize_dungeon_name(&fight.dungeon);
+                let dungeon_title =
+                    dungeon_display_name(portal_map, &fight.dungeon, fight.leisurely);
                 if resp
                     .hover_tip(format!("{}\n(Click to filter)", dungeon_label))
                     .clicked()
@@ -1902,7 +1920,7 @@ impl CombatHistoryPanel {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             ui.label(
-                                RichText::new(&dungeon_label)
+                                RichText::new(&dungeon_title)
                                     .size(17.0)
                                     .strong()
                                     .color(Color32::WHITE),
@@ -2340,7 +2358,7 @@ impl CombatHistoryPanel {
                         ui.label(
                             RichText::new(format!(
                                 "{}  ·  {}",
-                                portal_map.normalize_dungeon_name(&fight.dungeon),
+                                dungeon_display_name(portal_map, &fight.dungeon, fight.leisurely),
                                 datetime_s,
                             ))
                             .color(Color32::GRAY),
@@ -3430,7 +3448,7 @@ impl CombatHistoryPanel {
                         ui.label(
                             RichText::new(format!(
                                 "{}  ·  {}",
-                                portal_map.normalize_dungeon_name(&enc.dungeon),
+                                dungeon_display_name(portal_map, &enc.dungeon, enc.leisurely),
                                 datetime_s,
                             ))
                             .color(Color32::GRAY),
@@ -3768,7 +3786,29 @@ fn assign_drops_exclusive(
 
 #[cfg(test)]
 mod tests {
-    use super::{assign_drops_exclusive, boss_bar_label, boss_row_hp_label, share_hp_pool};
+    use super::{
+        assign_drops_exclusive, boss_bar_label, boss_row_hp_label, dungeon_display_name,
+        share_hp_pool,
+    };
+    use realmhound_core::assets::get_dungeon_portal_map;
+
+    #[test]
+    fn leisurely_mode_is_appended_to_the_dungeon_name() {
+        let portal_map = get_dungeon_portal_map();
+        assert_eq!(
+            dungeon_display_name(portal_map, "Moonlight Village", true),
+            "Moonlight Village (Leisurely)"
+        );
+        assert_eq!(
+            dungeon_display_name(portal_map, "Moonlight Village", false),
+            "Moonlight Village"
+        );
+        // Every other dungeon ignores the flag (it is never set for them).
+        assert_eq!(
+            dungeon_display_name(portal_map, "The Shatters", false),
+            "The Shatters"
+        );
+    }
 
     #[test]
     fn mv_bosses_share_against_tracked_total() {

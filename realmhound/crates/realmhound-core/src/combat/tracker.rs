@@ -732,6 +732,11 @@ pub struct CombatTracker {
     /// Until then the run is in the boss-less tutorial lantern phases, whose
     /// releases must not be scored as spirits.
     mv_boss_engaged: bool,
+    /// Whether this run was switched to Moonlight Village's Leisurely Mode (a
+    /// Tofu Delicacy was consumed). Latched onto the run's fights so the card
+    /// can label the run -- the mode shortens the phases and cuts the loot, so
+    /// the run is not comparable with a normal clear. Reset on map change.
+    mv_leisurely: bool,
 }
 
 impl Default for CombatTracker {
@@ -789,6 +794,7 @@ impl CombatTracker {
             mv_spirit_ids: HashSet::new(),
             pending_mv_spirits: 0,
             mv_boss_engaged: false,
+            mv_leisurely: false,
         }
     }
 
@@ -887,6 +893,7 @@ impl CombatTracker {
         self.mv_spirit_ids.clear();
         self.pending_mv_spirits = 0;
         self.mv_boss_engaged = false;
+        self.mv_leisurely = false;
         finished
     }
 
@@ -929,6 +936,7 @@ impl CombatTracker {
         self.mv_spirit_ids.clear();
         self.pending_mv_spirits = 0;
         self.mv_boss_engaged = false;
+        self.mv_leisurely = false;
         finished
     }
 
@@ -1205,6 +1213,14 @@ impl CombatTracker {
             return Vec::new();
         }
         self.perform_second_coming_split(object_id, time_ms)
+    }
+
+    /// The group activated Moonlight Village's Leisurely Mode by consuming a Tofu
+    /// Delicacy (the game raises a server notification for it). The mode
+    /// shortens the dance phases and cuts the loot, so the run's fights are
+    /// labelled with it on the card. Latched for the current instance.
+    pub fn on_mv_leisurely_mode(&mut self) {
+        self.mv_leisurely = true;
     }
 
     /// A loot bag was recorded in the current instance. Moonlight Village's
@@ -2764,6 +2780,7 @@ impl CombatTracker {
                 }
             }),
             spirits: fight.spirits,
+            leisurely: self.mv_leisurely,
             participants,
         };
 
@@ -7954,6 +7971,56 @@ mod tests {
             .collect();
         assert_eq!(umi.len(), 1);
         assert!(!umi[0].killed, "Umi only clears on her own loot");
+    }
+
+    // Leisurely Mode (the group consumed a Tofu Delicacy before the dance) is
+    // announced with a server notification and labels the run's fights.
+    #[test]
+    fn mv_leisurely_mode_labels_the_runs_fights() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_mv_leisurely_mode();
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            100,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 200);
+        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 300);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].leisurely, "the clear is labelled Leisurely Mode");
+
+        // The mode is per instance: the next run's fights are unlabelled.
+        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_object_spawn(
+            600,
+            20450,
+            &status(
+                600,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            1100,
+        );
+        t.pending_shots.insert(
+            11,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(600, 11, 1000, 1000, 1200);
+        let next = t.on_boss_text(600, "This concludes the Moonlight Dance.", 1300);
+        assert_eq!(next.len(), 1);
+        assert!(
+            !next[0].leisurely,
+            "a later normal run is not labelled Leisurely Mode"
+        );
     }
 
     // A completion in one dungeon instance does not carry to the next: a dancer

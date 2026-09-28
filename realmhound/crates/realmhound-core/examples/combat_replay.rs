@@ -145,6 +145,12 @@ fn main() {
                 Some(ParsedPacket::Text(t)) => {
                     finished.extend(tracker.on_boss_text(t.object_id, &t.text, clock));
                 }
+                // Moonlight Village's Leisurely Mode announcement.
+                Some(ParsedPacket::Notification(n))
+                    if realmhound_core::assets::is_mv_leisurely_mode_notification(&n.message) =>
+                {
+                    tracker.on_mv_leisurely_mode();
+                }
                 // Outgoing local `UseItem`: self-computed orb ability damage,
                 // centered on the throw/aim position.
                 Some(ParsedPacket::UseItem(u)) if !incoming => {
@@ -183,6 +189,9 @@ fn main() {
         );
         if f.spirits > 0 {
             println!("     spirits_collected={}", f.spirits);
+        }
+        if f.leisurely {
+            println!("     leisurely_mode=true");
         }
         println!(
             "     attributed_damage={attributed}  (~{pct:.1}% of start HP)  hp_lost_if_killed={hp_lost}"

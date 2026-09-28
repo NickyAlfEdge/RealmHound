@@ -311,6 +311,10 @@ pub struct CompletedFight {
     /// `MV Total Counter` object released at the end of a dance/Umi phase; the
     /// run total drives the dungeon's loot tier.
     pub spirits: i32,
+    /// Whether the run was played in Moonlight Village's Leisurely Mode (the
+    /// group consumed a Tofu Delicacy), which shortens the phases and reduces
+    /// the loot. False for every other dungeon.
+    pub leisurely: bool,
     /// Per-participant contributions, sorted by damage descending on finalize.
     pub participants: Vec<FightParticipant>,
 }

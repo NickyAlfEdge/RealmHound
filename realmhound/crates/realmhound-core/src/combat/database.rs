@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 51;
+pub const SCHEMA_VERSION: i32 = 52;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -74,6 +74,10 @@ pub struct FightRecord {
     /// Moonlight Village spirits collected during this fight (0 for other bosses
     /// and for rows recorded before spirit tracking).
     pub spirits: i32,
+    /// Whether the fight was played in Moonlight Village's Leisurely Mode (a
+    /// Tofu Delicacy was consumed). False for every other dungeon and for rows
+    /// recorded before the mode was tracked.
+    pub leisurely: bool,
     /// Participants (sorted by damage descending as stored).
     pub participants: Vec<ParticipantRecord>,
 }
@@ -121,6 +125,9 @@ pub struct EncounterRecord {
     pub ended_at: i64,
     /// Whether the anchor (or any phase) was killed.
     pub killed: bool,
+    /// Whether the run was played in Moonlight Village's Leisurely Mode (a Tofu
+    /// Delicacy was consumed). False for every other dungeon.
+    pub leisurely: bool,
     /// Object type of the run anchor (last real boss) for the header icon.
     pub anchor_object_type: i32,
     /// Member phase fights, ordered by start time.
@@ -331,6 +338,11 @@ pub struct FightSummary {
     /// other detected teammate (with at least one other participant). Computed at
     /// read time from stored data.
     pub most_damage_taken: bool,
+    /// Whether the run was played in Moonlight Village's Leisurely Mode (a Tofu
+    /// Delicacy was consumed), which shortens the phases and reduces the loot.
+    /// False for every other dungeon; set for the whole run when any of its
+    /// phases recorded it.
+    pub leisurely: bool,
 }
 
 impl FightSummary {
@@ -1245,6 +1257,18 @@ impl CombatDatabase {
                 )?;
             }
             self.conn.execute_batch("PRAGMA user_version = 51")?;
+        }
+        if from_version < 52 {
+            // v51 -> v52: whether the fight was played in Moonlight Village's
+            // Leisurely Mode (a Tofu Delicacy was consumed), which shortens the
+            // dance phases and reduces the loot. Legacy rows default to 0 (the
+            // mode was never captured for them).
+            if !self.column_exists("fights", "leisurely")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN leisurely INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 52")?;
         }
         Ok(())
     }
@@ -2217,7 +2241,8 @@ impl CombatDatabase {
                 aux_member_count INTEGER,
                 reached_zero INTEGER NOT NULL DEFAULT 0,
                 joined_late INTEGER NOT NULL DEFAULT 0,
-                spirits INTEGER NOT NULL DEFAULT 0
+                spirits INTEGER NOT NULL DEFAULT 0,
+                leisurely INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS stat_awards (
@@ -2342,8 +2367,8 @@ impl CombatDatabase {
                (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
-                dungeon_entered_at, reached_zero, joined_late, spirits)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"#,
+                dungeon_entered_at, reached_zero, joined_late, spirits, leisurely)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -2365,6 +2390,7 @@ impl CombatDatabase {
                 fight.reached_zero as i32,
                 fight.joined_late as i32,
                 fight.spirits,
+                fight.leisurely as i32,
             ],
         )?;
         let fight_id = tx.last_insert_rowid();
@@ -2446,7 +2472,8 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at, spirits
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits,
+                      leisurely
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -2475,6 +2502,7 @@ impl CombatDatabase {
             aux_member_count: row.get(13)?,
             dungeon_entered_at: row.get(14)?,
             spirits: row.get(15)?,
+            leisurely: row.get::<_, i32>(16)? != 0,
             participants: Vec::new(),
         })
     }
@@ -2993,7 +3021,7 @@ impl CombatDatabase {
                          WHERE p.fight_id = f.id AND p.is_local = 1 LIMIT 1),
                       (SELECT p.end_status FROM fight_participants p
                          WHERE p.fight_id = f.id AND p.is_local = 1 LIMIT 1),
-                      f.map_seed, f.local_close_calls
+                      f.map_seed, f.local_close_calls, f.leisurely
                FROM fights f"#,
         );
         let mut conds: Vec<String> = vec!["f.encounter_run_id IS NULL".to_string()];
@@ -3048,6 +3076,7 @@ impl CombatDatabase {
                 lone_fighter: false,
                 last_hero_standing: false,
                 most_damage_taken: false,
+                leisurely: row.get::<_, i32>(18)? != 0,
             })
         })?;
         rows.collect()
@@ -3219,8 +3248,24 @@ impl CombatDatabase {
             })?
             .collect::<SqlResult<_>>()?;
 
+        // Leisurely Mode is recorded per phase but applies to the whole run (the
+        // mode is toggled once, before any boss), so a run is labelled when any
+        // of its phases carries it.
+        let leisurely_sql = format!(
+            "SELECT encounter_run_id, MAX(leisurely) FROM fights
+             WHERE encounter_run_id IN ({placeholders})
+             GROUP BY encounter_run_id"
+        );
+        let mut stmt = self.conn.prepare(&leisurely_sql)?;
+        let leisurely_runs: HashMap<String, bool> = stmt
+            .query_map(rusqlite::params_from_iter(run_ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0))
+            })?
+            .collect::<SqlResult<_>>()?;
+
         let mut out = Vec::new();
         for (run_id, encounter_id, dungeon, started_at, ended_at, stored_killed) in runs {
+            let leisurely = leisurely_runs.get(&run_id).copied().unwrap_or(false);
             let phases = fights_by_run.remove(&run_id).unwrap_or_default();
             let phase_stats: Vec<PhaseStat> =
                 phases.iter().map(|p| (p.0, p.1, p.2, p.3, p.4)).collect();
@@ -3234,7 +3279,11 @@ impl CombatDatabase {
                 .iter()
                 .find_map(|p| crate::assets::encounter_for_boss_type(p.0))
                 .is_some_and(|e| crate::assets::encounter_supports_loot_completion(e.id));
-            let killed = killed || (loot_completable && stored_killed != 0);
+            let killed = killed
+                || (loot_completable && stored_killed != 0)
+                // Moonlight Village is cleared by its three dancers; the anchor
+                // can land on an escaped Kitsune Umi fought afterwards.
+                || mv_dancers_cleared(phases.iter().map(|p| (p.0, p.3)));
             let raw_phase_count = phases.len() as i64;
             // The card's phase count must match the collapsed detail view:
             // duplicate same-(type,name) phases of a dedup-prone boss (a
@@ -3359,6 +3408,7 @@ impl CombatDatabase {
                 lone_fighter: false,
                 last_hero_standing: false,
                 most_damage_taken: false,
+                leisurely,
             });
         }
         Ok(out)
@@ -3369,7 +3419,8 @@ impl CombatDatabase {
         let mut sql = String::from(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at, spirits
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits,
+                      leisurely
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -3397,7 +3448,8 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at, spirits
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits,
+                      leisurely
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -3439,7 +3491,8 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at, spirits
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits,
+                      leisurely
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -3457,7 +3510,11 @@ impl CombatDatabase {
             .iter()
             .find_map(|&t| crate::assets::encounter_for_boss_type(t))
             .is_some_and(|e| crate::assets::encounter_supports_loot_completion(e.id));
-        let killed = anchor_killed || (loot_completable && stored_killed);
+        let killed = anchor_killed
+            || (loot_completable && stored_killed)
+            // Moonlight Village is cleared by its three dancers; the anchor can
+            // land on an escaped Kitsune Umi fought afterwards.
+            || mv_dancers_cleared(phases.iter().map(|p| (p.boss_object_type, p.killed)));
         let display_name = if let Some(name) = realm_headline(&dungeon, &object_types) {
             name.to_string()
         } else if phases.len() > 1 {
@@ -3488,6 +3545,7 @@ impl CombatDatabase {
             started_at,
             ended_at,
             killed,
+            leisurely: phases.iter().any(|p| p.leisurely),
             anchor_object_type,
             phases,
             roster,
@@ -4443,6 +4501,7 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
                 Some(group.iter().map(|g| g.aux_member_count.unwrap_or(0)).sum())
             },
             spirits: group.iter().map(|g| g.spirits).sum(),
+            leisurely: group.iter().any(|g| g.leisurely),
             participants: aggregate_roster(&group),
         });
     }
@@ -4522,6 +4581,7 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             local_close_calls: group.iter().map(|g| g.local_close_calls).sum(),
             aux_member_count: p.aux_member_count,
             spirits: group.iter().map(|g| g.spirits).sum(),
+            leisurely: group.iter().any(|g| g.leisurely),
             participants: aggregate_roster(&group),
         });
     }
@@ -4689,6 +4749,24 @@ fn run_killed(enc_id: Option<&str>, phases: &[PhaseStat], anchor_killed: bool) -
     }
 }
 
+/// Whether a Moonlight Village run defeated every dancer. The dungeon is
+/// cleared by the three dancers alone; Kitsune Umi is an optional secret boss
+/// fought after them, so a run that escaped (or never found) her is still a
+/// clear. The dancers go invulnerable instead of dying on a partial run, so a
+/// dance abandoned midway stays Escaped.
+fn mv_dancers_cleared(phases: impl IntoIterator<Item = (i32, bool)>) -> bool {
+    let defeated: Vec<i32> = phases
+        .into_iter()
+        .filter(|(object_type, killed)| {
+            *killed && crate::assets::MV_DANCER_TYPES.contains(object_type)
+        })
+        .map(|(object_type, _)| object_type)
+        .collect();
+    crate::assets::MV_DANCER_TYPES
+        .iter()
+        .all(|t| defeated.contains(t))
+}
+
 /// Pick the anchor phase for a grouped run: the encounter's declared
 /// `anchor_type` when present, else the latest-ended real (non-aux) boss (tie:
 /// higher max HP), else any aux row. Returns `(object_type, max_hp, start_hp,
@@ -4840,6 +4918,7 @@ mod tests {
             local_close_calls: 0,
             aux_member_count: None,
             spirits: 0,
+            leisurely: false,
             participants: vec![
                 FightParticipant {
                     object_id: 600,
@@ -4945,6 +5024,7 @@ mod tests {
             local_close_calls: 0,
             aux_member_count: None,
             spirits: 0,
+            leisurely: false,
             participants,
         }
     }
@@ -6262,6 +6342,52 @@ mod tests {
     }
 
     #[test]
+    fn moonlight_village_clears_when_the_dancers_die_even_if_umi_escapes() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // The three dancers are cleared, then the optional secret boss Kitsune
+        // Umi is engaged and escaped when the group leaves: the card must stay
+        // Completed because the dungeon is scored on the dance alone.
+        let mut run = |object_type: i32, start: i64, end: i64, killed: bool| {
+            let mut f = flawless_fight("Moonlight Village", object_type, vec![]);
+            f.started_at = start;
+            f.ended_at = end;
+            f.killed = killed;
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some("mv-umi".to_string());
+            db.insert_fight(&f).unwrap();
+        };
+        run(20450, 1_000, 10_000, true); // Sage Genji
+        run(20451, 11_000, 20_000, true); // Dancer Miko
+        run(20452, 21_000, 30_000, true); // Drummer Kaguya
+        run(20493, 40_000, 50_000, false); // Kitsune Umi, escaped
+
+        let card = &db.list_fights(&FightQuery::default(), 50).unwrap()[0];
+        assert_eq!(card.boss_object_type, 20493, "Umi anchors the run");
+        assert!(card.killed, "escaping Umi keeps the card Completed");
+        assert!(
+            db.encounter_detail("mv-umi").unwrap().unwrap().killed,
+            "the Fight Card agrees with the list card",
+        );
+
+        // A dance abandoned after two dancers stays Escaped: the dancers floor
+        // invulnerable, so only a full clear counts.
+        for (object_type, killed) in [(20450, true), (20451, true), (20452, false)] {
+            let mut f = flawless_fight("Moonlight Village", object_type, vec![]);
+            f.killed = killed;
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some("mv-partial".to_string());
+            db.insert_fight(&f).unwrap();
+        }
+        let cards = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let partial_card = cards
+            .iter()
+            .find(|c| c.encounter_run_id.as_deref() == Some("mv-partial"))
+            .expect("partial run card");
+        assert!(!partial_card.killed, "an unfinished dance stays Escaped");
+        assert!(!db.encounter_detail("mv-partial").unwrap().unwrap().killed);
+    }
+
+    #[test]
     fn flawless_marker_clear_when_every_finisher_took_damage_or_left() {
         let mut db = CombatDatabase::open_in_memory().unwrap();
         db.insert_fight(&flawless_fight(
@@ -7064,6 +7190,53 @@ mod tests {
         assert_eq!(detail.local_char_id, 777);
         assert_eq!(detail.spirits, 8, "spirits persist through the DB");
         assert!(db.fight_detail(999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn leisurely_mode_persists_on_the_fight_and_its_run_card() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // A Moonlight Village run's phases all record the mode; the grouped card
+        // is labelled from it.
+        for (object_type, leisurely) in [(20450, true), (20451, false)] {
+            let mut f = flawless_fight("Moonlight Village", object_type, vec![]);
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some("mv-leisurely".to_string());
+            f.leisurely = leisurely;
+            db.insert_fight(&f).unwrap();
+        }
+        // An untouched dungeon is never labelled.
+        db.insert_fight(&flawless_fight("Fungal Cavern", 45712, vec![]))
+            .unwrap();
+
+        let cards = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let mv = cards
+            .iter()
+            .find(|c| c.dungeon == "Moonlight Village")
+            .expect("Moonlight Village card");
+        assert!(mv.leisurely, "any phase carrying the mode labels the run");
+        assert!(
+            cards
+                .iter()
+                .find(|c| c.dungeon == "Fungal Cavern")
+                .is_some_and(|c| !c.leisurely),
+            "other dungeons are not labelled",
+        );
+        assert!(
+            db.encounter_detail("mv-leisurely")
+                .unwrap()
+                .unwrap()
+                .leisurely
+        );
+        // Each phase keeps its own column value; the card aggregates them.
+        let stored: i64 = db
+            .conn
+            .query_row(
+                "SELECT leisurely FROM fights WHERE boss_object_type = 20451",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "a phase without the mode stores 0");
     }
 
     #[test]
@@ -9784,6 +9957,7 @@ mod tests {
             local_close_calls: 0,
             aux_member_count: None,
             spirits: 0,
+            leisurely: false,
             participants: vec![],
         }
     }

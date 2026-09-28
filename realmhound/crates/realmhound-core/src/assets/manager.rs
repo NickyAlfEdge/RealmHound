@@ -660,6 +660,15 @@ pub fn is_mv_dance_concluded_text(text: &str) -> bool {
     text == "This concludes the Moonlight Dance."
 }
 
+/// The notification the game raises when a Moonlight Village group consumes a
+/// Tofu Delicacy and turns the run into Leisurely Mode: the phases are shorter
+/// and the loot is reduced, so the run is labelled apart from a normal clear.
+/// The payload is a JSON blob (the server message key carries the effect name
+/// and the initiating player's name), so match on the effect name inside it.
+pub fn is_mv_leisurely_mode_notification(message: &str) -> bool {
+    message.contains("Leisurely mode was initiated")
+}
+
 /// Moonlight Village spirit object ("MV Total Counter"). One instance spawns per
 /// spirit released at the end of a dance (or Umi) phase -- always in pairs and
 /// up to 8 per phase -- so the number of distinct instances observed in a run is
@@ -4073,6 +4082,18 @@ mod tests {
         let manager = AssetManager::new();
         assert!(!manager.is_loaded());
         assert!(manager.assets_dir().is_none());
+    }
+
+    #[test]
+    fn mv_leisurely_notification_matches_the_server_message() {
+        // The game raises this server message (a JSON blob keyed by effect name)
+        // when the group consumes the Tofu Delicacy; the player name varies.
+        let message = r#"{"k":"s.something_by_player","t":{"name":"Leisurely mode was initiated","player":"KinSoy"}}"#;
+        assert!(is_mv_leisurely_mode_notification(message));
+        assert!(!is_mv_leisurely_mode_notification(
+            r#"{"k":"s.something_by_player","t":{"name":"Kalek's Trial was initiated"}}"#
+        ));
+        assert!(!is_mv_leisurely_mode_notification(""));
     }
 
     #[test]
