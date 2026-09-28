@@ -306,6 +306,11 @@ pub struct CompletedFight {
     /// Eyesmall), the number of distinct member instances seen in the world this
     /// run. `None` for ordinary boss fights. Drives the "xN" count on the row.
     pub aux_member_count: Option<i32>,
+    /// Moonlight Village spirits collected during this fight (0 for every other
+    /// boss, and for fights recorded before spirit tracking). Each spirit is one
+    /// `MV Total Counter` object released at the end of a dance/Umi phase; the
+    /// run total drives the dungeon's loot tier.
+    pub spirits: i32,
     /// Per-participant contributions, sorted by damage descending on finalize.
     pub participants: Vec<FightParticipant>,
 }

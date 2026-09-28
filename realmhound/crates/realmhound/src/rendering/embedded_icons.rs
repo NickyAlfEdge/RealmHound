@@ -92,6 +92,9 @@ pub enum EmbeddedIcon {
     LegacyPortalWoodlandLabyrinth,
     /// Legacy The Shatters portal (original art missing from game assets).
     LegacyPortalShatters,
+    /// Moonlight Village spirit/flame collected during a dance or Umi phase
+    /// (ForgeFire.png, reused as the spirit sprite).
+    MvSpirit,
 }
 
 impl EmbeddedIcon {
@@ -137,6 +140,7 @@ impl EmbeddedIcon {
         EmbeddedIcon::LegacyPortalCrawlingDepths,
         EmbeddedIcon::LegacyPortalWoodlandLabyrinth,
         EmbeddedIcon::LegacyPortalShatters,
+        EmbeddedIcon::MvSpirit,
     ];
 
     /// Embedded legacy dungeon portal for the given 0-based index, matching the
@@ -221,6 +225,7 @@ impl EmbeddedIcon {
             EmbeddedIcon::LegacyPortalShatters => {
                 include_bytes!("../../assets/portals/shatters_leg.png")
             }
+            EmbeddedIcon::MvSpirit => include_bytes!("../../assets/ForgeFire.png"),
         }
     }
 
@@ -267,6 +272,7 @@ impl EmbeddedIcon {
             EmbeddedIcon::LegacyPortalCrawlingDepths => "legacy_portal_cdepths",
             EmbeddedIcon::LegacyPortalWoodlandLabyrinth => "legacy_portal_wlab",
             EmbeddedIcon::LegacyPortalShatters => "legacy_portal_shatters",
+            EmbeddedIcon::MvSpirit => "mv_spirit_icon",
         }
     }
 }

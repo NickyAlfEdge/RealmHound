@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 50;
+pub const SCHEMA_VERSION: i32 = 51;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -71,6 +71,9 @@ pub struct FightRecord {
     /// the number of distinct member instances seen this run; drives the "xN"
     /// count. `None` for ordinary boss fights and legacy rows.
     pub aux_member_count: Option<i32>,
+    /// Moonlight Village spirits collected during this fight (0 for other bosses
+    /// and for rows recorded before spirit tracking).
+    pub spirits: i32,
     /// Participants (sorted by damage descending as stored).
     pub participants: Vec<ParticipantRecord>,
 }
@@ -1231,6 +1234,18 @@ impl CombatDatabase {
             self.purge_fights_by_type(&[34465])?;
             self.conn.execute_batch("PRAGMA user_version = 50")?;
         }
+        if from_version < 51 {
+            // v50 -> v51: per-fight Moonlight Village spirit count. Each spirit
+            // released at the end of a dance/Umi phase is one `MV Total Counter`
+            // object; the run total drives the dungeon's loot tier. Legacy rows
+            // default to 0 (the count was never captured for them).
+            if !self.column_exists("fights", "spirits")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN spirits INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 51")?;
+        }
         Ok(())
     }
 
@@ -2201,7 +2216,8 @@ impl CombatDatabase {
                 local_close_calls INTEGER NOT NULL DEFAULT 0,
                 aux_member_count INTEGER,
                 reached_zero INTEGER NOT NULL DEFAULT 0,
-                joined_late INTEGER NOT NULL DEFAULT 0
+                joined_late INTEGER NOT NULL DEFAULT 0,
+                spirits INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS stat_awards (
@@ -2326,8 +2342,8 @@ impl CombatDatabase {
                (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
-                dungeon_entered_at, reached_zero, joined_late)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
+                dungeon_entered_at, reached_zero, joined_late, spirits)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -2348,6 +2364,7 @@ impl CombatDatabase {
                 fight.dungeon_entered_at,
                 fight.reached_zero as i32,
                 fight.joined_late as i32,
+                fight.spirits,
             ],
         )?;
         let fight_id = tx.last_insert_rowid();
@@ -2429,7 +2446,7 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -2457,6 +2474,7 @@ impl CombatDatabase {
             local_close_calls: row.get(12)?,
             aux_member_count: row.get(13)?,
             dungeon_entered_at: row.get(14)?,
+            spirits: row.get(15)?,
             participants: Vec::new(),
         })
     }
@@ -3351,7 +3369,7 @@ impl CombatDatabase {
         let mut sql = String::from(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -3379,7 +3397,7 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -3421,7 +3439,7 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -4424,6 +4442,7 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             } else {
                 Some(group.iter().map(|g| g.aux_member_count.unwrap_or(0)).sum())
             },
+            spirits: group.iter().map(|g| g.spirits).sum(),
             participants: aggregate_roster(&group),
         });
     }
@@ -4502,6 +4521,7 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             killed: group.iter().any(|g| g.killed),
             local_close_calls: group.iter().map(|g| g.local_close_calls).sum(),
             aux_member_count: p.aux_member_count,
+            spirits: group.iter().map(|g| g.spirits).sum(),
             participants: aggregate_roster(&group),
         });
     }
@@ -4819,6 +4839,7 @@ mod tests {
             encounter_run_id: None,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
             participants: vec![
                 FightParticipant {
                     object_id: 600,
@@ -4923,6 +4944,7 @@ mod tests {
             encounter_run_id: None,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
             participants,
         }
     }
@@ -7034,10 +7056,13 @@ mod tests {
     #[test]
     fn fight_detail_round_trip() {
         let mut db = CombatDatabase::open_in_memory().unwrap();
-        let id = db.insert_fight(&sample_fight()).unwrap();
+        let mut fight = sample_fight();
+        fight.spirits = 8;
+        let id = db.insert_fight(&fight).unwrap();
         let detail = db.fight_detail(id).unwrap().unwrap();
         assert_eq!(detail.participants.len(), 2);
         assert_eq!(detail.local_char_id, 777);
+        assert_eq!(detail.spirits, 8, "spirits persist through the DB");
         assert!(db.fight_detail(999_999).unwrap().is_none());
     }
 
@@ -9758,6 +9783,7 @@ mod tests {
             killed: true,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
             participants: vec![],
         }
     }

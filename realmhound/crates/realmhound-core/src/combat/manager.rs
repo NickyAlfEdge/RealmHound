@@ -254,9 +254,17 @@ impl CombatManager {
     /// A loot bag was attributed to a mob. Realm events whose core boss can drop
     /// its bag without ever being seen dying (Towering Perfection) latch their
     /// card to Completed on the bag, even when only the segments were damaged.
-    pub fn on_boss_loot(&mut self, mob_type: i32, map_seed: i32) {
+    ///
+    /// Moonlight Village is the same shape: its bosses floor invulnerable, so a
+    /// bag recorded in the instance is what clears them (or Kitsune Umi, for her
+    /// dropper's loot). The finalized fights are persisted here.
+    pub fn on_boss_loot(&mut self, mob_type: i32, map_seed: i32, time_ms: i64) {
         if map_seed == 0 {
             return;
+        }
+        let mv_finished = self.tracker.on_instance_loot(mob_type, map_seed, time_ms);
+        if !mv_finished.is_empty() {
+            self.persist(mv_finished);
         }
         if let Some(enc_id) = crate::assets::encounter_loot_completes(mob_type) {
             self.pending_loot_completions.insert((map_seed, enc_id));
@@ -639,6 +647,7 @@ mod tests {
             encounter_run_id: None,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
             participants,
         }
     }

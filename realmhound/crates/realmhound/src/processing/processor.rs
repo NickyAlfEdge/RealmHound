@@ -2753,9 +2753,10 @@ impl PacketProcessor {
                 for drop in &new_drops {
                     // A core-boss bag latches its realm-event card to Completed
                     // even when the core (e.g. Towering Perfection) was never seen
-                    // dying and only its segments were damaged.
+                    // dying and only its segments were damaged; a Moonlight
+                    // Village bag is what clears the (invulnerable) dancers/Umi.
                     self.combat
-                        .on_boss_loot(drop.mob_type, drop.player.map_seed);
+                        .on_boss_loot(drop.mob_type, drop.player.map_seed, time_ms as i64);
                     self.emit(UiPayload::PushLoot(drop.clone()));
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
                     if let Some((ref settings, ref catalog)) = enchant_ctx {

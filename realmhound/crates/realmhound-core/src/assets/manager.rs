@@ -608,26 +608,67 @@ pub fn prismimic_display_name(id: i32) -> Option<&'static str> {
 }
 
 /// Whether `id` is an invulnerable-finish boss: one that never reaches 0 HP but
-/// is instead scored by a completion marker spawning (a Moonlight Village dancer
-/// or Umi, or a Legacy Lair of Draconis dragon whose loot balloon chest marks
-/// it done). The combat tracker suspends these by type so a re-detection or the
-/// self-destruct despawn folds into one fight scored when its marker fires.
+/// is instead scored by the encounter's completion (a Moonlight Village dancer
+/// or Umi, whose run is cleared by its loot, or a Legacy Lair of Draconis dragon
+/// whose loot balloon chest marks it done). The combat tracker suspends these by
+/// type so a re-detection or the self-destruct despawn folds into one fight.
 pub fn is_invuln_finish_boss(id: i32) -> bool {
-    COMPLETION_MARKER_MAP
-        .iter()
-        .any(|(_, targets)| targets.contains(&id))
+    is_mv_boss(id)
+        || COMPLETION_MARKER_MAP
+            .iter()
+            .any(|(_, targets)| targets.contains(&id))
 }
 
-/// Moonlight Village mechanics bosses: the three dancers (Sage Genji 20450,
-/// Dancer Miko 20451, Drummer Kaguya 20452) and the secret boss Kitsune Umi
-/// (20493). Their XML `MaxHitPoints` is only a nominal figure -- they floor
-/// invulnerable instead of dying and the encounter is scored by a completion
-/// marker -- so the HP they carry is not a real damage pool. The combat engine
-/// must not cap damage to it (the party's overkill is really absorbed by an
-/// effectively-infinite pool) and the UI must express each player's share of
-/// the party's tracked total rather than a fraction of that fake pool.
-pub fn is_hp_uncapped_boss(id: i32) -> bool {
-    matches!(id, 20450 | 20451 | 20452 | 20493)
+/// Whether `id` is a Moonlight Village mechanics boss: the three dancers (Sage
+/// Genji 20450, Dancer Miko 20451, Drummer Kaguya 20452) or the secret boss
+/// Kitsune Umi (20493).
+///
+/// Their XML `MaxHitPoints` is only a nominal figure -- they floor invulnerable
+/// instead of dying, and the run is cleared by its completion (the dancers'
+/// concluding line, or the loot their droppers emit) -- so the HP they carry is
+/// not a real damage pool. The combat engine must not cap damage to it (the
+/// party's overkill is really absorbed by an effectively-infinite pool) and the
+/// UI must express each player's share of the party's tracked total rather than
+/// a fraction of that fake pool.
+pub fn is_mv_boss(id: i32) -> bool {
+    MV_DANCER_TYPES.contains(&id) || id == MV_UMI_TYPE
+}
+
+/// Moonlight Village dancers, in the order the encounter is fought.
+pub const MV_DANCER_TYPES: &[i32] = &[20450, 20451, 20452];
+/// Moonlight Village's optional secret boss, Kitsune Umi.
+pub const MV_UMI_TYPE: i32 = 20493;
+
+/// Which Moonlight Village bosses a recorded loot bag clears. The invisible
+/// `MV Dungeon Complete` (0x50B2) and `MV Umi Complete` (0xC0BB) objects spawn
+/// around the start of the encounter (which is fine -- it is *not* a completion
+/// signal) and emit the dungeon's loot and XP when the run is cleared. Kitsune
+/// Umi's loot (or her dropper) clears only her; anything else in the instance is
+/// the dancers' loot, which pools the whole run and is therefore never resolved
+/// to a single dancer.
+pub fn mv_loot_completion_targets(mob_type: i32) -> &'static [i32] {
+    if mob_type == MV_UMI_TYPE || mob_type == 0xC0BB {
+        &[MV_UMI_TYPE]
+    } else {
+        MV_DANCER_TYPES
+    }
+}
+
+/// The line the dancers say when the Moonlight Village dance concludes. Emitted
+/// just before the clear loot lands, so it is the earliest completion signal.
+pub fn is_mv_dance_concluded_text(text: &str) -> bool {
+    text == "This concludes the Moonlight Dance."
+}
+
+/// Moonlight Village spirit object ("MV Total Counter"). One instance spawns per
+/// spirit released at the end of a dance (or Umi) phase -- always in pairs and
+/// up to 8 per phase -- so the number of distinct instances observed in a run is
+/// the spirit total that drives the dungeon's loot tier.
+pub const MV_SPIRIT_TYPE: i32 = 0x5026;
+
+/// Whether `id` is the Moonlight Village spirit object (see [`MV_SPIRIT_TYPE`]).
+pub fn is_mv_spirit(id: i32) -> bool {
+    id == MV_SPIRIT_TYPE
 }
 
 /// Towering Perfection (Sprite Forest realm event) types. The tower repeatedly
@@ -657,13 +698,15 @@ pub fn is_dedup_prone_boss(id: i32) -> bool {
 /// a marker spawns the engine marks the mapped boss types as completed for the
 /// current run. Each tuple is `(marker_type, &[boss_type, ...])`.
 const COMPLETION_MARKER_MAP: &[(i32, &[i32])] = &[
-    // MV Dungeon Complete -> the three dancers (Sage Genji, Dancer Miko, Drummer Kaguya).
-    (20658, &[20450, 20451, 20452]),
-    // MV Umi Complete -> Kitsune Umi (secret boss).
-    (49339, &[20493]),
     // Legacy Lair of Draconis dragons self-destruct on defeat and spawn a loot
     // balloon chest; the dragon's HP never reaches 0, so it would otherwise log
     // as Escaped. Each chest spawn marks its dragon Completed.
+    //
+    // Moonlight Village is deliberately absent: its `MV Dungeon Complete` /
+    // `MV Umi Complete` objects spawn at the *start* of the encounter and only
+    // drop loot when the run is cleared, so the completion signal there is the
+    // loot (or the dancers' concluding line), not the spawn. See
+    // [`mv_loot_completion_targets`] and [`is_mv_dance_concluded_text`].
     (30009, &[29849]), // Blue chest -> Nikao (blue)
     (30049, &[29978]), // Black chest -> Feargus (black)
     (30035, &[30017]), // Green chest -> Limoz (green)

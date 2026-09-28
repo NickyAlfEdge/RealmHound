@@ -139,6 +139,12 @@ fn main() {
                 Some(ParsedPacket::EnemyHit(h)) if !incoming => {
                     tracker.on_local_hit(h.target_id, h.bullet_id, h.shooter_id, h.main_id, clock);
                 }
+                // Boss dialogue: the Marble Colossus survival-exit taunt and the
+                // Moonlight Village dance-concluded line are both completion
+                // signals the tracker consumes here.
+                Some(ParsedPacket::Text(t)) => {
+                    finished.extend(tracker.on_boss_text(t.object_id, &t.text, clock));
+                }
                 // Outgoing local `UseItem`: self-computed orb ability damage,
                 // centered on the throw/aim position.
                 Some(ParsedPacket::UseItem(u)) if !incoming => {
@@ -175,6 +181,9 @@ fn main() {
             f.killed,
             f.participants.len(),
         );
+        if f.spirits > 0 {
+            println!("     spirits_collected={}", f.spirits);
+        }
         println!(
             "     attributed_damage={attributed}  (~{pct:.1}% of start HP)  hp_lost_if_killed={hp_lost}"
         );

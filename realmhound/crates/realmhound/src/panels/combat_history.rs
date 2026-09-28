@@ -13,9 +13,7 @@ use std::time::Instant;
 use chrono::{Local, TimeZone, Utc};
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
-    assets::{
-        get_asset_manager, get_dungeon_portal_map, is_hp_uncapped_boss, BossGroup, CatalogEntry,
-    },
+    assets::{get_asset_manager, get_dungeon_portal_map, is_mv_boss, BossGroup, CatalogEntry},
     combat::{
         build_bundle, sanitize_player_name, CombatDatabase, DamageProvenance,
         DamageTakenProvenance, EncounterRecord, FightQuery, FightRecord, FightSelection,
@@ -26,6 +24,7 @@ use realmhound_core::{
 
 use crate::panels::loot::DateFilter;
 use crate::panels::{empty_state, empty_state_lines, AppAction, Panel, PanelContext};
+use crate::rendering::EmbeddedIcon;
 
 /// How often to poll the fight count for new fights (wall clock).
 const POLL_INTERVAL_MS: u128 = 1000;
@@ -44,12 +43,12 @@ const O3_BOSS_TYPE: i32 = 45363;
 
 /// Boss starting HP a fight's damage shares reconcile against, or 0 when the HP
 /// is not a real damage pool. Moonlight Village mechanics bosses floor
-/// invulnerable and are scored by a completion marker instead of a death, so
-/// their nominal max HP is never removed; a 0 pool makes the participant table
-/// show each player's raw share of the tracked total rather than a fraction of
-/// that fake pool (and suppresses the "Unattributed" HP-gap row).
+/// invulnerable and are cleared by the run's own completion instead of a death,
+/// so their nominal max HP is never removed; a 0 pool makes the participant
+/// table show each player's raw share of the tracked total rather than a
+/// fraction of that fake pool (and suppresses the "Unattributed" HP-gap row).
 fn share_hp_pool(boss_object_type: i32, boss_start_hp: i32) -> i64 {
-    if is_hp_uncapped_boss(boss_object_type) {
+    if is_mv_boss(boss_object_type) {
         0
     } else {
         boss_start_hp as i64
@@ -66,7 +65,7 @@ fn boss_bar_label(
     max_hp: i64,
     damage: i64,
 ) -> Option<String> {
-    if is_hp_uncapped_boss(boss_object_type) {
+    if is_mv_boss(boss_object_type) {
         Some(format!("{} / ∞", fmt_thousands(damage)))
     } else if max_hp > 0 {
         Some(format!(
@@ -79,17 +78,23 @@ fn boss_bar_label(
     }
 }
 
-/// The HP segment of a boss row header in a grouped encounter. An uncapped boss
-/// has no finite HP, so its row shows the party's total damage instead of an HP
-/// fraction.
+/// The stat segment of a boss row header in a grouped encounter. An uncapped
+/// boss has no finite HP, so its row shows the party's total damage instead of
+/// an HP fraction, plus the Moonlight Village spirits it released when any were
+/// collected.
 fn boss_row_hp_label(
     boss_object_type: i32,
     boss_start_hp: i32,
     boss_max_hp: i32,
     damage: i64,
+    spirits: i32,
 ) -> String {
-    if is_hp_uncapped_boss(boss_object_type) {
-        format!("Damage {}", fmt_thousands(damage))
+    if is_mv_boss(boss_object_type) {
+        if spirits > 0 {
+            format!("Damage {}  ·  Spirits {}", fmt_thousands(damage), spirits)
+        } else {
+            format!("Damage {}", fmt_thousands(damage))
+        }
     } else {
         format!("HP {}/{}", boss_start_hp, boss_max_hp)
     }
@@ -2611,7 +2616,7 @@ impl CombatHistoryPanel {
 
         // Colored fill proportional to discovered/max HP. An uncapped boss has no
         // finite pool, so its bar is drawn full as an "infinite" bar.
-        let uncapped = is_hp_uncapped_boss(boss_type);
+        let uncapped = is_mv_boss(boss_type);
         let frac = if uncapped {
             1.0
         } else if max_hp > 0 {
@@ -3452,6 +3457,60 @@ impl CombatHistoryPanel {
                             "Wall-clock time from entering the dungeon to the final \
                          boss death, including minion clear and travel between bosses.",
                         );
+                        // Moonlight Village spirits: each spirit released at the
+                        // end of a dance (or Umi) phase is one object, and the
+                        // run total sets the dungeon's loot tier. Shown per side
+                        // because the dancers and Umi have separate thresholds.
+                        let dancer_spirits: i32 = enc
+                            .phases
+                            .iter()
+                            // Sage Genji / Dancer Miko / Drummer Kaguya.
+                            .filter(|p| matches!(p.boss_object_type, 20450..=20452))
+                            .map(|p| p.spirits)
+                            .sum();
+                        let umi_spirits: i32 = enc
+                            .phases
+                            .iter()
+                            .filter(|p| p.boss_object_type == 20493)
+                            .map(|p| p.spirits)
+                            .sum();
+                        for (label, count, tip) in [
+                            (
+                                "Total spirits collected (Dancers): ",
+                                dancer_spirits,
+                                "Moonlight Village spirits collected from Sage Genji, \
+                                 Dancer Miko and Drummer Kaguya. This total sets the \
+                                 dancers' loot tier and the odds of the Kitsune Umi \
+                                 encounter.",
+                            ),
+                            (
+                                "Total spirits collected (Umi): ",
+                                umi_spirits,
+                                "Moonlight Village spirits collected during the \
+                                 Kitsune Umi phases, scored on their own, lower tier \
+                                 thresholds.",
+                            ),
+                        ] {
+                            if count <= 0 {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                ctx.sprite_renderer.draw_embedded_icon(
+                                    ui,
+                                    EmbeddedIcon::MvSpirit,
+                                    rect,
+                                );
+                                ui.label(
+                                    RichText::new(format!("{label}{count}")).color(Color32::GRAY),
+                                )
+                                .hover_tip(tip);
+                            });
+                        }
                         let enc_close_calls = enc.total_close_calls();
                         if enc_close_calls > 0 {
                             let cc_char_id = enc
@@ -3569,6 +3628,7 @@ impl CombatHistoryPanel {
                         phase.boss_start_hp,
                         phase.boss_max_hp,
                         phase.total_damage(),
+                        phase.spirits,
                     );
                     let header = format!(
                         "{arrow}  {phase_name}   {phase_hp}   {dur}",
@@ -3711,7 +3771,7 @@ mod tests {
     use super::{assign_drops_exclusive, boss_bar_label, boss_row_hp_label, share_hp_pool};
 
     #[test]
-    fn hp_uncapped_bosses_share_against_tracked_total() {
+    fn mv_bosses_share_against_tracked_total() {
         // Moonlight Village mechanics bosses have no real HP pool: the share
         // denominator is 0 so the table uses the tracked total, not the boss HP.
         for boss in [20450, 20451, 20452, 20493] {
@@ -3722,7 +3782,7 @@ mod tests {
     }
 
     #[test]
-    fn hp_uncapped_boss_bar_reads_damage_over_infinity() {
+    fn mv_boss_bar_reads_damage_over_infinity() {
         // The top bar labels an uncapped boss by the party's damage against an
         // unlimited pool, and stays a full bar.
         assert_eq!(
@@ -3738,15 +3798,19 @@ mod tests {
     }
 
     #[test]
-    fn hp_uncapped_boss_row_shows_total_damage_only() {
+    fn mv_boss_row_shows_damage_and_spirits() {
         // The row header drops the HP fraction for an uncapped boss and prints
-        // the summed damage once.
+        // the summed damage once, plus collected spirits when any were released.
         assert_eq!(
-            boss_row_hp_label(20452, 720_000, 720_000, 511_088),
+            boss_row_hp_label(20452, 720_000, 720_000, 511_088, 0),
             "Damage 511,088"
         );
         assert_eq!(
-            boss_row_hp_label(0x10E4, 8_000, 12_000, 12_000),
+            boss_row_hp_label(20452, 720_000, 720_000, 511_088, 8),
+            "Damage 511,088  ·  Spirits 8"
+        );
+        assert_eq!(
+            boss_row_hp_label(0x10E4, 8_000, 12_000, 12_000, 0),
             "HP 8000/12000"
         );
     }

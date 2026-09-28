@@ -533,6 +533,9 @@ struct FightState {
     /// begun (boss below full HP on first sight), so remote observed damage is
     /// only a partial figure. Never set for heal-back / aux segments.
     joined_late: bool,
+    /// Moonlight Village spirits released during this fight. Each spirit is one
+    /// `MV Total Counter` object spawned at the end of a dance/Umi phase.
+    spirits: i32,
 }
 
 /// Run-scoped tally of one aux category's member instances (object id -> highest
@@ -716,6 +719,19 @@ pub struct CombatTracker {
     /// onto the next fight started this run so a pre-boss dip still shows on the
     /// run card. Reset on map change.
     run_pending_fight_close_calls: i32,
+    /// Object ids of Moonlight Village spirits (`MV Total Counter`) already
+    /// counted this map instance. The server re-adds an object repeatedly as it
+    /// re-enters view, so deduping by id keeps the tally at one per spirit.
+    /// Cleared on map change / disconnect.
+    mv_spirit_ids: HashSet<i32>,
+    /// Spirits released while no Moonlight Village boss fight was live (the
+    /// release can race the fight's finalize); carried onto the next such fight
+    /// started this run. Reset on map change / disconnect.
+    pending_mv_spirits: i32,
+    /// Whether a Moonlight Village dancer/Umi fight has been engaged this run.
+    /// Until then the run is in the boss-less tutorial lantern phases, whose
+    /// releases must not be scored as spirits.
+    mv_boss_engaged: bool,
 }
 
 impl Default for CombatTracker {
@@ -770,6 +786,9 @@ impl CombatTracker {
             local_low_hp_active: false,
             pending_close_calls: 0,
             run_pending_fight_close_calls: 0,
+            mv_spirit_ids: HashSet::new(),
+            pending_mv_spirits: 0,
+            mv_boss_engaged: false,
         }
     }
 
@@ -865,6 +884,9 @@ impl CombatTracker {
         // state resets so the first dip in the new map always counts.
         self.local_low_hp_active = false;
         self.run_pending_fight_close_calls = 0;
+        self.mv_spirit_ids.clear();
+        self.pending_mv_spirits = 0;
+        self.mv_boss_engaged = false;
         finished
     }
 
@@ -904,6 +926,9 @@ impl CombatTracker {
         self.reset_local_mitigation_windows();
         self.local_low_hp_active = false;
         self.run_pending_fight_close_calls = 0;
+        self.mv_spirit_ids.clear();
+        self.pending_mv_spirits = 0;
+        self.mv_boss_engaged = false;
         finished
     }
 
@@ -962,6 +987,56 @@ impl CombatTracker {
         }
         let spawn_max_hp = self.objects.get(&object_id).map(|o| o.max_hp).unwrap_or(0);
         self.note_aux_instance(object_id, object_type, spawn_max_hp);
+        // A Moonlight Village spirit released at the end of a dance/Umi phase.
+        // The server re-adds the same object as it re-enters view, so count each
+        // id once per run and credit it to the fight that released it. The
+        // dungeon's opening tutorial (three boss-less lantern mini-phases, see
+        // `MV Tutorial Lantern*` objects) precedes the dance and scores no
+        // spirits, so nothing counts until a dancer/Umi fight has been engaged.
+        if crate::assets::is_mv_spirit(object_type) && self.mv_spirit_ids.insert(object_id) {
+            if self.mv_boss_engaged {
+                self.note_mv_spirit();
+            }
+        }
+    }
+
+    /// Credit one collected Moonlight Village spirit to the fight that released
+    /// it: the most recently active dancer/Umi fight. When no such fight is live
+    /// (a phase-end release can race the fight's finalize), hold the spirit until
+    /// the next one starts this run; if the run ends first, [`Self::finalize_all`]
+    /// credits it to the run's last MV fight so the run total stays exact.
+    fn note_mv_spirit(&mut self) {
+        // Ties in `last_activity` (e.g. the burst landing between two phases) are
+        // broken by start time then object id so the pick is deterministic --
+        // `fights` is a HashMap, so its iteration order is not.
+        let live = self
+            .fights
+            .iter()
+            .filter(|(_, f)| crate::assets::is_mv_boss(f.boss_object_type))
+            .max_by_key(|(&id, f)| (f.last_activity, f.started_at, id))
+            .map(|(&id, _)| id);
+        if let Some(id) = live {
+            if let Some(fight) = self.fights.get_mut(&id) {
+                fight.spirits += 1;
+            }
+            return;
+        }
+        // The dancer left view between phases, so its fight is suspended. Credit
+        // the suspension rather than dropping the burst: it is the same run.
+        let dormant = self
+            .dormant_fights
+            .iter()
+            .filter(|(_, f)| crate::assets::is_mv_boss(f.boss_object_type))
+            .max_by_key(|(&ty, f)| (f.last_activity, f.started_at, ty))
+            .map(|(&ty, _)| ty);
+        match dormant {
+            Some(ty) => {
+                if let Some(fight) = self.dormant_fights.get_mut(&ty) {
+                    fight.spirits += 1;
+                }
+            }
+            None => self.pending_mv_spirits += 1,
+        }
     }
 
     /// Update an existing object's stats (from a `NewTick` status, which does not
@@ -1110,6 +1185,14 @@ impl CombatTracker {
         text: &str,
         time_ms: i64,
     ) -> Vec<CompletedFight> {
+        // Moonlight Village: the dancers announce the dance is over just before
+        // the clear loot lands. This is the earliest completion signal, so the
+        // dancer fights are scored here rather than at the (start-of-encounter)
+        // dropper spawn, which also keeps the run's loot attributable to them.
+        if crate::assets::is_mv_dance_concluded_text(text) {
+            self.complete_mv_bosses(crate::assets::MV_DANCER_TYPES, time_ms);
+            return std::mem::take(&mut self.deferred_finished);
+        }
         if !crate::assets::is_second_coming_transition_taunt(text) {
             return Vec::new();
         }
@@ -1122,6 +1205,47 @@ impl CombatTracker {
             return Vec::new();
         }
         self.perform_second_coming_split(object_id, time_ms)
+    }
+
+    /// A loot bag was recorded in the current instance. Moonlight Village's
+    /// mechanics bosses never die, so the run is scored Completed by its loot:
+    /// the invisible `MV Dungeon Complete` / `MV Umi Complete` droppers emit the
+    /// dungeon's bags when the run is cleared, and a bag recorded here therefore
+    /// clears the dancers (or Umi, for her dropper's loot). The droppers' own
+    /// `mob_type` is usually unresolved -- the player never hits them -- so any
+    /// bag in the instance counts, guarded by the dancers having been engaged:
+    /// the tutorial reward bag lands before that and must not score a clear.
+    ///
+    /// Returns any fights finalized as a side effect. A run whose map changes
+    /// with no such loot stays Escaped.
+    pub fn on_instance_loot(
+        &mut self,
+        mob_type: i32,
+        map_seed: i32,
+        time_ms: i64,
+    ) -> Vec<CompletedFight> {
+        if map_seed != self.current_seed
+            || normalize_dungeon(&self.current_map) != crate::loot::MOONLIGHT_VILLAGE_NAME
+            || !self.mv_boss_engaged
+        {
+            return Vec::new();
+        }
+        let targets: &[i32] = crate::assets::mv_loot_completion_targets(mob_type);
+        self.complete_mv_bosses(targets, time_ms);
+        std::mem::take(&mut self.deferred_finished)
+    }
+
+    /// Mark Moonlight Village bosses Completed for the current run and finalize
+    /// their engaged fights. Mirrors what a real death would do: the types are
+    /// remembered so a later re-detection cannot record a second run, and each
+    /// type's live/suspended segments merge into one kill.
+    fn complete_mv_bosses(&mut self, targets: &[i32], time_ms: i64) {
+        for &boss_type in targets {
+            self.completed_boss_types.insert(boss_type);
+            if let Some(cf) = self.consolidate_completed_boss(boss_type, time_ms) {
+                self.deferred_finished.push(cf);
+            }
+        }
     }
 
     /// Finalize the active pre-survival segment for `object_id` (as a
@@ -1166,6 +1290,7 @@ impl CombatTracker {
                 split_done: true,
                 // The local player saw the whole revive segment; not late.
                 joined_late: false,
+                spirits: 0,
             },
         );
         finished
@@ -1278,10 +1403,25 @@ impl CombatTracker {
     ///
     /// Moonlight Village invulnerable-finish bosses (dancers / Umi) are keyed by
     /// type too: a summoner run re-detects them under many object ids before the
-    /// completion marker scores the kill, so type-keyed suspension folds every
+    /// run's clear scores the kill, so type-keyed suspension folds every
     /// re-detection into one fight per boss type instead of one record per id.
     fn suspend_or_finalize(&mut self, fight: FightState, time_ms: i64) -> Option<CompletedFight> {
         let otype = fight.boss_object_type;
+        // Moonlight Village mechanics bosses are always suspended, never finalized
+        // here: they leave view repeatedly across their phases, and their run is
+        // only scored by its completion (the dancers' concluding line or the
+        // run's loot). Holding them keeps every phase's damage and spirits on one
+        // record, and lets a completion land on it however late it arrives; an
+        // unfinished run is finalized as Escaped at map change.
+        if crate::assets::is_mv_boss(otype) {
+            match self.dormant_fights.get_mut(&otype) {
+                Some(existing) => merge_fight_into(existing, fight),
+                None => {
+                    self.dormant_fights.insert(otype, fight);
+                }
+            }
+            return None;
+        }
         if get_asset_manager().is_wandering_boss(otype)
             || crate::assets::is_invuln_finish_boss(otype)
         {
@@ -2153,6 +2293,12 @@ impl CombatTracker {
         let object_max_hp = obj.max_hp;
         let start_hp = if obj.hp > 0 { obj.hp } else { obj.max_hp };
 
+        // Engaging a dancer/Umi ends the boss-less tutorial: from here on,
+        // released spirits score.
+        if crate::assets::is_mv_boss(object_type) {
+            self.mv_boss_engaged = true;
+        }
+
         // A Moonlight Village boss already completed AND recorded this run must
         // not spawn a second fight from lingering fire on the now-invulnerable
         // object, which would duplicate the Completed record. The
@@ -2237,6 +2383,13 @@ impl CombatTracker {
                 // First sight below full HP means the fight was already underway
                 // when the local player arrived.
                 joined_late: object_max_hp > 0 && start_hp < object_max_hp,
+                // Spirits released between fights (their phase end raced the
+                // previous fight's finalize) belong to this one.
+                spirits: if crate::assets::is_mv_boss(object_type) {
+                    std::mem::take(&mut self.pending_mv_spirits)
+                } else {
+                    0
+                },
             },
         );
         true
@@ -2286,6 +2439,7 @@ impl CombatTracker {
                 display_name_override: Some(aux.display_name),
                 split_done: false,
                 joined_late: false,
+                spirits: 0,
             })
     }
 
@@ -2351,6 +2505,19 @@ impl CombatTracker {
             fights.push(seg);
         }
         fights.extend(self.aux_fights.drain().map(|(_, f)| f));
+        // Moonlight Village spirits released after the run's last dancer/Umi
+        // fight finalized (a phase-end burst racing the finalize) still belong to
+        // the run: credit them to its most recent MV fight, so the run total stays
+        // exact even though the individual burst was late.
+        if self.pending_mv_spirits > 0 {
+            if let Some(f) = fights
+                .iter_mut()
+                .filter(|f| crate::assets::is_mv_boss(f.boss_object_type))
+                .max_by_key(|f| (f.last_activity, f.started_at, f.boss_object_id))
+            {
+                f.spirits += std::mem::take(&mut self.pending_mv_spirits);
+            }
+        }
         let mut finished = std::mem::take(&mut self.deferred_finished);
         for fight in fights {
             if let Some(cf) = self.finalize_fight(fight, time_ms) {
@@ -2524,11 +2691,11 @@ impl CombatTracker {
         // so it is a no-op for crowded fights where we saw less than the full HP.
         //
         // Moonlight Village mechanics bosses are exempt: they never lose HP (the
-        // encounter is scored by a completion marker, not a death), so their
-        // nominal max HP is not the damage they absorbed. Capping there would
-        // truncate the party's real output, so raw damage is kept as-is and
-        // shares are later taken against the tracked total.
-        if fight.killed && !crate::assets::is_hp_uncapped_boss(fight.boss_object_type) {
+        // run is scored by its clear, not by a death), so their nominal max HP is
+        // not the damage they absorbed. Capping there would truncate the party's
+        // real output, so raw damage is kept as-is and shares are later taken
+        // against the tracked total.
+        if fight.killed && !crate::assets::is_mv_boss(fight.boss_object_type) {
             cap_overkill(&mut participants, fight.boss_start_hp as i64);
         }
 
@@ -2596,6 +2763,7 @@ impl CombatTracker {
                     Some(count)
                 }
             }),
+            spirits: fight.spirits,
             participants,
         };
 
@@ -3303,6 +3471,7 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
     dst.killed = dst.killed || src.killed;
     dst.joined_late = dst.joined_late || src.joined_late;
     dst.local_close_calls += src.local_close_calls;
+    dst.spirits += src.spirits;
     for (aid, accum) in src.attackers {
         let e = dst.attackers.entry(aid).or_default();
         e.damage += accum.damage;
@@ -3793,6 +3962,7 @@ mod tests {
             display_name_override: None,
             split_done: false,
             joined_late: false,
+            spirits: 0,
         }
     }
 
@@ -4192,9 +4362,9 @@ mod tests {
     #[test]
     fn mv_completed_dancer_keeps_local_present_when_nexusing_after() {
         // Moonlight Village bosses never reach 0 HP -- they lock invulnerable and
-        // are completed by a marker object. A completion marker seen this run
-        // scores the dancer as killed, so a later nexus must keep the local player
-        // Present / Completed rather than flagging them Nexused.
+        // are completed by the run's clear (the dancers' concluding line, or their
+        // loot). The completion scores the dancer as killed, so the local player is
+        // recorded Present / Completed rather than Nexused.
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
@@ -4218,29 +4388,22 @@ mod tests {
         t.on_local_hit(500, 10, 1000, 1000, 200);
         // Dancer floors at 1 HP (invulnerable), never removed.
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        // MV Dungeon Complete marker (20658) -> the dancer is scored completed.
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        // Local nexuses afterwards; completion must survive the departure finalize.
-        let done = t.on_map_change("Nexus", 0, 500);
+        // The dance concludes: the dancer is scored Completed and its record is
+        // emitted. The local player is still present at that moment.
+        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 350);
         assert_eq!(done.len(), 1);
-        assert!(
-            done[0].killed,
-            "marker completion survives the nexus finalize"
-        );
+        assert!(done[0].killed, "completion scores the dancer as killed");
         let local = done[0]
             .participants
             .iter()
             .find(|p| p.is_local)
             .expect("local");
         assert_eq!(local.end_status, ParticipantEndStatus::Present);
+        // A later nexus adds nothing: the completion was already recorded.
+        assert!(
+            t.on_map_change("Nexus", 0, 500).is_empty(),
+            "no duplicate record after the nexus"
+        );
     }
 
     #[test]
@@ -6822,17 +6985,8 @@ mod tests {
             },
         );
         t.on_local_hit(500, 10, 1000, 1000, 120);
-        // MV Dungeon Complete marker scores the dancer as completed.
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        let done = t.on_tick(450);
+        // The dance concludes: the dancer is scored completed.
+        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 400);
         assert_eq!(done.len(), 1);
         assert!(done[0].killed);
         assert_eq!(
@@ -6840,6 +6994,101 @@ mod tests {
             450_000,
             "raw damage kept, not capped to the nominal 180000 HP"
         );
+    }
+
+    #[test]
+    fn mv_spirits_count_once_per_object_and_credit_the_active_fight() {
+        // Each spirit is one `MV Total Counter` object released at a phase end.
+        // The server re-adds the same object as it re-enters view, so the tally
+        // must count each id once and credit it to the live dancer fight.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 180_000), stat(StatType::HP, 180_000)],
+            ),
+            100,
+        );
+        t.on_damage(500, 600, 10_000, 110);
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 120);
+        // A phase-end burst of four spirits (pairs, up to 8 per phase).
+        let spirit = |id: i32| status(id, vec![stat(StatType::Size, 105)]);
+        for id in 700..704 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 200);
+        }
+        // Re-adds of the same objects (re-entering view) must not double-count.
+        for id in 700..704 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 240);
+        }
+        // A later burst adds two more.
+        for id in 710..712 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 300);
+        }
+        let done = t.on_map_change("Nexus", 0, 500);
+        let mv: Vec<_> = done
+            .iter()
+            .filter(|f| f.boss_object_type == 20450)
+            .collect();
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].spirits, 6, "four plus two, re-adds deduped");
+    }
+
+    #[test]
+    fn mv_tutorial_spirits_do_not_count_before_a_boss_is_engaged() {
+        // The dungeon opens with three boss-less lantern mini-phases. Any spirit
+        // releases there (or any pre-fight noise) must not score; counting starts
+        // only once a dancer/Umi fight has been engaged.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        let spirit = |id: i32| status(id, vec![stat(StatType::Size, 105)]);
+        for id in 700..704 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 50);
+        }
+        // Engage Sage Genji, then a phase-end burst counts.
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 180_000), stat(StatType::HP, 180_000)],
+            ),
+            100,
+        );
+        t.on_damage(500, 600, 10_000, 110);
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 120);
+        for id in 710..714 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 200);
+        }
+        let done = t.on_map_change("Nexus", 0, 500);
+        let mv: Vec<_> = done
+            .iter()
+            .filter(|f| f.boss_object_type == 20450)
+            .collect();
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].spirits, 4, "only the post-engagement burst counts");
     }
 
     #[test]
@@ -7577,7 +7826,7 @@ mod tests {
     // A Moonlight Village dancer floors at 1 HP (invulnerable) and is never
     // removed, so without a completion signal it finalizes as Escaped.
     #[test]
-    fn mv_dancer_without_marker_stays_escaped() {
+    fn mv_dancer_without_completion_stays_escaped() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
@@ -7602,15 +7851,28 @@ mod tests {
         t.on_local_hit(500, 10, 1000, 1000, 200);
         // Floors at 1 HP -- never 0, so the kill heuristic never fires.
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
+        // The completion dropper is present but emits no loot: the run escaped.
+        t.on_object_spawn(
+            15598,
+            20658,
+            &status(
+                15598,
+                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
+            ),
+            350,
+        );
         let done = t.on_map_change("Nexus", 0, 500);
         assert_eq!(done.len(), 1);
-        assert!(!done[0].killed, "dancer at 1 HP with no marker is Escaped");
+        assert!(
+            !done[0].killed,
+            "a dancer cleared with no loot recorded is Escaped"
+        );
     }
 
-    // The MV Dungeon Complete marker (20658) scores all three dancers as
-    // completed even though they go invulnerable rather than dying.
+    // The dancers' concluding line scores all three as Completed even though they
+    // go invulnerable rather than dying.
     #[test]
-    fn mv_dungeon_complete_marker_completes_dancer() {
+    fn mv_dance_concluded_text_completes_dancer() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
@@ -7625,29 +7887,18 @@ mod tests {
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        // Completion marker spawns (invisible, 100 HP).
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        // The live fight is flagged immediately; a tick finalizes it as a kill.
-        let done = t.on_tick(450);
+        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 400);
         assert_eq!(done.len(), 1);
         assert!(
             done[0].killed,
-            "dancer completed via MV Dungeon Complete marker"
+            "dancer completed via the dance-concluded line"
         );
     }
 
-    // The MV Umi Complete marker (49339) completes Umi, who heals back to full
-    // and never dies.
+    // A recorded loot bag is the other completion signal: the droppers emit the
+    // run's loot when it is cleared. Kitsune Umi's loot clears only Umi.
     #[test]
-    fn mv_umi_complete_marker_completes_umi() {
+    fn mv_loot_completes_umi_only() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
@@ -7663,36 +7914,23 @@ mod tests {
         );
         t.on_local_hit(254, 7, 1000, 1000, 200);
         t.on_object_status(254, &status(254, vec![stat(StatType::HP, 180_000)]), 300);
-        t.on_object_spawn(
-            15599,
-            49339,
-            &status(
-                15599,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        let done = t.on_map_change("Nexus", 0, 500);
+        // Her loot lands (resolved to Umi, or her dropper's own type).
+        let done = t.on_instance_loot(20493, 42, 400);
         assert_eq!(done.len(), 1);
-        assert!(done[0].killed, "Umi completed via MV Umi Complete marker");
+        assert!(done[0].killed, "Umi completed by her loot");
+        assert_eq!(done[0].boss_object_type, 20493);
     }
 
-    // A marker only completes its own mapped boss types: the Umi marker must not
-    // complete an in-progress dancer.
+    // The dance concluded line completes the dancers only: Umi's optional fight
+    // is scored by her own loot, never by the dancers' clear.
     #[test]
-    fn mv_marker_only_completes_mapped_types() {
+    fn mv_dance_text_does_not_complete_umi() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
-        t.on_object_spawn(
-            500,
-            20450,
-            &status(
-                500,
-                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
-            ),
-            100,
-        );
+        let hp = || vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)];
+        t.on_object_spawn(500, 20450, &status(500, hp()), 100);
+        t.on_object_spawn(254, 20493, &status(254, hp()), 110);
         t.pending_shots.insert(
             10,
             PendingShot {
@@ -7702,43 +7940,29 @@ mod tests {
             },
         );
         t.on_local_hit(500, 10, 1000, 1000, 200);
+        t.on_local_hit(254, 10, 1000, 1000, 210);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        // Only the Umi marker fires -- the dancer is not one of its targets.
-        t.on_object_spawn(
-            15599,
-            49339,
-            &status(
-                15599,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
+        assert_eq!(
+            t.on_boss_text(500, "This concludes the Moonlight Dance.", 400)
+                .len(),
+            1
         );
         let done = t.on_map_change("Nexus", 0, 500);
-        assert_eq!(done.len(), 1);
-        assert!(
-            !done[0].killed,
-            "dancer not completed by an unrelated marker"
-        );
+        let umi: Vec<_> = done
+            .iter()
+            .filter(|f| f.boss_object_type == 20493)
+            .collect();
+        assert_eq!(umi.len(), 1);
+        assert!(!umi[0].killed, "Umi only clears on her own loot");
     }
 
-    // The completed-boss flag is scoped to the run: a marker in one map does not
-    // complete a same-type boss in a later map instance.
+    // A completion in one dungeon instance does not carry to the next: a dancer
+    // in a later Moonlight Village run starts fresh.
     #[test]
     fn mv_completion_flag_clears_on_map_change() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            100,
-        );
-        // New run: a dancer here must not inherit the previous run's completion.
-        t.on_map_change("Moonlight Village", 43, 1000);
         t.on_object_spawn(
             500,
             20450,
@@ -7746,18 +7970,35 @@ mod tests {
                 500,
                 vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
             ),
+            100,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 200);
+        assert_eq!(
+            t.on_boss_text(500, "This concludes the Moonlight Dance.", 300)
+                .len(),
+            1
+        );
+        // New run: a dancer here must not inherit the previous run's completion.
+        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_object_spawn(
+            600,
+            20450,
+            &status(
+                600,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
             1100,
         );
         t.pending_shots.insert(
-            10,
+            11,
             PendingShot {
                 base_damage: 1000,
                 armor_piercing: false,
                 ..Default::default()
             },
         );
-        t.on_local_hit(500, 10, 1000, 1000, 1200);
-        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 1300);
+        t.on_local_hit(600, 11, 1000, 1000, 1200);
+        t.on_object_status(600, &status(600, vec![stat(StatType::HP, 1)]), 1300);
         let done = t.on_map_change("Nexus", 0, 1500);
         assert_eq!(done.len(), 1);
         assert!(
@@ -7784,18 +8025,9 @@ mod tests {
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        // Marker fires, then a tick finalizes the flagged fight as a kill.
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        let first = t.on_tick(450);
-        assert_eq!(first.len(), 1, "one completed dancer from the tick");
+        // The dance concludes while the fight is live.
+        let first = t.on_boss_text(500, "This concludes the Moonlight Dance.", 400);
+        assert_eq!(first.len(), 1, "one completed dancer");
         assert!(first[0].killed);
         // The invulnerable dancer object is still present; a late hit must not
         // create a second fight for the same completed boss type.
@@ -7816,9 +8048,9 @@ mod tests {
         );
     }
 
-    // A summoner run re-detects a dancer under many object ids before the
-    // completion marker fires. Every re-detection folds into one fight so the DB
-    // records a single row, not one per id.
+    // A summoner run re-detects a dancer under many object ids before the dance
+    // concludes. Every re-detection folds into one fight so the DB records a
+    // single row, not one per id.
     #[test]
     fn mv_dancer_redetected_under_many_ids_yields_one_record() {
         let mut t = CombatTracker::new();
@@ -7840,17 +8072,8 @@ mod tests {
                 assert!(t.on_tick(base + 30).is_empty(), "nothing surfaces mid-run");
             }
         }
-        // MV Dungeon Complete marker fires while the last detection is live.
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            3000,
-        );
-        let done = t.on_tick(3050);
+        // The dance concludes while the last detection is live.
+        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 3000);
         assert_eq!(
             done.len(),
             1,
@@ -7893,16 +8116,7 @@ mod tests {
             2,
             "two live same-type fights coexist",
         );
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            40,
-        );
-        let done = t.on_tick(50);
+        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 40);
         assert_eq!(
             done.len(),
             1,
