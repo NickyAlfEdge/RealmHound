@@ -350,6 +350,25 @@ fn threshold_field(ui: &mut egui::Ui, value: &mut i32, enabled: bool, tip: &str)
     changed
 }
 
+/// A compact numeric field for how many of a dungeon's recent spawns are
+/// compared when recognizing an event mod from the user's own runs. Returns
+/// whether the value changed.
+fn run_count_field(ui: &mut egui::Ui, value: &mut u32) -> bool {
+    let response = ui.add(
+        egui::DragValue::new(value)
+            .speed(0.2)
+            .range(realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE),
+    );
+    let changed = response.changed();
+    response.hover_tip(
+        "How many consecutive spawns of the same dungeon must carry the mod before it counts \
+         as an event mod. Three tells an event mod from a coincidence while still adapting \
+         within a session; higher is stricter.",
+    );
+    ui.label(RichText::new("runs in a row").weak().small());
+    changed
+}
+
 /// Cache key for the projected Taskbar items. When every field matches the
 /// previous frame the cached `taskbar_items_cache` is reused instead of
 /// reprojecting missions/quests (and their tooltips) again.
@@ -3849,12 +3868,35 @@ impl RealmHoundApp {
                     "Events make participating dungeons spawn with a preset mod (e.g. Steamworks \
                      Maintenance on Kogbold Steamworks, called as \"turrets off\", or Found \
                      Treasure! on Woodland Labyrinth), even when nothing else was rolled. On \
-                     (default) they are called like any other mod; off drops their tags. \
-                     RealmHound also learns them from your own runs: a mod carried by the last \
-                     three instances of a dungeon, including one where it was the only mod, is \
-                     treated as an event mod too. The loot/dust/xp it grants is called either way.",
+                     (default) they are called like any other mod; off drops their tags. The \
+                     loot/dust/xp it grants is called either way.",
                 )
                 .changed();
+
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                settings_changed |= shadcn
+                    .switch(
+                        ui,
+                        &mut current.learn_event_mods,
+                        "Learn event mods from my runs",
+                    )
+                    .hover_tip(
+                        "Recognizes an event mod from your own dungeons instead of the built-in \
+                         list: a mod carried by every one of the last few spawns of the same \
+                         dungeon - with at least one of those spawns having no other mods - is \
+                         treated as an event mod for the rest of the session. A mod that stands \
+                         alone in an instance can't be part of the roll, and one that repeats \
+                         across spawns isn't a coincidence. This is what picks up an event a \
+                         table update never mentioned. Only affects calls while \"Call special \
+                         event mods\" is off.",
+                    )
+                    .changed();
+                ui.add_enabled_ui(current.learn_event_mods, |ui| {
+                    settings_changed |= run_count_field(ui, &mut current.learn_event_mods_runs);
+                });
+            });
 
             ui.add_space(6.0);
 

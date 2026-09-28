@@ -594,11 +594,10 @@ const DUNGEON_WINDOW_ESTIMATED: std::time::Duration = std::time::Duration::from_
 /// Time from a realm-close message to the castle teleport.
 const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// How many recent entries of one dungeon are compared when recognizing the
-/// mods an event applies to every instance of it. Three is enough to tell an
-/// event mod from a coincidence, and short enough to recognize an event that
-/// started mid-session.
-const LEARN_EVENT_MOD_ENTRIES: usize = 3;
+/// How many recent entries of one dungeon the panel remembers, and therefore the
+/// widest window `learn_event_mods_runs` can compare. An event that started
+/// mid-session is recognized a few runs in, so a handful of spawns is enough.
+const MAX_LEARN_EVENT_MOD_SETS: usize = 10;
 
 /// Whether two modifier tokens name the same mod (wire ids vary by separators).
 fn same_modifier(a: &str, b: &str) -> bool {
@@ -895,6 +894,13 @@ pub struct LiveFeedPanel {
     /// Whether to call mods the game applies to an instance itself during a
     /// special event. Mirrors `Settings.live_feed.call_event_mods`.
     call_event_mods: bool,
+    /// Whether to recognize event mods from the dungeons the user enters.
+    /// Mirrors `Settings.live_feed.learn_event_mods`.
+    learn_event_mods: bool,
+    /// How many consecutive spawns of one dungeon must carry a mod before it is
+    /// recognized as an event mod. Mirrors
+    /// `Settings.live_feed.learn_event_mods_runs`.
+    learn_event_mods_runs: u32,
     /// Modifier sets of this session's dungeon entries, keyed by the dungeon's
     /// display name, newest last (capped). Used to recognize the mods the game
     /// applies to every instance of a dungeon during an event, which the game
@@ -1051,6 +1057,8 @@ impl LiveFeedPanel {
             dust_threshold: 10,
             xp_threshold: 10,
             call_event_mods: true,
+            learn_event_mods: true,
+            learn_event_mods_runs: realmhound_core::settings::LEARN_EVENT_MOD_RUNS_DEFAULT,
             dungeon_mod_sets: HashMap::new(),
             realm_status: realmhound_core::settings::RealmStatusMode::default(),
             realm_status_threshold: 50,
@@ -1107,6 +1115,8 @@ impl LiveFeedPanel {
             || self.dust_threshold != settings.dust_threshold
             || self.xp_threshold != settings.xp_threshold
             || self.call_event_mods != settings.call_event_mods
+            || self.learn_event_mods != settings.learn_event_mods
+            || self.learn_event_mods_runs != settings.learn_event_mods_runs
             || self.realm_status != settings.realm_status
             || self.realm_status_threshold != settings.realm_status_threshold
             || self.callout_percent != settings.callout_percent
@@ -1128,6 +1138,11 @@ impl LiveFeedPanel {
         self.dust_threshold = settings.dust_threshold;
         self.xp_threshold = settings.xp_threshold;
         self.call_event_mods = settings.call_event_mods;
+        self.learn_event_mods = settings.learn_event_mods;
+        self.learn_event_mods_runs = settings.learn_event_mods_runs.clamp(
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+        );
         self.realm_status = settings.realm_status;
         self.realm_status_threshold = settings.realm_status_threshold;
         self.callout_percent = settings.callout_percent;
@@ -1187,24 +1202,34 @@ impl LiveFeedPanel {
     }
 
     /// Mods the session has seen in *every* one of the last
-    /// [`LEARN_EVENT_MOD_ENTRIES`] entries of `dungeon`, with at least one of
-    /// those entries carrying the mod as its only own: the signature of a mod the
-    /// game applies to the instance itself during an event instead of rolling it.
+    /// [`LiveFeedSettings::learn_event_mods_runs`] entries of `dungeon`, with at
+    /// least one of those entries carrying the mod as its only own: the signature
+    /// of a mod the game applies to the instance itself during an event instead
+    /// of rolling it.
     ///
     /// This complements the curated [`EVENT_PRESET_MODS`] table: the game files
     /// cannot mark an event mod (they all ship as `ROLLABLE`), so a new event is
-    /// only recognizable from the traffic itself. Empty until enough entries of
-    /// the dungeon have been seen, so a single coincidence can't hide a real roll.
+    /// only recognizable from the traffic itself. Empty while the feature is off
+    /// and until enough entries of the dungeon have been seen, so a single
+    /// coincidence can't hide a real roll.
     ///
+    /// [`LiveFeedSettings::learn_event_mods_runs`]: realmhound_core::settings::LiveFeedSettings::learn_event_mods_runs
     /// [`EVENT_PRESET_MODS`]: realmhound_core::dungeon_modifiers::EVENT_PRESET_MODS
     fn learned_event_mods(&self, dungeon: &str) -> Vec<String> {
+        if !self.learn_event_mods {
+            return Vec::new();
+        }
+        let runs = self.learn_event_mods_runs.clamp(
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+        ) as usize;
         let Some(sets) = self.dungeon_mod_sets.get(dungeon) else {
             return Vec::new();
         };
-        if sets.len() < LEARN_EVENT_MOD_ENTRIES {
+        if sets.len() < runs {
             return Vec::new();
         }
-        let recent = &sets[sets.len() - LEARN_EVENT_MOD_ENTRIES..];
+        let recent = &sets[sets.len() - runs..];
         let mut candidates = recent[0].clone();
         candidates.retain(|modifier| {
             recent[1..]
@@ -1230,8 +1255,8 @@ impl LiveFeedPanel {
             .entry(dungeon.to_string())
             .or_default();
         sets.push(modifier_tokens.to_vec());
-        if sets.len() > LEARN_EVENT_MOD_ENTRIES {
-            let overflow = sets.len() - LEARN_EVENT_MOD_ENTRIES;
+        if sets.len() > MAX_LEARN_EVENT_MOD_SETS {
+            let overflow = sets.len() - MAX_LEARN_EVENT_MOD_SETS;
             sets.drain(0..overflow);
         }
     }
@@ -6770,6 +6795,36 @@ mod tests {
             None,
         );
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake keyf"));
+    }
+
+    #[test]
+    fn learned_event_mods_honor_the_configured_run_count() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        // Ask for four runs instead of the default three: three aren't enough.
+        panel.learn_event_mods_runs = 4;
+        for seed in [1, 2, 3] {
+            panel.push_dungeon(seed, "Snake Pit", &["GENEROUS".to_string()], None);
+        }
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+        panel.push_dungeon(4, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(panel.learned_event_mods("Snake Pit"), ["GENEROUS"]);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn learned_event_mods_can_be_switched_off() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        panel.learn_event_mods = false;
+        for seed in [1, 2, 3, 4] {
+            panel.push_dungeon(seed, "Snake Pit", &["GENEROUS".to_string()], None);
+        }
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
     }
 
     #[test]

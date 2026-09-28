@@ -336,6 +336,21 @@ pub struct LiveFeedSettings {
     #[serde(default = "default_true")]
     pub call_event_mods: bool,
 
+    /// Whether to also recognize event mods from the dungeons the user enters:
+    /// a mod carried by the last [`Self::learn_event_mods_runs`] spawns of one
+    /// dungeon, in at least one of which it was the only mod, is treated as an
+    /// event mod for the rest of the session. This is how an event that shipped
+    /// no table update is picked up. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub learn_event_mods: bool,
+
+    /// How many consecutive spawns of one dungeon must carry a mod before
+    /// [`Self::learn_event_mods`] treats it as an event mod. Three tells an
+    /// event mod from a coincidence while still adapting within a session;
+    /// higher is stricter. Clamped to 2..=10. Defaults to 3.
+    #[serde(default = "default_learn_event_mods_runs")]
+    pub learn_event_mods_runs: u32,
+
     /// How the realm a dungeon was entered from is named in its callout.
     /// Defaults to [`RealmStatusMode::None`].
     #[serde(default)]
@@ -808,6 +823,19 @@ fn default_realm_status_threshold() -> i32 {
     50
 }
 
+/// Default number of consecutive dungeon spawns compared when recognizing an
+/// event mod from the user's own runs (3).
+fn default_learn_event_mods_runs() -> u32 {
+    LEARN_EVENT_MOD_RUNS_DEFAULT
+}
+
+/// Shipped [`LiveFeedSettings::learn_event_mods_runs`].
+pub const LEARN_EVENT_MOD_RUNS_DEFAULT: u32 = 3;
+
+/// Bounds of [`LiveFeedSettings::learn_event_mods_runs`]: at least two runs are
+/// needed to see a pattern at all, and ten is as far back as a session keeps.
+pub const LEARN_EVENT_MOD_RUNS_RANGE: std::ops::RangeInclusive<u32> = 2..=10;
+
 /// The default reward-modifier callout tags, in emission order. Named tags are
 /// enabled; the rarely-called mods ship disabled with a blank call so users can
 /// enable and name them. Dimitus is included as an editable preset.
@@ -921,6 +949,8 @@ impl Default for LiveFeedSettings {
             dust_threshold: default_dust_threshold(),
             xp_threshold: default_xp_threshold(),
             call_event_mods: true,
+            learn_event_mods: true,
+            learn_event_mods_runs: default_learn_event_mods_runs(),
             realm_status: RealmStatusMode::default(),
             realm_status_threshold: default_realm_status_threshold(),
             callout_percent: false,
@@ -2770,6 +2800,8 @@ mod tests {
             lf.call_event_mods,
             "event preset mods are called by default"
         );
+        assert!(lf.learn_event_mods, "runs are learned from by default");
+        assert_eq!(lf.learn_event_mods_runs, 3);
         assert_eq!(lf.realm_status, RealmStatusMode::None);
         assert_eq!(lf.realm_status_threshold, 50);
         // The name-less dungeon style round-trips.
