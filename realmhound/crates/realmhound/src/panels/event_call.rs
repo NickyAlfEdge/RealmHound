@@ -80,6 +80,13 @@ const EVENT_SHORT_NAMES: &[(&str, &str)] = &[
     ("Jack Frost",                     "jack"),
     ("Jotunn",                         "jotunn"),
     ("Oryx Horde",                     "oryx horde"),
+    // Newer realm encounters (the in-game names of their bosses).
+    ("Artificial Slop",                "slop"),
+    ("Cold Soul",                      "cold soul"),
+    ("Cube Deity",                     "deity"),
+    ("Man-eating Barnacle",            "barnacle"),
+    ("Stygian Mirror",                 "mirror"),
+    ("Towering Perfection",            "tower perf"),
 ];
 
 /// Upcoming-dungeon hint suffix for encounters that drop dungeon portals, keyed
@@ -183,6 +190,9 @@ fn resolve_event_name(
         DungeonNameStyle::Short => event_short_name(display_name)
             .map(|s| s.to_string())
             .unwrap_or_else(|| display_name.trim().to_string()),
+        // Events are never called without a name (a bare `j` call is useless),
+        // so a name-less style falls back to the full display name.
+        DungeonNameStyle::None => display_name.trim().to_string(),
     }
 }
 
@@ -264,6 +274,28 @@ mod tests {
         // Punctuation/case differences must not matter.
         assert_eq!(event_short_name("world's oyster"), Some("oyster"));
         assert_eq!(event_short_name("Mysterious Crystal"), Some("cry"));
+    }
+
+    #[test]
+    fn new_realm_bosses_have_short_calls() {
+        // The newer realm encounters are called by their community nicknames.
+        assert_eq!(event_short_name("Artificial Slop"), Some("slop"));
+        assert_eq!(event_short_name("Cold Soul"), Some("cold soul"));
+        assert_eq!(event_short_name("Cube Deity"), Some("deity"));
+        assert_eq!(event_short_name("Man-eating Barnacle"), Some("barnacle"));
+        assert_eq!(event_short_name("Stygian Mirror"), Some("mirror"));
+        assert_eq!(event_short_name("Towering Perfection"), Some("tower perf"));
+        // Punctuation/case don't matter for the lookup.
+        assert_eq!(event_short_name("man eating barnacle"), Some("barnacle"));
+        assert_eq!(
+            event_call_body(
+                "Towering Perfection",
+                DungeonNameStyle::Short,
+                true,
+                &no_overrides()
+            ),
+            "tower perf"
+        );
     }
 
     #[test]

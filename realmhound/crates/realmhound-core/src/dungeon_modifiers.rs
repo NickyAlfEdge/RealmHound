@@ -216,6 +216,39 @@ pub fn contains_modifier(tokens: &[String], canonical_key: &str) -> bool {
     tokens.iter().any(|t| canonical(t) == canonical_key)
 }
 
+/// Dungeon modifiers the game applies to an instance by itself rather than
+/// rolling them for the run: while a special event is live, every instance of a
+/// participating dungeon spawns with its signature mod, often as the *only* mod
+/// (e.g. `Steamworks Maintenance` on every Kogbold Steamworks run, so every
+/// call reads `turrets off` even though nothing was rolled).
+///
+/// Curated from live observations: a mod belongs here when (nearly) every
+/// instance of the dungeon carries it across many runs, including instances
+/// where it is the only mod. Excluded from callouts when
+/// [`LiveFeedSettings::call_event_mods`](crate::settings::LiveFeedSettings::call_event_mods)
+/// is off -- the numeric reward bonuses such a mod grants are still called,
+/// since the dungeon really does give them.
+pub const EVENT_PRESET_MODS: &[&str] = &[
+    // Kogbold Steamworks / Advanced Kogbold Steamworks (Steamworks event).
+    "STEAMWORKSMAINTENANCE",
+    // Parasite Chambers (every observed instance carried it).
+    "LOOTING",
+];
+
+/// Whether `token` is a modifier the game applies to an instance by itself
+/// during a special event (see [`EVENT_PRESET_MODS`]).
+pub fn is_event_preset_modifier(token: &str) -> bool {
+    let key = canonical(token);
+    !key.is_empty()
+        && EVENT_PRESET_MODS
+            .iter()
+            .any(|base| match key.strip_prefix(base) {
+                // Exact, or a numbered tier of it (`LOOTING` / `LOOTING_2`).
+                Some(suffix) => suffix.is_empty() || suffix.chars().all(|c| c.is_ascii_digit()),
+                None => false,
+            })
+}
+
 /// True if `labels` (a comma-separated list from `mods.xml`) contains `label` as
 /// an exact, case-insensitive token.
 fn has_label(labels: &str, label: &str) -> bool {
@@ -455,6 +488,21 @@ mod tests {
         assert_eq!(base_and_tier("Exposed IV"), ("EXPOSED".to_string(), 4));
         assert_eq!(base_and_tier("Berserk"), ("BERSERK".to_string(), 0));
         assert_eq!(base_and_tier("Weak I"), ("WEAK".to_string(), 1));
+    }
+
+    #[test]
+    fn event_preset_mods_match_their_wire_ids() {
+        // The wire id keeps its underscore; the canonical table entry does not.
+        assert!(is_event_preset_modifier("STEAMWORKS_MAINTENANCE"));
+        assert!(is_event_preset_modifier("steamworks maintenance"));
+        assert!(is_event_preset_modifier("LOOTING"));
+        // A numbered tier of a preset still matches.
+        assert!(is_event_preset_modifier("LOOTING_2"));
+        // Rolled mods, prefix lookalikes and junk do not.
+        assert!(!is_event_preset_modifier("GENEROUS"));
+        assert!(!is_event_preset_modifier("LOOTINGPARTY"));
+        assert!(!is_event_preset_modifier("WEAKBOSS_3"));
+        assert!(!is_event_preset_modifier(""));
     }
 
     #[test]

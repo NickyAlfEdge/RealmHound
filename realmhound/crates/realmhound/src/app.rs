@@ -310,6 +310,46 @@ fn fixed_cell<R>(
     .inner
 }
 
+/// The callable dungeon names a character-stats entry covers. Some legacy
+/// dungeons share one completion row in the stats list but are separate
+/// instances that get separate portal callouts:
+///
+/// - `Legacy Deadwater Docks & Grotto` -> `Legacy Deadwater Docks` + `Legacy Bilgewater's Grotto`
+/// - `Legacy Lair of Draconis & Ivory` -> `Legacy Lair of Draconis` + `The Ivory Wyvern`
+///
+/// Every other entry covers exactly one callable dungeon, so the slice is empty.
+fn legacy_callable_split(stats_name: &str) -> &'static [&'static str] {
+    match stats_name {
+        "Legacy Deadwater Docks & Grotto" => {
+            &["Legacy Deadwater Docks", "Legacy Bilgewater's Grotto"]
+        }
+        "Legacy Lair of Draconis & Ivory" => &["Legacy Lair of Draconis", "The Ivory Wyvern"],
+        _ => &[],
+    }
+}
+
+/// A compact numeric field for a callout threshold: the minimum reward bonus
+/// (in percent) at which a tag is called. Greyed out when the tag it belongs to
+/// is set to `none`, so the field reads as inert rather than ignored. Returns
+/// whether the value changed.
+fn threshold_field(ui: &mut egui::Ui, value: &mut i32, enabled: bool, tip: &str) -> bool {
+    let response = ui.add_enabled(
+        enabled,
+        egui::DragValue::new(value)
+            .speed(1.0)
+            .range(0..=100)
+            .suffix("%"),
+    );
+    let changed = response.changed();
+    if enabled {
+        response.hover_tip(tip);
+    } else {
+        response.disabled_hover_tip("This tag is not called (set to \"none\").");
+    }
+    ui.label(RichText::new("or more").weak().small());
+    changed
+}
+
 /// Cache key for the projected Taskbar items. When every field matches the
 /// previous frame the cached `taskbar_items_cache` is reused instead of
 /// reprojecting missions/quests (and their tooltips) again.
@@ -3172,6 +3212,12 @@ impl RealmHoundApp {
     /// from the Trophy Hall dungeon list ([`ALL_DUNGEONS`]), so the dropdown
     /// matches the game's dungeon list exactly. Dungeons with no curated
     /// nickname get an empty default (still editable).
+    ///
+    /// The character-stats list folds some legacy dungeons into one combined row
+    /// (`Legacy Deadwater Docks & Grotto`, `Legacy Lair of Draconis & Ivory`)
+    /// because they share a completion entry. Calls are made for the instances
+    /// themselves, which are separate dungeons, so those rows are split into the
+    /// four callable names.
     fn dungeon_slang_entries() -> Vec<(String, String)> {
         realmhound_core::stats::ALL_DUNGEONS
             .iter()
@@ -3181,11 +3227,22 @@ impl RealmHoundApp {
                 !crate::panels::dungeon_callout::is_non_callable(d.name)
                     && !d.name.starts_with("Oryx's")
             })
-            .map(|d| {
-                let short = crate::panels::dungeon_callout::dungeon_nickname(d.name)
-                    .unwrap_or("")
-                    .to_string();
-                (d.name.to_string(), short)
+            .flat_map(|d| {
+                let split = legacy_callable_split(d.name);
+                let names: Vec<&str> = if split.is_empty() {
+                    vec![d.name]
+                } else {
+                    split.to_vec()
+                };
+                names
+                    .into_iter()
+                    .map(|name| {
+                        let short = crate::panels::dungeon_callout::dungeon_nickname(name)
+                            .unwrap_or("")
+                            .to_string();
+                        (name.to_string(), short)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -3350,7 +3407,7 @@ impl RealmHoundApp {
     /// Render the Live Feed settings panel.
     fn render_live_feed_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
         use realmhound_core::settings::{
-            DungeonNameStyle, DustLabel, JoinPosition, LootLabel, XpLabel,
+            DungeonNameStyle, DustLabel, JoinPosition, LootLabel, RealmStatusMode, XpLabel,
         };
 
         ui.add_space(10.0);
@@ -3575,6 +3632,7 @@ impl RealmHoundApp {
                 let cur = match current.dungeon_name_style {
                     DungeonNameStyle::Short => "short",
                     DungeonNameStyle::Full => "full",
+                    DungeonNameStyle::None => "none",
                 };
                 let mut sel = Some(cur.to_string());
                 if shadcn
@@ -3583,16 +3641,23 @@ impl RealmHoundApp {
                         "dungeon_name_style",
                         &mut sel,
                         140.0,
-                        &[("short", "short (slang)"), ("full", "full names")],
+                        &[
+                            ("short", "short (slang)"),
+                            ("full", "full names"),
+                            ("none", "none"),
+                        ],
                     )
                     .hover_tip(
                         "Short uses curated nicknames (e.g. \"halls\"); Full uses the dungeon's \
-                         full name lowercased (e.g. \"lost halls\"). Only affects clipboard text.",
+                         full name lowercased (e.g. \"lost halls\"); None calls only the reward/mod \
+                         tags, for dungeon-specific parties where the dungeon is already known. \
+                         Only affects clipboard text.",
                     )
                     .changed()
                 {
                     current.dungeon_name_style = match sel.as_deref() {
                         Some("full") => DungeonNameStyle::Full,
+                        Some("none") => DungeonNameStyle::None,
                         _ => DungeonNameStyle::Short,
                     };
                     settings_changed = true;
@@ -3628,7 +3693,8 @@ impl RealmHoundApp {
 
             ui.add_space(8.0);
 
-            // Reward-value label modes.
+            // Reward-value label modes, each with the minimum bonus it takes to
+            // call the value (the field only matters when the tag is called).
             shadcn.field_row(ui, |ui| {
                 ui.label("Loot boost:");
                 let cur = match current.loot_label {
@@ -3654,6 +3720,12 @@ impl RealmHoundApp {
                     };
                     settings_changed = true;
                 }
+                settings_changed |= threshold_field(
+                    ui,
+                    &mut current.loot_threshold,
+                    !matches!(current.loot_label, LootLabel::None),
+                    "Only call the loot boost when it is at least this much.",
+                );
             });
 
             ui.add_space(6.0);
@@ -3683,6 +3755,12 @@ impl RealmHoundApp {
                     };
                     settings_changed = true;
                 }
+                settings_changed |= threshold_field(
+                    ui,
+                    &mut current.dust_threshold,
+                    !matches!(current.dust_label, DustLabel::None),
+                    "Only call the dust boost when it is at least this much.",
+                );
             });
 
             ui.add_space(6.0);
@@ -3711,7 +3789,69 @@ impl RealmHoundApp {
                     };
                     settings_changed = true;
                 }
+                settings_changed |= threshold_field(
+                    ui,
+                    &mut current.xp_threshold,
+                    matches!(current.xp_label, XpLabel::Xp),
+                    "Only call the XP boost when it is at least this much.",
+                );
             });
+
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Realm status:");
+                let cur = match current.realm_status {
+                    RealmStatusMode::None => "none",
+                    RealmStatusMode::Closing => "closing",
+                    RealmStatusMode::Score => "score",
+                };
+                let mut sel = Some(cur.to_string());
+                if shadcn
+                    .select(
+                        ui,
+                        "realm_status",
+                        &mut sel,
+                        170.0,
+                        &[
+                            ("none", "none"),
+                            ("closing", "in a closing realm"),
+                            ("score", "in Y% realm"),
+                        ],
+                    )
+                    .hover_tip(
+                        "Appended to calls for dungeons entered through a realm portal (a party \
+                         join has no realm of its own). \"in a closing realm\" covers realms past \
+                         90%; \"in Y% realm\" names the realm score the dungeon was entered at.",
+                    )
+                    .changed()
+                {
+                    current.realm_status = match sel.as_deref() {
+                        Some("closing") => RealmStatusMode::Closing,
+                        Some("score") => RealmStatusMode::Score,
+                        _ => RealmStatusMode::None,
+                    };
+                    settings_changed = true;
+                }
+                settings_changed |= threshold_field(
+                    ui,
+                    &mut current.realm_status_threshold,
+                    matches!(current.realm_status, RealmStatusMode::Score),
+                    "Call the realm score from this percentage up.",
+                );
+            });
+
+            ui.add_space(4.0);
+
+            settings_changed |= shadcn
+                .switch(ui, &mut current.call_event_mods, "Call special event mods")
+                .hover_tip(
+                    "Events make participating dungeons spawn with a preset mod (e.g. Steamworks \
+                     Maintenance on Kogbold Steamworks, called as \"turrets off\", even when \
+                     nothing else was rolled). On (default) they are called like any other mod; \
+                     off drops their tags. The loot/dust/xp the mod grants is still called.",
+                )
+                .changed();
 
             ui.add_space(6.0);
 
@@ -3835,8 +3975,13 @@ impl RealmHoundApp {
                     loot_label: current.loot_label,
                     dust_label: current.dust_label,
                     xp_label: current.xp_label,
+                    loot_threshold: current.loot_threshold,
+                    dust_threshold: current.dust_threshold,
+                    xp_threshold: current.xp_threshold,
+                    call_event_mods: current.call_event_mods,
                     percent: current.callout_percent,
                     reward_mods: &current.reward_mods,
+                    realm_status: None,
                 };
                 let tokens = [
                     "REWARDING".to_string(),
@@ -3897,6 +4042,7 @@ impl RealmHoundApp {
                 let cur = match current.event_name_style {
                     DungeonNameStyle::Short => "short",
                     DungeonNameStyle::Full => "full",
+                    DungeonNameStyle::None => "short",
                 };
                 let mut sel = Some(cur.to_string());
                 if shadcn
@@ -9235,5 +9381,45 @@ mod reader_tests {
             AppStartError::Reader(detail) => assert!(detail.starts_with("loot")),
             other => panic!("expected a reader error, got {other}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod slang_tests {
+    use super::{legacy_callable_split, RealmHoundApp};
+
+    #[test]
+    fn combined_legacy_rows_split_into_callable_instances() {
+        assert_eq!(
+            legacy_callable_split("Legacy Deadwater Docks & Grotto"),
+            ["Legacy Deadwater Docks", "Legacy Bilgewater's Grotto"]
+        );
+        assert_eq!(
+            legacy_callable_split("Legacy Lair of Draconis & Ivory"),
+            ["Legacy Lair of Draconis", "The Ivory Wyvern"]
+        );
+        // Every other dungeon is its own call.
+        assert!(legacy_callable_split("Snake Pit").is_empty());
+        assert!(legacy_callable_split("Deadwater Docks").is_empty());
+    }
+
+    #[test]
+    fn slang_editor_lists_the_split_names_with_their_defaults() {
+        let entries = RealmHoundApp::dungeon_slang_entries();
+        let short_of = |name: &str| {
+            entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, short)| short.as_str())
+        };
+        // The combined stats names are gone; the callable instances are listed.
+        assert_eq!(short_of("Legacy Deadwater Docks & Grotto"), None);
+        assert_eq!(short_of("Legacy Lair of Draconis & Ivory"), None);
+        assert_eq!(short_of("Legacy Deadwater Docks"), Some("leg ddocks"));
+        assert_eq!(short_of("Legacy Bilgewater's Grotto"), Some("grotto"));
+        assert_eq!(short_of("Legacy Lair of Draconis"), Some("leg LOD"));
+        assert_eq!(short_of("The Ivory Wyvern"), Some("ivory"));
+        // The legacy block keeps its curated default.
+        assert_eq!(short_of("Legacy The Shatters"), Some("leg shatts"));
     }
 }

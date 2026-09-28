@@ -312,6 +312,40 @@ pub struct LiveFeedSettings {
     #[serde(default)]
     pub xp_label: XpLabel,
 
+    /// Minimum loot bonus (percent) for a callout to include the loot tag.
+    /// Defaults to 5.
+    #[serde(default = "default_loot_threshold")]
+    pub loot_threshold: i32,
+
+    /// Minimum dust bonus (percent) for a callout to include the dust tag.
+    /// Defaults to 10.
+    #[serde(default = "default_dust_threshold")]
+    pub dust_threshold: i32,
+
+    /// Minimum XP bonus (percent) for a callout to include the XP tag.
+    /// Defaults to 10.
+    #[serde(default = "default_xp_threshold")]
+    pub xp_threshold: i32,
+
+    /// Whether callouts name the mods the game applies to an instance by itself
+    /// during a special event (see
+    /// [`is_event_preset_modifier`](crate::dungeon_modifiers::is_event_preset_modifier)),
+    /// e.g. `turrets off` on every Kogbold Steamworks run. Defaults to `true`;
+    /// turning it off drops those tags, since the group did not roll them (the
+    /// numeric loot/dust/xp bonuses they grant are still called).
+    #[serde(default = "default_true")]
+    pub call_event_mods: bool,
+
+    /// How the realm a dungeon was entered from is named in its callout.
+    /// Defaults to [`RealmStatusMode::None`].
+    #[serde(default)]
+    pub realm_status: RealmStatusMode,
+
+    /// Minimum realm score (percent) for [`RealmStatusMode::Score`] to append
+    /// `in <n>% realm`. Defaults to 50.
+    #[serde(default = "default_realm_status_threshold")]
+    pub realm_status_threshold: i32,
+
     /// Whether loot/dust/xp callout values include the `%` sign. Defaults to
     /// `false` (e.g. `15 lb`).
     #[serde(default)]
@@ -641,7 +675,31 @@ pub enum DungeonNameStyle {
     Short,
     /// Use the full dungeon name, lowercased (e.g. `lost halls`).
     Full,
+    /// Omit the name entirely, calling only the reward/mod tags (for
+    /// dungeon-specific parties where the dungeon is already known).
+    None,
 }
+
+/// How the realm a dungeon was entered from is appended to its callout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RealmStatusMode {
+    /// Never mention the realm.
+    #[default]
+    None,
+    /// Append `in a closing realm` for dungeons entered from a realm that is
+    /// past [`CLOSING_REALM_PERCENT`].
+    Closing,
+    /// Append `in <n>% realm` for dungeons entered from a realm that is at or
+    /// past the configured threshold (see
+    /// [`LiveFeedSettings::realm_status_threshold`]).
+    Score,
+}
+
+/// Realm completion (percent) from which a realm counts as closing.
+///
+/// Above this the realm can no longer be joined from the outside, which is what
+/// the "in a closing realm" callout warns about.
+pub const CLOSING_REALM_PERCENT: i32 = 90;
 
 /// How reward bonuses are labeled in the clipboard callout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -728,6 +786,26 @@ pub struct RewardModEntry {
 /// Default event join marker placement ([`JoinPosition::None`]).
 fn default_event_join() -> JoinPosition {
     JoinPosition::None
+}
+
+/// Default minimum loot bonus for a callout's loot tag (5%).
+fn default_loot_threshold() -> i32 {
+    5
+}
+
+/// Default minimum dust bonus for a callout's dust tag (10%).
+fn default_dust_threshold() -> i32 {
+    10
+}
+
+/// Default minimum XP bonus for a callout's XP tag (10%).
+fn default_xp_threshold() -> i32 {
+    10
+}
+
+/// Default minimum realm score for the `in <n>% realm` callout tag (50%).
+fn default_realm_status_threshold() -> i32 {
+    50
 }
 
 /// The default reward-modifier callout tags, in emission order. Named tags are
@@ -839,6 +917,12 @@ impl Default for LiveFeedSettings {
             loot_label: LootLabel::default(),
             dust_label: DustLabel::default(),
             xp_label: XpLabel::default(),
+            loot_threshold: default_loot_threshold(),
+            dust_threshold: default_dust_threshold(),
+            xp_threshold: default_xp_threshold(),
+            call_event_mods: true,
+            realm_status: RealmStatusMode::default(),
+            realm_status_threshold: default_realm_status_threshold(),
             callout_percent: false,
             event_name_style: DungeonNameStyle::default(),
             event_add_upcoming: true,
@@ -2667,6 +2751,34 @@ mod tests {
             .any(|e| e.id == "GENEROUS" && e.short == "generous"));
         // Percent sign migrates onto the new callout_percent flag.
         assert!(loaded.live_feed.callout_percent);
+    }
+
+    #[test]
+    fn callout_extras_default_on_files_that_lack_them() {
+        // A file written before the callout options existed: every new field
+        // takes its shipped default rather than failing to load.
+        let old_json = r#"{
+            "version": 7,
+            "live_feed": { "loot_label": "Lb", "dust_label": "Db" }
+        }"#;
+        let loaded: Settings = serde_json::from_str(old_json).unwrap();
+        let lf = &loaded.live_feed;
+        assert_eq!(lf.loot_threshold, 5);
+        assert_eq!(lf.dust_threshold, 10);
+        assert_eq!(lf.xp_threshold, 10);
+        assert!(
+            lf.call_event_mods,
+            "event preset mods are called by default"
+        );
+        assert_eq!(lf.realm_status, RealmStatusMode::None);
+        assert_eq!(lf.realm_status_threshold, 50);
+        // The name-less dungeon style round-trips.
+        let json = serde_json::to_string(&DungeonNameStyle::None).unwrap();
+        assert_eq!(json, "\"None\"");
+        assert_eq!(
+            serde_json::from_str::<DungeonNameStyle>(&json).unwrap(),
+            DungeonNameStyle::None
+        );
     }
 
     #[test]
