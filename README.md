@@ -5,6 +5,8 @@ God** (RotMG). RealmHound organizes data received by your game client and
 presents your account data and observed activity in a clearer, more usable
 way. It does not access server-side information unavailable to your client.
 
+RealmHound Discord link: https://discord.gg/4zdy5Z4Sfd
+
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 ![Language](https://img.shields.io/badge/language-Rust-orange.svg)
