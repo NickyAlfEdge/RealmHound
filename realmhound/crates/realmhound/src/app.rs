@@ -3847,9 +3847,12 @@ impl RealmHoundApp {
                 .switch(ui, &mut current.call_event_mods, "Call special event mods")
                 .hover_tip(
                     "Events make participating dungeons spawn with a preset mod (e.g. Steamworks \
-                     Maintenance on Kogbold Steamworks, called as \"turrets off\", even when \
-                     nothing else was rolled). On (default) they are called like any other mod; \
-                     off drops their tags. The loot/dust/xp the mod grants is still called.",
+                     Maintenance on Kogbold Steamworks, called as \"turrets off\", or Found \
+                     Treasure! on Woodland Labyrinth), even when nothing else was rolled. On \
+                     (default) they are called like any other mod; off drops their tags. \
+                     RealmHound also learns them from your own runs: a mod carried by the last \
+                     three instances of a dungeon, including one where it was the only mod, is \
+                     treated as an event mod too. The loot/dust/xp it grants is called either way.",
                 )
                 .changed();
 
@@ -3981,6 +3984,7 @@ impl RealmHoundApp {
                     call_event_mods: current.call_event_mods,
                     percent: current.callout_percent,
                     reward_mods: &current.reward_mods,
+                    learned_event_mods: &[],
                     realm_status: None,
                 };
                 let tokens = [

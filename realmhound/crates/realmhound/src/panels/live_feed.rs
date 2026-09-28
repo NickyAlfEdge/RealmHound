@@ -594,6 +594,18 @@ const DUNGEON_WINDOW_ESTIMATED: std::time::Duration = std::time::Duration::from_
 /// Time from a realm-close message to the castle teleport.
 const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How many recent entries of one dungeon are compared when recognizing the
+/// mods an event applies to every instance of it. Three is enough to tell an
+/// event mod from a coincidence, and short enough to recognize an event that
+/// started mid-session.
+const LEARN_EVENT_MOD_ENTRIES: usize = 3;
+
+/// Whether two modifier tokens name the same mod (wire ids vary by separators).
+fn same_modifier(a: &str, b: &str) -> bool {
+    realmhound_core::dungeon_modifiers::canonical(a)
+        == realmhound_core::dungeon_modifiers::canonical(b)
+}
+
 impl DungeonEntry {
     /// Create a new dungeon entry from a display name and decoded modifier tokens.
     ///
@@ -883,6 +895,11 @@ pub struct LiveFeedPanel {
     /// Whether to call mods the game applies to an instance itself during a
     /// special event. Mirrors `Settings.live_feed.call_event_mods`.
     call_event_mods: bool,
+    /// Modifier sets of this session's dungeon entries, keyed by the dungeon's
+    /// display name, newest last (capped). Used to recognize the mods the game
+    /// applies to every instance of a dungeon during an event, which the game
+    /// files cannot mark (see `EVENT_PRESET_MODS`).
+    dungeon_mod_sets: HashMap<String, Vec<Vec<String>>>,
     /// How the realm a dungeon was entered from is named. Mirrors
     /// `Settings.live_feed.realm_status`.
     realm_status: realmhound_core::settings::RealmStatusMode,
@@ -1034,6 +1051,7 @@ impl LiveFeedPanel {
             dust_threshold: 10,
             xp_threshold: 10,
             call_event_mods: true,
+            dungeon_mod_sets: HashMap::new(),
             realm_status: realmhound_core::settings::RealmStatusMode::default(),
             realm_status_threshold: 50,
             callout_percent: false,
@@ -1168,12 +1186,64 @@ impl LiveFeedPanel {
         )
     }
 
+    /// Mods the session has seen in *every* one of the last
+    /// [`LEARN_EVENT_MOD_ENTRIES`] entries of `dungeon`, with at least one of
+    /// those entries carrying the mod as its only own: the signature of a mod the
+    /// game applies to the instance itself during an event instead of rolling it.
+    ///
+    /// This complements the curated [`EVENT_PRESET_MODS`] table: the game files
+    /// cannot mark an event mod (they all ship as `ROLLABLE`), so a new event is
+    /// only recognizable from the traffic itself. Empty until enough entries of
+    /// the dungeon have been seen, so a single coincidence can't hide a real roll.
+    ///
+    /// [`EVENT_PRESET_MODS`]: realmhound_core::dungeon_modifiers::EVENT_PRESET_MODS
+    fn learned_event_mods(&self, dungeon: &str) -> Vec<String> {
+        let Some(sets) = self.dungeon_mod_sets.get(dungeon) else {
+            return Vec::new();
+        };
+        if sets.len() < LEARN_EVENT_MOD_ENTRIES {
+            return Vec::new();
+        }
+        let recent = &sets[sets.len() - LEARN_EVENT_MOD_ENTRIES..];
+        let mut candidates = recent[0].clone();
+        candidates.retain(|modifier| {
+            recent[1..]
+                .iter()
+                .all(|set| set.iter().any(|t| same_modifier(t, modifier)))
+        });
+        // A mod that stood alone in at least one of those entries cannot be part
+        // of the rolled set (which fills the instance's grade), so it is one the
+        // game added. Requiring this keeps three identical *rolls* from
+        // suppressing a genuine call.
+        candidates.retain(|modifier| {
+            recent
+                .iter()
+                .any(|set| set.len() == 1 && same_modifier(&set[0], modifier))
+        });
+        candidates
+    }
+
+    /// Record a dungeon entry's modifier set for [`Self::learned_event_mods`].
+    fn remember_dungeon_mods(&mut self, dungeon: &str, modifier_tokens: &[String]) {
+        let sets = self
+            .dungeon_mod_sets
+            .entry(dungeon.to_string())
+            .or_default();
+        sets.push(modifier_tokens.to_vec());
+        if sets.len() > LEARN_EVENT_MOD_ENTRIES {
+            let overflow = sets.len() - LEARN_EVENT_MOD_ENTRIES;
+            sets.drain(0..overflow);
+        }
+    }
+
     /// Borrow the current dungeon-callout formatting parameters from the panel's
     /// settings mirrors. `realm_status` is the realm-status suffix to append
-    /// (see [`Self::realm_status_suffix`]), when any.
+    /// (see [`Self::realm_status_suffix`]), when any; `learned_event_mods` are the
+    /// mods this session has recognized as applied by an event.
     fn dungeon_callout_params<'a>(
         &'a self,
         realm_status: Option<&'a str>,
+        learned_event_mods: &'a [String],
     ) -> crate::panels::dungeon_callout::DungeonCalloutParams<'a> {
         crate::panels::dungeon_callout::DungeonCalloutParams {
             name_style: self.dungeon_name_style,
@@ -1187,6 +1257,7 @@ impl LiveFeedPanel {
             call_event_mods: self.call_event_mods,
             percent: self.callout_percent,
             reward_mods: &self.reward_mods,
+            learned_event_mods,
             realm_status,
         }
     }
@@ -1198,6 +1269,15 @@ impl LiveFeedPanel {
         // Copy the settings mirrors out of `self` so the mutable pass over the
         // entries doesn't conflict with the immutable borrows the parameters need.
         let current_realm = self.realm_name.clone();
+        // Learned event mods per dungeon, resolved before that mutable pass.
+        let dungeons: Vec<String> = self.dungeon_mod_sets.keys().cloned().collect();
+        let learned_event_mods: HashMap<String, Vec<String>> = dungeons
+            .into_iter()
+            .map(|name| {
+                let mods = self.learned_event_mods(&name);
+                (name, mods)
+            })
+            .collect();
         let params = crate::panels::dungeon_callout::DungeonCalloutParams {
             name_style: self.dungeon_name_style,
             name_overrides: &self.dungeon_name_overrides,
@@ -1210,6 +1290,7 @@ impl LiveFeedPanel {
             call_event_mods: self.call_event_mods,
             percent: self.callout_percent,
             reward_mods: &self.reward_mods,
+            learned_event_mods: &[],
             realm_status: None,
         };
         let realm_mode = self.realm_status;
@@ -1227,8 +1308,10 @@ impl LiveFeedPanel {
                     realm_threshold,
                     score,
                 );
+                let learned = learned_event_mods.get(&d.dungeon_name);
                 let params = crate::panels::dungeon_callout::DungeonCalloutParams {
                     realm_status: realm_status.as_deref(),
+                    learned_event_mods: learned.map(Vec::as_slice).unwrap_or_default(),
                     ..params
                 };
                 d.callout = crate::panels::dungeon_callout::dungeon_callout_for(
@@ -2075,7 +2158,11 @@ impl LiveFeedPanel {
             self.get_score_percent()
         };
         let realm_status = self.realm_status_suffix(realm_score_percent);
-        let params = self.dungeon_callout_params(realm_status.as_deref());
+        // Recognize (and remember) the mods this event applies to every instance
+        // of this dungeon, so calls stop advertising a mod nobody rolled.
+        self.remember_dungeon_mods(&display_name, modifier_tokens);
+        let learned_event_mods = self.learned_event_mods(&display_name);
+        let params = self.dungeon_callout_params(realm_status.as_deref(), &learned_event_mods);
         let mut entry = DungeonEntry::new(
             display_name,
             portal_id,
@@ -5783,6 +5870,7 @@ mod tests {
             call_event_mods: true,
             percent: false,
             reward_mods: mods,
+            learned_event_mods: &[],
             realm_status: None,
         }
     }
@@ -6650,6 +6738,72 @@ mod tests {
         panel.pending_portal_spawn = Some(std::time::Instant::now());
         panel.push_dungeon(1, "Spider Den", &[], None);
         assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
+    }
+
+    #[test]
+    fn learned_event_mods_need_repeated_instances_it_stood_alone_in() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        // Only the option's own effect is observable, so turn it off. None of
+        // these mods are in the curated list: this is the learned path.
+        panel.call_event_mods = false;
+
+        // First two entries: not enough evidence yet, so the tag is called.
+        panel.push_dungeon(1, "Snake Pit", &["GENEROUS".to_string()], None);
+        panel.push_dungeon(2, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+
+        // Third entry: the pattern is now recognizable, so the call drops it.
+        panel.push_dungeon(3, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+        assert_eq!(panel.learned_event_mods("Snake Pit"), ["GENEROUS"]);
+
+        // Other dungeons are unaffected (nothing learned for them yet).
+        panel.push_dungeon(4, "Spider Den", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden generous"));
+
+        // A rolled mod alongside the event mod is still called.
+        panel.push_dungeon(
+            5,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "KEYFAIRY".to_string()],
+            None,
+        );
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake keyf"));
+    }
+
+    #[test]
+    fn learned_event_mods_need_equal_tokens_across_runs() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        // Three runs where no single mod appears in all of them, so nothing is
+        // learned and every tag is still called. (None of these mods is in the
+        // curated event list, so only the learning path can drop one.)
+        panel.push_dungeon(
+            1,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "KEYFAIRY".to_string()],
+            None,
+        );
+        panel.push_dungeon(
+            2,
+            "Snake Pit",
+            &["KEYFAIRY".to_string(), "NILDROPS".to_string()],
+            None,
+        );
+        panel.push_dungeon(
+            3,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "NILDROPS".to_string()],
+            None,
+        );
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        // Tags keep their reward-mod list order (Nildrops precedes Generous).
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake nildrop generous")
+        );
     }
 
     #[test]

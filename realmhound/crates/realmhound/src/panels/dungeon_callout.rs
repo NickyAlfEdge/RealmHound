@@ -209,6 +209,12 @@ pub struct DungeonCalloutParams<'a> {
     pub percent: bool,
     /// Editable reward-modifier tags (id, short call, enabled).
     pub reward_mods: &'a [RewardModEntry],
+    /// Mods this session has recognized as applied to every instance of the
+    /// dungeon by an event (raw wire tokens; see
+    /// [`LiveFeedPanel::learned_event_mods`](crate::panels::live_feed::LiveFeedPanel)).
+    /// Their tags are dropped along with [`Self::call_event_mods`]'s curated set;
+    /// empty when nothing has been learned yet.
+    pub learned_event_mods: &'a [String],
     /// Realm-status suffix to append, e.g. `in a closing realm` or
     /// `in 74% realm`. Resolved and gated by the caller (`None` appends
     /// nothing). See [`realm_status_suffix`].
@@ -337,7 +343,10 @@ pub fn build_dungeon_callout(
         if entry.id == "DIMITUS" {
             continue;
         }
-        if !params.call_event_mods && is_event_preset_modifier(&entry.id) {
+        if !params.call_event_mods
+            && (is_event_preset_modifier(&entry.id)
+                || has_base_or_numbered(params.learned_event_mods, &entry.id))
+        {
             continue;
         }
         if let Some(tag) = reward_mod_tag(modifier_tokens, entry) {
@@ -504,6 +513,7 @@ mod tests {
             call_event_mods: true,
             percent,
             reward_mods: mods,
+            learned_event_mods: &[],
             realm_status: None,
         }
     }
@@ -994,9 +1004,39 @@ mod tests {
         let out = build_dungeon_callout("kog", &tokens(&["STEAMWORKS_MAINTENANCE"]), &p).unwrap();
         assert!(!out.contains("turrets off"), "{out}");
 
+        // The same for the Woodland Labyrinth event: 38 captured instances all
+        // carried Found Treasure!, 24 of them with nothing else.
+        let woodland = tokens(&["FOOLISH_2", "FOOUNDTREASURE"]);
+        let out = build_dungeon_callout("wlab", &woodland, &default_params(&mods, &ov)).unwrap();
+        assert!(out.contains("troom"), "{out}");
+        let out = build_dungeon_callout("wlab", &woodland, &p).unwrap();
+        assert!(!out.contains("troom"), "{out}");
+
         // A rolled mod is unaffected by the option.
         let out = build_dungeon_callout("halls", &tokens(&["GENEROUS"]), &p).unwrap();
         assert!(out.contains("generous"), "{out}");
+    }
+
+    #[test]
+    fn learned_event_mods_are_dropped_too() {
+        let _assets = crate::test_support::modifier_assets();
+        let mods = default_reward_mods();
+        let ov = BTreeMap::new();
+        let learned = vec!["GENEROUS".to_string()];
+        let mut p = default_params(&mods, &ov);
+        p.call_event_mods = false;
+        p.learned_event_mods = &learned;
+        let out = build_dungeon_callout("halls", &tokens(&["GENEROUS"]), &p).unwrap();
+        assert!(!out.contains("generous"), "{out}");
+        // A tiered wire id still matches its learned base.
+        let learned = vec!["SOUVENIR".to_string()];
+        p.learned_event_mods = &learned;
+        let out = build_dungeon_callout("ddocks", &tokens(&["SOUVENIR_1"]), &p).unwrap();
+        assert!(!out.contains("souv"), "{out}");
+        // With the option on, the learned set is ignored.
+        p.call_event_mods = true;
+        let out = build_dungeon_callout("ddocks", &tokens(&["SOUVENIR_1"]), &p).unwrap();
+        assert!(out.contains("souv"), "{out}");
     }
 
     #[test]
