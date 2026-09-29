@@ -898,6 +898,19 @@ impl LootTracker {
         map_seed: i32,
         now_ms: i64,
     ) -> Option<(i32, String)> {
+        // The Shatters hard mode first: its extra bags are emitted by an
+        // invisible spawner, so nothing below can identify them.
+        if let Some(hit) = Self::resolve_shatters_hm_bag(
+            &self.recent_boss_kills,
+            bag_type,
+            dungeon,
+            prior_mob_type,
+            map_seed,
+            now_ms,
+            self.attribution.hm_shatters_latched(map_seed),
+        ) {
+            return Some(hit);
+        }
         Self::resolve_boss_override_with(
             &self.recent_boss_kills,
             bag_type,
@@ -908,6 +921,46 @@ impl LootTracker {
             now_ms,
             self.attribution.mv_umi_latched(map_seed),
         )
+    }
+
+    /// The Shatters hard mode: each HM boss drops an *extra* bag (Valen's second
+    /// bag, Nox the Wild Shadow's doubled bags, King Azamoth's two bags) from an
+    /// invisible spawner, seconds after the boss's death line closed the
+    /// attribution window. Those bags arrive Unknown and hold loot the drop-table
+    /// path cannot pin to one boss, so credit them to the boss the run just
+    /// fought -- Combat History's last kill in this instance -- carrying the same
+    /// `(HM)` variant suffix the main bag gets from the death-line trigger.
+    fn resolve_shatters_hm_bag(
+        recent_boss_kills: &[RecentBossKill],
+        bag_type: LootBagType,
+        dungeon: &str,
+        prior_mob_type: i32,
+        map_seed: i32,
+        bag_time_ms: i64,
+        hm_shatters_latched: bool,
+    ) -> Option<(i32, String)> {
+        if dungeon != super::THE_SHATTERS_NAME || !hm_shatters_latched {
+            return None;
+        }
+        if matches!(bag_type, LootBagType::Brown | LootBagType::BoostedBrown) {
+            return None;
+        }
+        // Only bags proximity left unattributed: a bag pinned to a nearby entity
+        // already knows its source.
+        if prior_mob_type != 0 {
+            return None;
+        }
+        let (object_type, name) =
+            Self::select_last_boss_where(recent_boss_kills, map_seed, |kill| {
+                let lag = bag_time_ms - kill.ended_at_ms;
+                lag >= -KILL_CORRELATION_EARLY_TOLERANCE_MS && lag <= KILL_CORRELATION_MAX_LAG_MS
+            })?;
+        let name = if name.ends_with("(HM)") {
+            name
+        } else {
+            format!("{name} (HM)")
+        };
+        Some((object_type, name))
     }
 
     /// Fight-correlation core of [`resolve_boss_override`], taking the recent
@@ -1700,6 +1753,166 @@ mod tests {
         )];
         let picked = LootTracker::resolve_killer_bee_nest(&kills, 0, &[9999], 42, 60_000);
         assert!(picked.is_none());
+    }
+
+    #[test]
+    fn shatters_hm_extra_bag_credits_the_last_boss() {
+        // Valen's second bag is emitted by an invisible spawner seconds after
+        // his death line, so proximity leaves it Unknown.
+        let kills = vec![kill(
+            42,
+            super::super::boss_ids::BRIDGE_SENTINEL,
+            "The Bridge Sentinel",
+            1_000,
+        )];
+        let picked = LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            4_000,
+            true,
+        );
+        assert_eq!(
+            picked,
+            Some((
+                super::super::boss_ids::BRIDGE_SENTINEL,
+                "The Bridge Sentinel (HM)".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn shatters_hm_extra_bag_picks_the_most_recent_kill() {
+        // King Azamoth's two bags both belong to the King, not to the earlier
+        // Twilight Archmage killed in the same instance.
+        let kills = vec![
+            kill(
+                42,
+                super::super::boss_ids::TWILIGHT_ARCHMAGE,
+                "Twilight Archmage",
+                1_000,
+            ),
+            kill(
+                42,
+                super::super::boss_ids::ACCURSED_KING,
+                "The Forgotten King",
+                5_000,
+            ),
+        ];
+        let picked = LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::Red,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            6_000,
+            true,
+        );
+        assert_eq!(
+            picked,
+            Some((
+                super::super::boss_ids::ACCURSED_KING,
+                "The Forgotten King (HM)".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn shatters_extra_bag_needs_hard_mode_and_the_right_dungeon() {
+        let kills = vec![kill(
+            42,
+            super::super::boss_ids::BRIDGE_SENTINEL,
+            "The Bridge Sentinel",
+            1_000,
+        )];
+        // Not a Hard Mode run: the bag belongs to whatever proximity found.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            4_000,
+            false,
+        )
+        .is_none());
+        // Another dungeon's Unknown bag is not touched.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            "Spider Den",
+            0,
+            42,
+            4_000,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn shatters_hm_extra_bag_leaves_attributed_and_public_bags_alone() {
+        let kills = vec![kill(
+            42,
+            super::super::boss_ids::BRIDGE_SENTINEL,
+            "The Bridge Sentinel",
+            1_000,
+        )];
+        // A bag proximity already pinned to a source keeps that source.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            33280,
+            42,
+            4_000,
+            true,
+        )
+        .is_none());
+        // Brown bags are player/public bags.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::Brown,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            4_000,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn shatters_hm_extra_bag_ignores_distant_kills() {
+        // A bag landing long after the boss died is not his.
+        let kills = vec![kill(
+            42,
+            super::super::boss_ids::BRIDGE_SENTINEL,
+            "The Bridge Sentinel",
+            1_000,
+        )];
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            1_000 + KILL_CORRELATION_MAX_LAG_MS + 1,
+            true,
+        )
+        .is_none());
+        // Nor is one from another instance.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            7,
+            4_000,
+            true,
+        )
+        .is_none());
     }
 
     #[test]

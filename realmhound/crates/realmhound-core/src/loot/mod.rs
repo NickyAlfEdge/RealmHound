@@ -241,6 +241,9 @@ pub const SPECTRAL_PENITENTIARY_NAME: &str = "Spectral Penitentiary";
 /// Dungeon name for Moonlight Village, matching the stored dungeon label.
 pub const MOONLIGHT_VILLAGE_NAME: &str = "Moonlight Village";
 
+/// Dungeon name for The Shatters, matching the stored dungeon label.
+pub const THE_SHATTERS_NAME: &str = "The Shatters";
+
 /// The invisible Moonlight Village objects that hand out the run's loot and XP.
 /// `MV Dungeon Complete` covers the three dancers (its loot pools the whole run),
 /// `MV Umi Complete` covers Kitsune Umi. Both spawn at the *start* of the

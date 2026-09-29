@@ -79,6 +79,12 @@ pub struct LootAttributionManager {
     /// fight itself never completes until that loot is recorded, so the bag
     /// cannot be resolved from recorded kills -- it is resolved from this latch.
     mv_umi_instance: i32,
+
+    /// Map seed of the instance in which The Shatters was played in Hard Mode
+    /// (0 = none). Hard Mode is announced only by the renamed bosses' death
+    /// lines, and the *extra* bag each of them drops arrives from an invisible
+    /// spawner after those lines, so the bag cannot be resolved by proximity.
+    hm_shatters_instance: i32,
 }
 
 impl LootAttributionManager {
@@ -92,6 +98,7 @@ impl LootAttributionManager {
             current_tick_seed: -1,
             fabricated_this_tick: Vec::new(),
             mv_umi_instance: 0,
+            hm_shatters_instance: 0,
         }
     }
 
@@ -105,6 +112,7 @@ impl LootAttributionManager {
         self.current_tick_seed = -1;
         self.fabricated_this_tick.clear();
         self.mv_umi_instance = 0;
+        self.hm_shatters_instance = 0;
     }
 
     /// Handle a text packet to check for attribution triggers.
@@ -118,6 +126,12 @@ impl LootAttributionManager {
             if trigger.mob_id == boss_ids::UMI_KITSUNE && map_seed != 0 {
                 self.mv_umi_instance = map_seed;
             }
+            // Hard-mode variants only exist in The Shatters, so an HM trigger
+            // latches the instance as a Hard Mode run. The extra bag each HM
+            // boss drops arrives later, from an invisible spawner.
+            if trigger.variant == Some(VariantSuffix::HardMode) && map_seed != 0 {
+                self.hm_shatters_instance = map_seed;
+            }
             self.open_window(trigger.mob_id, map_seed, trigger.ticks, trigger.variant);
             true
         } else {
@@ -128,6 +142,12 @@ impl LootAttributionManager {
     /// Whether Kitsune Umi was engaged in the instance identified by `map_seed`.
     pub fn mv_umi_latched(&self, map_seed: i32) -> bool {
         map_seed != 0 && self.mv_umi_instance == map_seed
+    }
+
+    /// Whether The Shatters instance identified by `map_seed` was played in
+    /// Hard Mode (see [`Self::hm_shatters_instance`]).
+    pub fn hm_shatters_latched(&self, map_seed: i32) -> bool {
+        map_seed != 0 && self.hm_shatters_instance == map_seed
     }
 
     /// Check if a text packet matches any attribution trigger.
@@ -382,6 +402,35 @@ mod tests {
         let t = trigger.unwrap();
         assert_eq!(t.mob_id, boss_ids::BRIDGE_SENTINEL);
         assert_eq!(t.variant, Some(VariantSuffix::HardMode));
+    }
+
+    #[test]
+    fn hard_mode_shatters_latches_the_instance() {
+        let mut mgr = LootAttributionManager::new();
+        // Valen the Unbreakable's death line only happens on a Hard Mode run.
+        assert!(mgr.handle_text_packet(
+            "#Valen the Unbreakable",
+            "I see now... my strength could not have held against this growing power.",
+            12345
+        ));
+        assert!(mgr.hm_shatters_latched(12345));
+        assert!(!mgr.hm_shatters_latched(999));
+        assert!(!mgr.hm_shatters_latched(0));
+    }
+
+    #[test]
+    fn regular_shatters_does_not_latch_hard_mode() {
+        let mut mgr = LootAttributionManager::new();
+        assert!(mgr.handle_text_packet(
+            "#The Bridge Sentinel",
+            "I tried to protect you... I have failed.",
+            12345
+        ));
+        assert!(!mgr.hm_shatters_latched(12345));
+        // The latch is per-instance: leaving the dungeon clears it, as does
+        // re-entering.
+        mgr.clear();
+        assert!(!mgr.hm_shatters_latched(12345));
     }
 
     #[test]
