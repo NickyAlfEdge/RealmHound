@@ -439,7 +439,11 @@ mod tests {
     #[test]
     fn non_umi_triggers_do_not_latch_umi() {
         let mut mgr = LootAttributionManager::new();
-        mgr.handle_text_packet("#Void Entity", "You fools... You can never truly defeat me! I am in all of you! I AM all of you!", 12345);
+        mgr.handle_text_packet(
+            "#Void Entity",
+            "You fools... You can never truly defeat me! I am in all of you! I AM all of you!",
+            12345,
+        );
         assert!(!mgr.mv_umi_latched(12345));
     }
 

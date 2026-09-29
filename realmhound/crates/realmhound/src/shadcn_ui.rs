@@ -970,6 +970,28 @@ impl Shadcn {
         .inner
     }
 
+    /// A compact square `x` button sized to the `small` text beside it, for
+    /// inline remove/cancel actions in list rows. Its height matches the small
+    /// font so it does not inflate the row or sit below the text.
+    pub fn btn_x(&self, ui: &mut Ui) -> Response {
+        let palette = &self.theme.palette;
+        ui.scope(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+            ui.add(
+                egui::Button::new(
+                    egui::RichText::new("x")
+                        .small()
+                        .color(palette.secondary_foreground),
+                )
+                .fill(palette.secondary)
+                .stroke(egui::Stroke::new(1.0_f32, palette.border))
+                .corner_radius(4.0)
+                .min_size(egui::vec2(16.0, 16.0)),
+            )
+        })
+        .inner
+    }
+
     /// A themed destructive button (red, for irreversible actions).
     pub fn button_destructive(
         &self,

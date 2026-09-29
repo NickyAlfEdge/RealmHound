@@ -347,11 +347,11 @@ impl KeyPopEntry {
         }
     }
 
-    /// The "Thanks <opener> for the key" clipboard callout, or `None` when the
+    /// The "Thanks <opener> for the key!" clipboard callout, or `None` when the
     /// local player opened the key.
     pub fn callout(&self) -> Option<String> {
         self.thankable
-            .then(|| format!("Thanks {} for the key", self.opener))
+            .then(|| format!("Thanks {} for the key!", self.opener))
     }
 }
 
@@ -4194,8 +4194,8 @@ impl LiveFeedPanel {
 
     /// Render a public key-pop entry: the dungeon key sprite, dungeon name, and
     /// "Opened by <player>". Observed (not entered) events stay clickable and
-    /// never expire; clicking copies a "Thanks <opener> for the key"
-    /// callout. Returns true when clicked.
+    /// never expire; clicking copies a "Thanks <opener> for the key!" callout.
+    /// Returns true when clicked.
     fn render_key_pop_entry(
         &self,
         ui: &mut Ui,
@@ -5992,7 +5992,7 @@ mod tests {
         assert_eq!(entry.key_id, 1234);
         assert_eq!(
             entry.callout(),
-            Some("Thanks Alice for the key".to_string())
+            Some("Thanks Alice for the key!".to_string())
         );
     }
 
