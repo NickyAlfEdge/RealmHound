@@ -3112,8 +3112,12 @@ impl RealmHoundApp {
                         .map(|(v, l)| (v.as_str(), l.as_str()))
                         .collect();
                     let mut tier_sel = Some(current_settings.min_tiered_tier.to_string());
+                    // Open upward: the trigger is the last row of the last card
+                    // in the tab, so a downward popup has nowhere to go and gets
+                    // slid back over its own trigger (whose hover then scrolls
+                    // the list endlessly instead of letting a tier be picked).
                     if shadcn
-                        .select(ui, "min_tiered_tier", &mut tier_sel, 70.0, &option_refs)
+                        .select_up(ui, "min_tiered_tier", &mut tier_sel, 70.0, &option_refs)
                         .changed()
                     {
                         if let Some(parsed) =
@@ -3579,12 +3583,23 @@ impl RealmHoundApp {
         };
 
         ui.add_space(10.0);
-        ui.heading("Live Feed");
+        let (heading, description) = match self.live_feed_sub_tab {
+            LiveFeedSubTab::NotificationsWarnings => (
+                "Notifications & Warnings",
+                "Choose what types of notifications and warnings appear in the Live Feed.",
+            ),
+            LiveFeedSubTab::DungeonCallouts => (
+                "Dungeon Callouts",
+                "Choose how quick dungeon callouts are formatted.",
+            ),
+            LiveFeedSubTab::EncounterCallouts => (
+                "Encounter Callouts",
+                "Choose how quick realm encounters callouts are formatted.",
+            ),
+        };
+        ui.heading(heading);
         ui.add_space(5.0);
-        ui.label(
-            RichText::new("Choose what appears in the Live Feed and how callouts are formatted.")
-                .weak(),
-        );
+        ui.label(RichText::new(description).weak());
         ui.add_space(15.0);
 
         let mut settings_changed = false;
