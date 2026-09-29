@@ -1501,7 +1501,7 @@ impl RealmHoundApp {
     ///
     /// Returns `true` if the per-frame cap was hit (more may remain), so the
     /// caller can request another repaint to keep draining.
-    fn drain_ui_updates(&mut self, _ctx: &egui::Context) -> bool {
+    fn drain_ui_updates(&mut self, ctx: &egui::Context) -> bool {
         #[cfg(feature = "latency-diagnostics")]
         let frame_started = Instant::now();
         #[cfg(feature = "latency-diagnostics")]
@@ -1591,6 +1591,16 @@ impl RealmHoundApp {
                 minimized
             );
         }
+        // The Live Feed panel decides when its automatic dungeon callout has to
+        // be copied or cleared, but it only runs while its tab is open. The
+        // clipboard write therefore happens here, every frame.
+        if let Some(write) = self.live_feed_panel.poll_clipboard() {
+            match write {
+                crate::panels::live_feed::ClipboardWrite::Copy(text) => ctx.copy_text(text),
+                crate::panels::live_feed::ClipboardWrite::Clear => ctx.copy_text(String::new()),
+            }
+        }
+
         applied == 4096
     }
 
@@ -3797,6 +3807,21 @@ impl RealmHoundApp {
 
             shadcn.card(ui, "lf_callout_structure", "Callout Structure", |ui| {
                 Self::render_preview(ui, std::slice::from_ref(&dungeon_preview));
+
+                settings_changed |= shadcn
+                    .switch(
+                        ui,
+                        &mut current.auto_clipboard_dungeon_calls,
+                        "Auto clipboard dungeon calls",
+                    )
+                    .hover_tip(
+                        "Copy a dungeon's callout to the clipboard as soon as you enter it, \
+                         without clicking its feed entry. The clipboard is cleared again when \
+                         the dungeon can no longer be joined, when you move on, or when the \
+                         realm closes.",
+                    )
+                    .changed();
+                ui.add_space(8.0);
 
                 // Short-name editing only applies while short names are in use; it
                 // is hidden for the full-name and name-less styles.

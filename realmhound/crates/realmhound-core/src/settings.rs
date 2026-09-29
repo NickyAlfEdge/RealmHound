@@ -366,6 +366,13 @@ pub struct LiveFeedSettings {
     #[serde(default)]
     pub callout_percent: bool,
 
+    /// Whether entering a joinable dungeon copies its callout to the clipboard
+    /// by itself, without the user clicking the feed entry. The clipboard is
+    /// cleared again when the dungeon can no longer be joined, when the player
+    /// moves on, or when the realm closes. Defaults to `false`.
+    #[serde(default)]
+    pub auto_clipboard_dungeon_calls: bool,
+
     /// Whether event clipboard callouts use the curated short nickname or the
     /// full event name. Defaults to [`DungeonNameStyle::Short`].
     #[serde(default)]
@@ -954,6 +961,7 @@ impl Default for LiveFeedSettings {
             realm_status: RealmStatusMode::default(),
             realm_status_threshold: default_realm_status_threshold(),
             callout_percent: false,
+            auto_clipboard_dungeon_calls: false,
             event_name_style: DungeonNameStyle::default(),
             event_add_upcoming: true,
             reward_mods: default_reward_mods(),
@@ -2804,6 +2812,10 @@ mod tests {
         assert_eq!(lf.learn_event_mods_runs, 3);
         assert_eq!(lf.realm_status, RealmStatusMode::None);
         assert_eq!(lf.realm_status_threshold, 33);
+        assert!(
+            !lf.auto_clipboard_dungeon_calls,
+            "auto clipboard is off by default"
+        );
         // The name-less dungeon style round-trips.
         let json = serde_json::to_string(&DungeonNameStyle::None).unwrap();
         assert_eq!(json, "\"None\"");
