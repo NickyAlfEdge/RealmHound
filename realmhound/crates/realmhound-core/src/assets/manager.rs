@@ -813,6 +813,22 @@ pub fn is_shatters_main_boss(id: i32) -> bool {
     )
 }
 
+/// Sprite sheet hard mode draws the Forgotten King's revealed form from.
+pub const SHATTERS_HM_KING_SHEET: &str = "theShattersChars32x32";
+/// Frame of [`SHATTERS_HM_KING_SHEET`] King Azamoth is drawn from. Hard mode
+/// reveals the King rather than swapping in another object, so the revealed
+/// sprite is one of the extra frames his own object references.
+pub const SHATTERS_HM_KING_FRAME: i32 = 15;
+
+/// The sprite hard mode swaps a Shatters boss to, as `(sheet, frame)`, or `None`
+/// for the bosses whose hard-mode form keeps the object's own sprite.
+pub fn shatters_hm_boss_sprite(id: i32) -> Option<(&'static str, i32)> {
+    match id {
+        SHATTERS_KING_TYPE => Some((SHATTERS_HM_KING_SHEET, SHATTERS_HM_KING_FRAME)),
+        _ => None,
+    }
+}
+
 /// The boss object types a completion marker signals as cleared, or `None` when
 /// `id` is not a known completion marker ([`COMPLETION_MARKER_MAP`]).
 fn completion_marker_targets_for(id: i32) -> Option<&'static [i32]> {
@@ -4698,6 +4714,35 @@ mod tests {
         // The Stone Idol is a curated standalone boss (no encounter grouping).
         assert!(is_curated_boss_type(33280));
         assert!(encounter_for_boss_type(33280).is_none());
+    }
+
+    #[test]
+    fn shatters_hard_mode_sprite_is_the_revealed_king_only() {
+        // Hard mode renames bosses in place, so only the King has a swapped
+        // sprite; the other two keep their object's own art.
+        assert_eq!(
+            shatters_hm_boss_sprite(SHATTERS_KING_TYPE),
+            Some((SHATTERS_HM_KING_SHEET, SHATTERS_HM_KING_FRAME))
+        );
+        assert_eq!(shatters_hm_boss_sprite(SHATTERS_BRIDGE_SENTINEL_TYPE), None);
+        assert_eq!(
+            shatters_hm_boss_sprite(SHATTERS_TWILIGHT_ARCHMAGE_TYPE),
+            None
+        );
+        assert_eq!(shatters_hm_boss_sprite(33280), None);
+
+        // The named sheet/frame pair and the revealed names describe the same
+        // three bosses.
+        for id in [
+            SHATTERS_BRIDGE_SENTINEL_TYPE,
+            SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            SHATTERS_KING_TYPE,
+        ] {
+            assert!(is_shatters_main_boss(id));
+            assert!(shatters_hm_boss_name(id).is_some());
+        }
+        assert!(!is_shatters_main_boss(33280)); // the Stone Idol is an unlock object
+        assert!(!is_shatters_main_boss(SHATTERS_THE_SOURCE_TYPE));
     }
 
     #[test]

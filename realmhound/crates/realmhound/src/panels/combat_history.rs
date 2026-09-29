@@ -123,6 +123,28 @@ fn dungeon_display_name(
     }
 }
 
+/// Draw a boss portrait. Hard mode reveals the Forgotten King as King Azamoth
+/// without swapping in another object, so his card is drawn from the extra frame
+/// of his own sprite sheet ([`shatters_hm_boss_sprite`]); every other boss uses
+/// the sprite of its object type.
+fn draw_boss_sprite(
+    sprite_renderer: &mut crate::rendering::SpriteRenderer,
+    ui: &egui::Ui,
+    object_type: i32,
+    shatters_hm: bool,
+    rect: egui::Rect,
+) {
+    if shatters_hm {
+        if let Some((sheet, frame)) = realmhound_core::assets::shatters_hm_boss_sprite(object_type)
+        {
+            if sprite_renderer.draw_outlined_sprite_by_sheet(ui, sheet, frame, rect) {
+                return;
+            }
+        }
+    }
+    sprite_renderer.draw_outlined_sprite_in_rect(ui, object_type, rect);
+}
+
 /// Cached autocomplete data (distinct bosses/dungeons) for search suggestions.
 #[derive(Default)]
 struct AutocompleteCache {
@@ -1761,9 +1783,11 @@ impl CombatHistoryPanel {
                 let (brect, bresp) =
                     cui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
                 if fight.boss_object_type != 0 {
-                    ctx.sprite_renderer.draw_outlined_sprite_in_rect(
+                    draw_boss_sprite(
+                        ctx.sprite_renderer,
                         cui,
                         fight.boss_object_type,
+                        fight.shatters_hm,
                         brect,
                     );
                 }
@@ -2350,6 +2374,7 @@ impl CombatHistoryPanel {
                     fight.boss_start_hp as i64,
                     fight.boss_max_hp as i64,
                     fight.total_damage(),
+                    fight.shatters_hm,
                 );
 
                 ui.add_space(6.0);
@@ -2606,6 +2631,7 @@ impl CombatHistoryPanel {
         start_hp: i64,
         max_hp: i64,
         damage: i64,
+        shatters_hm: bool,
     ) -> f32 {
         const YELLOW: Color32 = Color32::from_rgb(0xff, 0xc1, 0x00);
         const DARK_YELLOW: Color32 = Color32::from_rgb(0xab, 0x83, 0x00);
@@ -2717,7 +2743,7 @@ impl CombatHistoryPanel {
         ));
         if boss_type != 0 {
             let p_rect = egui::Rect::from_center_size(dc, egui::vec2(PORTRAIT, PORTRAIT));
-            sprite_renderer.draw_outlined_sprite_in_rect(ui, boss_type, p_rect);
+            draw_boss_sprite(sprite_renderer, ui, boss_type, shatters_hm, p_rect);
         }
 
         // Tooltip scoped to the bar itself.
@@ -3437,6 +3463,7 @@ impl CombatHistoryPanel {
                     anchor_start,
                     anchor_max,
                     anchor_damage,
+                    enc.shatters_hm,
                 );
 
                 ui.add_space(6.0);
@@ -3677,9 +3704,11 @@ impl CombatHistoryPanel {
                         if phase.boss_object_type != 0 {
                             let (rect, _) = ui
                                 .allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                            ctx.sprite_renderer.draw_outlined_sprite_in_rect(
+                            draw_boss_sprite(
+                                ctx.sprite_renderer,
                                 ui,
                                 phase.boss_object_type,
+                                phase.shatters_hm,
                                 rect,
                             );
                         }
