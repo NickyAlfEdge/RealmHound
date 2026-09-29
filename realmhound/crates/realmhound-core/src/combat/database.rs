@@ -2603,6 +2603,12 @@ impl CombatDatabase {
         {
             return Ok((false, false, false));
         }
+        // Tracked mini-bosses of a dungeon whose markers are reserved for its
+        // main boss (Lost Halls' Agonized Titan, Cultist Hideout's sub-bosses)
+        // are not the fight these markers describe.
+        if !crate::assets::boss_earns_secret_stats(&s.dungeon, s.boss_object_type) {
+            return Ok((false, false, false));
+        }
         // Every fight in the card, flagged as a main-boss (anchor) phase.
         let fights: Vec<(i64, bool)> = match &s.encounter_run_id {
             Some(run) => {
@@ -5299,6 +5305,78 @@ mod tests {
             !list[0].lone_fighter,
             "another damage dealer disqualifies solo"
         );
+    }
+
+    #[test]
+    fn lone_fighter_skips_tracked_mini_bosses_of_a_main_boss_dungeon() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // A solo Lost Halls mini-boss: local finished it with a teammate who only
+        // died, which is exactly the shape the markers describe -- but it is not
+        // the dungeon's boss, so the card earns none of them.
+        db.insert_fight(&flawless_fight(
+            "Lost Halls",
+            0xb010,
+            vec![
+                secret_local_part(80_000, ParticipantEndStatus::Present),
+                flawless_part(
+                    600,
+                    "Alice",
+                    0,
+                    None,
+                    ParticipantEndStatus::Died { grave_type: 1830 },
+                ),
+            ],
+        ))
+        .unwrap();
+        // The same mini-boss type in an unrestricted dungeon keeps its marker.
+        db.insert_fight(&flawless_fight(
+            "Kogbold Steamworks",
+            0xc4ad,
+            vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+        ))
+        .unwrap();
+        // The dungeons' main bosses still earn them.
+        db.insert_fight(&flawless_fight(
+            "Lost Halls",
+            45073,
+            vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+        ))
+        .unwrap();
+        db.insert_fight(&flawless_fight(
+            "Cultist Hideout",
+            45231,
+            vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+        ))
+        .unwrap();
+
+        let list = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let card = |boss: i32| {
+            list.iter()
+                .find(|s| s.boss_object_type == boss)
+                .unwrap_or_else(|| panic!("card for {boss:#x}"))
+        };
+        let titan = card(0xb010);
+        assert_eq!(titan.dungeon, "Lost Halls");
+        assert!(
+            !titan.lone_fighter,
+            "a Lost Halls mini-boss is not a dungeon clear"
+        );
+        assert!(!titan.last_hero_standing && !titan.most_damage_taken);
+        assert!(
+            card(45073).lone_fighter,
+            "Marble Colossus is the fight the marker describes"
+        );
+        assert!(card(45231).lone_fighter, "Malus is Cultist Hideout's boss");
+        assert!(
+            card(0xc4ad).lone_fighter,
+            "other dungeons keep their mini-boss markers"
+        );
+
+        // The secret-stat filter agrees with the flags.
+        let mut query = FightQuery::default();
+        query.filter_lone_fighter = true;
+        let filtered = db.list_fights(&query, 50).unwrap();
+        assert!(!filtered.iter().any(|s| s.boss_object_type == 0xb010));
     }
 
     #[test]

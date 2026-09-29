@@ -1061,6 +1061,34 @@ pub fn boss_exempt_from_flawless(boss_object_type: i32) -> bool {
     FLAWLESS_EXEMPT_BOSS_TYPES.contains(&boss_object_type)
 }
 
+/// Dungeons whose Combat History secret-stat markers ("Lone fighter", "Last
+/// hero standing", "Most damage taken") are reserved for their main boss.
+///
+/// Their Exaltation band classifies every tracked entity fought inside them, so
+/// a mini-boss card would otherwise earn markers that describe clearing the
+/// dungeon's boss. Each entry lists the object type(s) that do qualify; any
+/// other boss in that dungeon earns none. Dungeons absent from the table are
+/// unrestricted (their band gate applies as before), which includes "The Void" --
+/// the Void Entity is recorded under its own dungeon name, not Lost Halls.
+static SECRET_STAT_MAIN_BOSSES: &[(&str, &[i32])] = &[
+    ("Lost Halls", &[45073]),      // Marble Colossus
+    ("Cultist Hideout", &[45231]), // Malus
+];
+
+/// Whether a card's boss earns the Combat History secret-stat markers.
+///
+/// False for the tracked mini-bosses of the dungeons in
+/// [`SECRET_STAT_MAIN_BOSSES`]: an Agonized Titan or Marble Defender has no
+/// dungeon boss to clear, so a lone kill of one is not the group-scale feat the
+/// markers describe. Every other fight keeps the markers (this only narrows
+/// *which boss* qualifies, not whether the dungeon's cards do).
+pub fn boss_earns_secret_stats(dungeon: &str, boss_object_type: i32) -> bool {
+    SECRET_STAT_MAIN_BOSSES
+        .iter()
+        .find(|(name, _)| *name == dungeon)
+        .is_none_or(|(_, bosses)| bosses.contains(&boss_object_type))
+}
+
 /// Case-insensitive substring fragments identifying the curated seasonal event
 /// bosses. Matched against the resolved boss name so no
 /// object-type table is required (names are stable and already persisted).
@@ -1324,6 +1352,25 @@ mod tests {
         assert!(!boss_exempt_from_flawless(45073)); // Marble Colossus
         assert!(!boss_exempt_from_flawless(50391)); // Factory Control Core
         assert!(!boss_exempt_from_flawless(45712)); // Crystal Worm Mother
+    }
+
+    #[test]
+    fn secret_stats_are_reserved_for_the_main_boss_where_tracked() {
+        // Lost Halls: only Marble Colossus; its tracked mini-bosses earn nothing.
+        assert!(boss_earns_secret_stats("Lost Halls", 45073));
+        assert!(!boss_earns_secret_stats("Lost Halls", 0xb010)); // Agonized Titan
+        assert!(!boss_earns_secret_stats("Lost Halls", 0xb136)); // Marble Defender F
+        assert!(!boss_earns_secret_stats("Lost Halls", 45116)); // Marble Core summary
+                                                                // Cultist Hideout: only Malus's card (its sub-bosses are phases of it).
+        assert!(boss_earns_secret_stats("Cultist Hideout", 45231));
+        assert!(!boss_earns_secret_stats("Cultist Hideout", 45217)); // Argus
+                                                                     // The Void Entity is recorded under its own dungeon, so Lost Halls'
+                                                                     // restriction does not reach it.
+        assert!(boss_earns_secret_stats("The Void", 45076));
+        // Every other dungeon is unrestricted: the band gate already applies.
+        assert!(boss_earns_secret_stats("Fungal Cavern", 45712));
+        assert!(boss_earns_secret_stats("Kogbold Steamworks", 0xc4ad));
+        assert!(boss_earns_secret_stats("", 0));
     }
 
     #[test]
