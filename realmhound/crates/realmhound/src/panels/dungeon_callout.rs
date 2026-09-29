@@ -1,16 +1,24 @@
 //! Dungeon-entry clipboard callouts.
 //!
 //! When the user loads into a dungeon, RealmHound builds a short callout *body*
-//! to copy to the clipboard, e.g. `snake 15% lb synd`. The body is the dungeon's
-//! short nickname followed by reward/modifier tags. The `/p` prefix, short
-//! server name, and join marker `j` are added at copy time by the Live Feed
-//! panel, so they are NOT part of the body built here.
+//! to copy to the clipboard, e.g. `snake 15% lb synd`. The body starts with the
+//! dungeon's short nickname (dropped when the name style is `none`) and is
+//! followed by reward/modifier tags. The `/p` prefix, short server name, and
+//! join marker `j` are added at copy time by the Live Feed panel, so they are
+//! NOT part of the body built here.
 //!
 //! Tag rules: the total loot/dust/xp bonuses render as `<n>% lb`/`<n>% db`/
-//! `<n>% xp` (labels and percent sign are configurable), followed by the
-//! enabled reward-mod tags in list order (see [`default_reward_mods`], which
-//! includes Syndicate, Prismimic, Crab Rave and other popular unique mods), then
-//! Alexander's Legacy (`dying thessal <pct>%`), and finally Dimitus.
+//! `<n>% xp` (labels, percent sign and the minimum bonus each needs are
+//! configurable), followed by the enabled reward-mod tags in list order (see
+//! [`default_reward_mods`], which includes Syndicate, Prismimic, Crab Rave and
+//! other popular unique mods), then Alexander's Legacy
+//! (`dying thessal <pct>%`), Dimitus, and finally the realm status
+//! (`in 74% realm`) when the caller resolved one.
+//!
+//! Mods the game applies to an instance by itself during a special event (a
+//! Steamworks Maintenance on every Kogbold Steamworks run) can be left out of
+//! the call while still counting towards the numeric bonuses -- see
+//! [`is_event_preset_modifier`].
 //!
 //! By default, dungeons carrying the Dimitus modifier get NO callout because its
 //! reward-mod entry ships disabled (they still surface via their own icon and
@@ -24,15 +32,22 @@
 //! (e.g. Syndicate = `MERCA..D`, Wanderer = `WANDERERBOSS`, Found Treasure =
 //! `FOOUNDTREASURE`), matched via [`canonical`] so separators/case are ignored.
 //! [`default_reward_mods`]: realmhound_core::settings::default_reward_mods
+//!
+//! Some dungeons are reachable only from inside other instances (Crystal Cavern,
+//! Cultist Hideout, The Void) and are deliberately given no callout because they
+//! cannot be joined from the nexus.
+//!
+//! Modifier identification keys come from the authoritative `mods.xml` wire ids
+//! (e.g. Syndicate = `MERCA..D`, Wanderer = `WANDERERBOSS`, Found Treasure =
+//! `FOOUNDTREASURE`), matched via [`canonical`] so separators/case are ignored.
+//! [`default_reward_mods`]: realmhound_core::settings::default_reward_mods
 
-use realmhound_core::dungeon_modifiers::{canonical, total_bonus};
-use realmhound_core::settings::{DungeonNameStyle, DustLabel, LootLabel, RewardModEntry, XpLabel};
+use realmhound_core::dungeon_modifiers::{canonical, is_event_preset_modifier, total_bonus};
+use realmhound_core::settings::{
+    DungeonNameStyle, DustLabel, LootLabel, RealmStatusMode, RewardModEntry, XpLabel,
+    CLOSING_REALM_PERCENT,
+};
 use std::collections::BTreeMap;
-
-/// Loot bonus (percent) must be strictly greater than this to add an `lb` tag.
-const LOOT_THRESHOLD: i32 = 0;
-/// Dust bonus (percent) must be greater than or equal to this to add a `db` tag.
-const DUST_THRESHOLD: i32 = 20;
 
 /// Short callout nicknames for known dungeons, keyed by the
 /// dungeon's display name. Lookup is done on a normalized form (lowercase,
@@ -87,6 +102,21 @@ const DUNGEON_NICKNAMES: &[(&str, &str)] = &[
     ("Ice Tomb",                     "ice tomb"),
     ("Legacy Heroic Abyss of Demons","legacy habyss"),
     ("Legacy Heroic Undead Lair",    "legacy hudl"),
+    // Legacy dungeons (the "Legacy ..." instances callable from the realm).
+    ("Legacy Pirate Cave",           "leg pcave"),
+    ("Legacy Forest Maze",           "leg fmaze"),
+    ("Legacy Spider Den",            "leg sden"),
+    ("Legacy Sprite World",          "leg sprite"),
+    ("Legacy Abyss of Demons",       "leg abby"),
+    ("Legacy Undead Lair",           "leg udl"),
+    ("Legacy Deadwater Docks",       "leg ddocks"),
+    ("Legacy Bilgewater's Grotto",   "grotto"),
+    ("Legacy Woodland Labyrinth",    "leg wlab"),
+    ("Legacy The Crawling Depths",   "leg cdepths"),
+    ("Legacy Lair of Shaitan",       "leg shait"),
+    ("Legacy Lair of Draconis",      "leg LOD"),
+    ("The Ivory Wyvern",             "ivory"),
+    ("Legacy The Shatters",          "leg shatts"),
     ("The Trials of Cronus",         "trials"),
     ("Mad God Mayhem",               "mayhem"),
     ("Mountain Temple",              "MT"),
@@ -163,40 +193,95 @@ pub struct DungeonCalloutParams<'a> {
     pub dust_label: DustLabel,
     /// How the XP-boost tag is rendered (or hidden).
     pub xp_label: XpLabel,
+    /// Minimum loot bonus (percent) for the loot tag to be emitted.
+    pub loot_threshold: i32,
+    /// Minimum dust bonus (percent) for the dust tag to be emitted.
+    pub dust_threshold: i32,
+    /// Minimum XP bonus (percent) for the XP tag to be emitted.
+    pub xp_threshold: i32,
+    /// Whether to call the mods the game applies to an instance by itself during
+    /// a special event (see
+    /// [`is_event_preset_modifier`](realmhound_core::dungeon_modifiers::is_event_preset_modifier)).
+    /// When `false` their tags are omitted; the numeric bonuses they grant are
+    /// still called.
+    pub call_event_mods: bool,
     /// Whether loot/dust/xp values include a `%` sign.
     pub percent: bool,
     /// Editable reward-modifier tags (id, short call, enabled).
     pub reward_mods: &'a [RewardModEntry],
+    /// Mods this session has recognized as applied to every instance of the
+    /// dungeon by an event (raw wire tokens; see
+    /// [`LiveFeedPanel::learned_event_mods`](crate::panels::live_feed::LiveFeedPanel)).
+    /// Their tags are dropped along with [`Self::call_event_mods`]'s curated set;
+    /// empty when nothing has been learned yet.
+    pub learned_event_mods: &'a [String],
+    /// Realm-status suffix to append, e.g. `in a closing realm` or
+    /// `in 74% realm`. Resolved and gated by the caller (`None` appends
+    /// nothing). See [`realm_status_suffix`].
+    pub realm_status: Option<&'a str>,
+}
+
+/// The realm-status callout suffix for a dungeon entered from a realm, or
+/// `None` when nothing should be appended.
+///
+/// `score_percent` is the realm's completion when the dungeon was entered (the
+/// last score seen before leaving it). It is `None` for dungeons that were not
+/// entered through a realm portal, or whose realm has since been left/closed.
+///
+/// - [`RealmStatusMode::Closing`] reads `in a closing realm` for scores above
+///   [`CLOSING_REALM_PERCENT`]: the realm can no longer be joined from outside.
+/// - [`RealmStatusMode::Score`] reads `in <n>% realm` from `threshold` upwards.
+pub fn realm_status_suffix(
+    mode: RealmStatusMode,
+    threshold_percent: i32,
+    score_percent: Option<i32>,
+) -> Option<String> {
+    let score = score_percent?;
+    match mode {
+        RealmStatusMode::None => None,
+        RealmStatusMode::Closing => {
+            (score > CLOSING_REALM_PERCENT).then(|| "in a closing realm".to_string())
+        }
+        RealmStatusMode::Score => {
+            (score >= threshold_percent).then(|| format!("in {score}% realm"))
+        }
+    }
 }
 
 /// Resolve a dungeon display name to the callout name part, honoring a user
 /// short-name override (Short mode only), then the curated nickname, then the
-/// lowercased full name.
+/// lowercased full name. Returns `None` in [`DungeonNameStyle::None`] mode,
+/// where callouts carry only reward/mod tags.
 fn resolve_dungeon_name(
     display_name: &str,
     name_style: DungeonNameStyle,
     overrides: &BTreeMap<String, String>,
-) -> String {
+) -> Option<String> {
     if matches!(name_style, DungeonNameStyle::Short) {
         if let Some(custom) = overrides.get(display_name.trim()) {
             if !custom.trim().is_empty() {
-                return custom.trim().to_string();
+                return Some(custom.trim().to_string());
             }
         }
     }
     match name_style {
-        DungeonNameStyle::Full => display_name.trim().to_lowercase(),
-        DungeonNameStyle::Short => dungeon_nickname(display_name)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| display_name.trim().to_lowercase()),
+        DungeonNameStyle::None => None,
+        DungeonNameStyle::Full => Some(display_name.trim().to_lowercase()),
+        DungeonNameStyle::Short => Some(
+            dungeon_nickname(display_name)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| display_name.trim().to_lowercase()),
+        ),
     }
 }
 
 /// Build the clipboard callout for a dungeon, resolving the name part to a user
-/// override, the curated short nickname, or the lowercased full display name.
-/// Every dungeon is callable except those in [`NON_CALLABLE_DUNGEONS`]. Returns
-/// `None` when the dungeon should have no callout: a non-callable dungeon, or a
-/// Dimitus dungeon whose reward-mod entry is disabled.
+/// override, the curated short nickname, or the lowercased full display name
+/// (and to nothing at all in [`DungeonNameStyle::None`] mode, which calls only
+/// the reward/mod tags). Every dungeon is callable except those in
+/// [`NON_CALLABLE_DUNGEONS`]. Returns `None` when the dungeon should have no
+/// callout: a non-callable dungeon, a Dimitus dungeon whose reward-mod entry is
+/// disabled, or a callout that would be empty.
 pub fn dungeon_callout_for(
     display_name: &str,
     modifier_tokens: &[String],
@@ -207,17 +292,16 @@ pub fn dungeon_callout_for(
         return None;
     }
     let name = resolve_dungeon_name(display_name, params.name_style, params.name_overrides);
-    if name.trim().is_empty() {
-        return None;
-    }
-    build_dungeon_callout(&name, modifier_tokens, params)
+    build_dungeon_callout(name.as_deref().unwrap_or_default(), modifier_tokens, params)
 }
 
 /// Build the clipboard callout body for a dungeon from a resolved name plus its
-/// modifier-derived tags, in this order: loot, dust, xp, Syndicate, the enabled
-/// reward-mod tags (list order), Prismimic, Crab Rave, Alexander's Legacy, and
-/// finally Dimitus. Returns `None` for a Dimitus dungeon whose reward-mod entry
-/// is disabled (the whole callout is suppressed, matching the legacy toggle).
+/// modifier-derived tags, in this order: the name (when the style keeps one),
+/// loot, dust, xp, the enabled reward-mod tags (list order), Alexander's Legacy,
+/// Dimitus, then the realm status. Returns `None` for a Dimitus dungeon whose
+/// reward-mod entry is disabled (the whole callout is suppressed, matching the
+/// legacy toggle) or for a callout that would be empty (name-less calls with no
+/// tags to name).
 pub fn build_dungeon_callout(
     nickname: &str,
     modifier_tokens: &[String],
@@ -232,20 +316,22 @@ pub fn build_dungeon_callout(
 
     let mut tags: Vec<String> = Vec::new();
 
-    // Reward bonuses (thresholds preserved). Each honors its label mode and the
-    // percent-sign preference; a `None` label mode omits the tag entirely.
+    // Reward bonuses. Each honors its label mode, its threshold, and the
+    // percent-sign preference; a `None` label mode omits the tag entirely. The
+    // bonuses are summed from every modifier, including the event presets the
+    // caller may have chosen not to name: the dungeon really does grant them.
     let bonus = total_bonus(modifier_tokens);
-    if bonus.loot > LOOT_THRESHOLD {
+    if bonus.loot >= params.loot_threshold {
         if let Some(tag) = loot_tag(bonus.loot, params.loot_label, params.percent) {
             tags.push(tag);
         }
     }
-    if bonus.dust >= DUST_THRESHOLD {
+    if bonus.dust >= params.dust_threshold {
         if let Some(tag) = dust_tag(bonus.dust, params.dust_label, params.percent) {
             tags.push(tag);
         }
     }
-    if bonus.xp > 0 {
+    if bonus.xp >= params.xp_threshold {
         if let Some(tag) = xp_tag(bonus.xp, params.xp_label, params.percent) {
             tags.push(tag);
         }
@@ -255,6 +341,12 @@ pub fn build_dungeon_callout(
     // Syndicate, Prismimic and Crab Rave now live in this list too.
     for entry in params.reward_mods {
         if entry.id == "DIMITUS" {
+            continue;
+        }
+        if !params.call_event_mods
+            && (is_event_preset_modifier(&entry.id)
+                || has_base_or_numbered(params.learned_event_mods, &entry.id))
+        {
             continue;
         }
         if let Some(tag) = reward_mod_tag(modifier_tokens, entry) {
@@ -281,12 +373,22 @@ pub fn build_dungeon_callout(
         }
     }
 
-    let mut call = nickname.to_string();
+    // The realm the dungeon was entered from (when the caller resolved one).
+    if let Some(status) = params.realm_status {
+        let status = status.trim();
+        if !status.is_empty() {
+            tags.push(status.to_string());
+        }
+    }
+
+    let mut call = nickname.trim().to_string();
     for tag in &tags {
-        call.push(' ');
+        if !call.is_empty() {
+            call.push(' ');
+        }
         call.push_str(tag);
     }
-    Some(call)
+    (!call.is_empty()).then_some(call)
 }
 
 /// The short call for a reward-mod entry when the dungeon carries it and the
@@ -405,8 +507,14 @@ mod tests {
             loot_label: LootLabel::Lb,
             dust_label: DustLabel::Db,
             xp_label: XpLabel::None,
+            loot_threshold: 5,
+            dust_threshold: 10,
+            xp_threshold: 10,
+            call_event_mods: true,
             percent,
             reward_mods: mods,
+            learned_event_mods: &[],
+            realm_status: None,
         }
     }
 
@@ -471,15 +579,22 @@ mod tests {
     }
 
     #[test]
-    fn loot_threshold_is_strictly_greater_than_zero() {
+    fn loot_threshold_calls_at_or_above_the_configured_minimum() {
         let _assets = crate::test_support::modifier_assets();
-        // Mystery Effusion grants +20 loot in mods.xml -> 20 > 0.
+        // Mystery Effusion grants +20 loot in mods.xml.
         let out = call("snake", &["MYSTERYEFFUSION"]).unwrap();
         assert!(out.contains("20% lb"), "got: {out}");
+        // Below the configured minimum (25) the tag is dropped.
+        let mods = default_reward_mods();
+        let ov = BTreeMap::new();
+        let mut p = params(&mods, &ov, true);
+        p.loot_threshold = 25;
+        let out = build_dungeon_callout("snake", &tokens(&["MYSTERYEFFUSION"]), &p).unwrap();
+        assert!(!out.contains("lb"), "got: {out}");
     }
 
     #[test]
-    fn dust_threshold_is_greater_than_or_equal_to_20() {
+    fn dust_threshold_calls_at_or_above_the_configured_minimum() {
         let _assets = crate::test_support::modifier_assets();
         // Dust Storm grants +50 dust in mods.xml.
         let out = call("snake", &["DUSTSTORM"]).unwrap();
@@ -489,9 +604,13 @@ mod tests {
     #[test]
     fn no_tag_when_below_threshold() {
         let _assets = crate::test_support::modifier_assets();
-        // Colorful = +10 loot / +18 dust in mods.xml; loot exceeds 0 so lb shows,
-        // but dust <20 so no db tag.
-        let out = call("snake", &["COLORFUL"]).unwrap();
+        let mods = default_reward_mods();
+        let ov = BTreeMap::new();
+        // Colorful = +10 loot / +18 dust in mods.xml: above the shipped 5% loot
+        // minimum, below the 20% dust minimum configured here.
+        let mut p = params(&mods, &ov, true);
+        p.dust_threshold = 20;
+        let out = build_dungeon_callout("snake", &tokens(&["COLORFUL"]), &p).unwrap();
         assert!(out.contains("10% lb"), "got: {out}");
         assert!(!out.contains("db"), "got: {out}");
     }
@@ -659,7 +778,7 @@ mod tests {
                 "normalized dup nickname {nick}"
             );
         }
-        assert_eq!(DUNGEON_NICKNAMES.len(), 62);
+        assert_eq!(DUNGEON_NICKNAMES.len(), 76);
     }
 
     #[test]
@@ -778,6 +897,226 @@ mod tests {
         assert_eq!(
             call_for("Lost Halls", &["MYSTERYEFFUSION"]).as_deref(),
             Some("halls 20% lb")
+        );
+    }
+
+    /// A params set with every threshold at its shipped default.
+    fn default_params<'a>(
+        mods: &'a [RewardModEntry],
+        ov: &'a BTreeMap<String, String>,
+    ) -> DungeonCalloutParams<'a> {
+        params(mods, ov, true)
+    }
+
+    #[test]
+    fn reward_thresholds_gate_each_tag() {
+        let _assets = crate::test_support::modifier_assets();
+        let mods = default_reward_mods();
+        let ov = BTreeMap::new();
+        let p = default_params(&mods, &ov);
+        // Looting is +50 loot, Dust Storm +50 dust: both clear the defaults.
+        let out = build_dungeon_callout("halls", &tokens(&["LOOTING", "DUSTSTORM"]), &p).unwrap();
+        assert!(out.contains("50% lb") && out.contains("50% db"), "{out}");
+
+        // Raising a threshold past the dungeon's bonus drops just that tag.
+        let mut p = default_params(&mods, &ov);
+        p.loot_threshold = 60;
+        p.dust_threshold = 60;
+        let out = build_dungeon_callout("halls", &tokens(&["LOOTING", "DUSTSTORM"]), &p).unwrap();
+        assert!(!out.contains("lb") && !out.contains("db"), "{out}");
+
+        // A threshold equal to a bonus still calls it (inclusive).
+        let mut p = default_params(&mods, &ov);
+        p.loot_threshold = 50;
+        let out = build_dungeon_callout("halls", &tokens(&["LOOTING", "DUSTSTORM"]), &p).unwrap();
+        assert!(out.contains("50% lb"), "{out}");
+
+        // XP honours its own threshold (off by default, so enable the label).
+        // Experienced is +100% xp in the fixture.
+        let mut p = default_params(&mods, &ov);
+        p.xp_label = XpLabel::Xp;
+        let out = build_dungeon_callout("halls", &tokens(&["EXPERIENCED"]), &p).unwrap();
+        assert!(out.contains("100% xp"), "{out}");
+        p.xp_threshold = 150;
+        let out = build_dungeon_callout("halls", &tokens(&["EXPERIENCED"]), &p).unwrap();
+        assert!(!out.contains("xp"), "{out}");
+    }
+
+    #[test]
+    fn threshold_defaults_match_shipped_values() {
+        let overrides = BTreeMap::new();
+        let p = default_params(&[], &overrides);
+        assert_eq!(p.loot_threshold, 5);
+        assert_eq!(p.dust_threshold, 10);
+        assert_eq!(p.xp_threshold, 10);
+        assert!(p.call_event_mods, "event mods are called by default");
+    }
+
+    #[test]
+    fn none_name_style_calls_only_the_tags() {
+        let _assets = crate::test_support::modifier_assets();
+        let mods = default_reward_mods();
+        let ov = BTreeMap::new();
+        let mut p = default_params(&mods, &ov);
+        p.name_style = DungeonNameStyle::None;
+        assert_eq!(
+            dungeon_callout_for("The Shatters", &tokens(&["LOOTING"]), &p).as_deref(),
+            Some("50% lb")
+        );
+        // A name-less dungeon with nothing else to say produces no callout.
+        assert_eq!(
+            dungeon_callout_for("The Shatters", &tokens(&["WEAKBOSS_3"]), &p),
+            None
+        );
+    }
+
+    #[test]
+    fn event_preset_mods_are_optional_in_calls() {
+        let _assets = crate::test_support::modifier_assets();
+        // Looting is a game preset on Parasite Chambers; the fixtures know its
+        // bonus, and its tag ships disabled, so enable it to observe the drop.
+        let mut mods = default_reward_mods();
+        if let Some(entry) = mods.iter_mut().find(|e| e.id == "LOOTING") {
+            entry.enabled = true;
+        }
+        let ov = BTreeMap::new();
+        let out = build_dungeon_callout("para", &tokens(&["LOOTING"]), &default_params(&mods, &ov))
+            .unwrap();
+        assert!(out.contains("looting"), "{out}");
+        assert!(out.contains("50% lb"), "{out}");
+
+        let mut p = default_params(&mods, &ov);
+        p.call_event_mods = false;
+        let out = build_dungeon_callout("para", &tokens(&["LOOTING"]), &p).unwrap();
+        assert!(!out.contains("looting"), "{out}");
+        // The bonus the preset grants is still called: the dungeon has it.
+        assert!(out.contains("50% lb"), "{out}");
+
+        // The issue's example: Steamworks Maintenance ships enabled as
+        // "turrets off", so every Kogbold Steamworks call advertises it.
+        let out = build_dungeon_callout(
+            "kog",
+            &tokens(&["STEAMWORKS_MAINTENANCE"]),
+            &default_params(&mods, &ov),
+        )
+        .unwrap();
+        assert!(out.contains("turrets off"), "{out}");
+        let out = build_dungeon_callout("kog", &tokens(&["STEAMWORKS_MAINTENANCE"]), &p).unwrap();
+        assert!(!out.contains("turrets off"), "{out}");
+
+        // The same for the Woodland Labyrinth event: 38 captured instances all
+        // carried Found Treasure!, 24 of them with nothing else.
+        let woodland = tokens(&["FOOLISH_2", "FOOUNDTREASURE"]);
+        let out = build_dungeon_callout("wlab", &woodland, &default_params(&mods, &ov)).unwrap();
+        assert!(out.contains("troom"), "{out}");
+        let out = build_dungeon_callout("wlab", &woodland, &p).unwrap();
+        assert!(!out.contains("troom"), "{out}");
+
+        // A rolled mod is unaffected by the option.
+        let out = build_dungeon_callout("halls", &tokens(&["GENEROUS"]), &p).unwrap();
+        assert!(out.contains("generous"), "{out}");
+    }
+
+    #[test]
+    fn learned_event_mods_are_dropped_too() {
+        let _assets = crate::test_support::modifier_assets();
+        let mods = default_reward_mods();
+        let ov = BTreeMap::new();
+        let learned = vec!["GENEROUS".to_string()];
+        let mut p = default_params(&mods, &ov);
+        p.call_event_mods = false;
+        p.learned_event_mods = &learned;
+        let out = build_dungeon_callout("halls", &tokens(&["GENEROUS"]), &p).unwrap();
+        assert!(!out.contains("generous"), "{out}");
+        // A tiered wire id still matches its learned base.
+        let learned = vec!["SOUVENIR".to_string()];
+        p.learned_event_mods = &learned;
+        let out = build_dungeon_callout("ddocks", &tokens(&["SOUVENIR_1"]), &p).unwrap();
+        assert!(!out.contains("souv"), "{out}");
+        // With the option on, the learned set is ignored.
+        p.call_event_mods = true;
+        let out = build_dungeon_callout("ddocks", &tokens(&["SOUVENIR_1"]), &p).unwrap();
+        assert!(out.contains("souv"), "{out}");
+    }
+
+    #[test]
+    fn realm_status_suffix_modes_and_thresholds() {
+        // Off by default.
+        assert_eq!(
+            realm_status_suffix(RealmStatusMode::None, 50, Some(95)),
+            None
+        );
+        // No realm (key pop in the nexus, a party join) names nothing.
+        assert_eq!(
+            realm_status_suffix(RealmStatusMode::Closing, 50, None),
+            None
+        );
+        assert_eq!(realm_status_suffix(RealmStatusMode::Score, 50, None), None);
+
+        // "Closing" covers realms past 90%, exclusively.
+        assert_eq!(
+            realm_status_suffix(RealmStatusMode::Closing, 50, Some(91)).as_deref(),
+            Some("in a closing realm")
+        );
+        assert_eq!(
+            realm_status_suffix(RealmStatusMode::Closing, 50, Some(90)),
+            None
+        );
+
+        // "Score" names the score from the configured threshold up.
+        assert_eq!(
+            realm_status_suffix(RealmStatusMode::Score, 75, Some(74)),
+            None
+        );
+        assert_eq!(
+            realm_status_suffix(RealmStatusMode::Score, 75, Some(75)).as_deref(),
+            Some("in 75% realm")
+        );
+        assert_eq!(
+            realm_status_suffix(RealmStatusMode::Score, 50, Some(63)).as_deref(),
+            Some("in 63% realm")
+        );
+    }
+
+    #[test]
+    fn realm_status_is_appended_last() {
+        let _assets = crate::test_support::modifier_assets();
+        let mods = default_reward_mods();
+        let ov = BTreeMap::new();
+        let mut p = default_params(&mods, &ov);
+        p.realm_status = Some("in 74% realm");
+        let out = build_dungeon_callout("halls", &tokens(&["LOOTING", "GENEROUS"]), &p).unwrap();
+        assert!(out.ends_with("in 74% realm"), "{out}");
+        assert!(out.starts_with("halls 50% lb"), "{out}");
+    }
+
+    #[test]
+    fn legacy_and_new_realm_slangs_resolve() {
+        // Legacy instances calls are split from the combined stats rows.
+        assert_eq!(dungeon_nickname("Legacy Pirate Cave"), Some("leg pcave"));
+        assert_eq!(
+            dungeon_nickname("Legacy Deadwater Docks"),
+            Some("leg ddocks")
+        );
+        assert_eq!(
+            dungeon_nickname("Legacy Bilgewater's Grotto"),
+            Some("grotto")
+        );
+        assert_eq!(dungeon_nickname("Legacy Lair of Draconis"), Some("leg LOD"));
+        assert_eq!(dungeon_nickname("The Ivory Wyvern"), Some("ivory"));
+        assert_eq!(dungeon_nickname("Legacy The Shatters"), Some("leg shatts"));
+        // A legacy callout uses the split nickname, not the full name.
+        let _assets = crate::test_support::modifier_assets();
+        let mods = default_reward_mods();
+        let ov = BTreeMap::new();
+        assert_eq!(
+            dungeon_callout_for(
+                "The Ivory Wyvern",
+                &tokens(&[]),
+                &default_params(&mods, &ov)
+            )
+            .as_deref(),
+            Some("ivory")
         );
     }
 

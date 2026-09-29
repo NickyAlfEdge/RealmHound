@@ -567,6 +567,10 @@ pub struct DungeonEntry {
     pub server_name: Option<String>,
     /// Realm name at time of dungeon entry (for callout assembly).
     pub realm_name: Option<String>,
+    /// Realm completion (percent) of the realm this dungeon was entered from,
+    /// when it was entered through a realm portal and the realm is still the one
+    /// we are tracking. Drives the optional realm-status callout suffix.
+    pub realm_score_percent: Option<i32>,
     /// True when the join window is estimated rather than anchored to an observed
     /// portal spawn (e.g. joined via a party call). Estimated entries use a
     /// shorter window and mark the countdown with a `?`.
@@ -590,6 +594,17 @@ const DUNGEON_WINDOW_ESTIMATED: std::time::Duration = std::time::Duration::from_
 /// Time from a realm-close message to the castle teleport.
 const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How many recent entries of one dungeon the panel remembers, and therefore the
+/// widest window `learn_event_mods_runs` can compare. An event that started
+/// mid-session is recognized a few runs in, so a handful of spawns is enough.
+const MAX_LEARN_EVENT_MOD_SETS: usize = 10;
+
+/// Whether two modifier tokens name the same mod (wire ids vary by separators).
+fn same_modifier(a: &str, b: &str) -> bool {
+    realmhound_core::dungeon_modifiers::canonical(a)
+        == realmhound_core::dungeon_modifiers::canonical(b)
+}
+
 impl DungeonEntry {
     /// Create a new dungeon entry from a display name and decoded modifier tokens.
     ///
@@ -603,6 +618,7 @@ impl DungeonEntry {
         params: &crate::panels::dungeon_callout::DungeonCalloutParams<'_>,
         server_name: Option<String>,
         realm_name: Option<String>,
+        realm_score_percent: Option<i32>,
         anchor: std::time::Instant,
         estimated: bool,
     ) -> Self {
@@ -668,6 +684,7 @@ impl DungeonEntry {
             modifier_tokens: modifier_tokens.to_vec(),
             server_name,
             realm_name,
+            realm_score_percent,
             estimated,
             map_seed: 0,
             entered_at: std::time::Instant::now(),
@@ -865,6 +882,36 @@ pub struct LiveFeedPanel {
     dust_label: realmhound_core::settings::DustLabel,
     /// How the XP-boost tag is rendered. Mirrors `Settings.live_feed.xp_label`.
     xp_label: realmhound_core::settings::XpLabel,
+    /// Minimum loot bonus (%) for the loot tag. Mirrors
+    /// `Settings.live_feed.loot_threshold`.
+    loot_threshold: i32,
+    /// Minimum dust bonus (%) for the dust tag. Mirrors
+    /// `Settings.live_feed.dust_threshold`.
+    dust_threshold: i32,
+    /// Minimum XP bonus (%) for the XP tag. Mirrors
+    /// `Settings.live_feed.xp_threshold`.
+    xp_threshold: i32,
+    /// Whether to call mods the game applies to an instance itself during a
+    /// special event. Mirrors `Settings.live_feed.call_event_mods`.
+    call_event_mods: bool,
+    /// Whether to recognize event mods from the dungeons the user enters.
+    /// Mirrors `Settings.live_feed.learn_event_mods`.
+    learn_event_mods: bool,
+    /// How many consecutive spawns of one dungeon must carry a mod before it is
+    /// recognized as an event mod. Mirrors
+    /// `Settings.live_feed.learn_event_mods_runs`.
+    learn_event_mods_runs: u32,
+    /// Modifier sets of this session's dungeon entries, keyed by the dungeon's
+    /// display name, newest last (capped). Used to recognize the mods the game
+    /// applies to every instance of a dungeon during an event, which the game
+    /// files cannot mark (see `EVENT_PRESET_MODS`).
+    dungeon_mod_sets: HashMap<String, Vec<Vec<String>>>,
+    /// How the realm a dungeon was entered from is named. Mirrors
+    /// `Settings.live_feed.realm_status`.
+    realm_status: realmhound_core::settings::RealmStatusMode,
+    /// Minimum realm score (%) for the `in <n>% realm` tag. Mirrors
+    /// `Settings.live_feed.realm_status_threshold`.
+    realm_status_threshold: i32,
     /// Whether callout reward values include a `%` sign.
     /// Mirrors `Settings.live_feed.callout_percent`.
     callout_percent: bool,
@@ -1006,6 +1053,15 @@ impl LiveFeedPanel {
             loot_label: realmhound_core::settings::LootLabel::default(),
             dust_label: realmhound_core::settings::DustLabel::default(),
             xp_label: realmhound_core::settings::XpLabel::default(),
+            loot_threshold: 5,
+            dust_threshold: 10,
+            xp_threshold: 10,
+            call_event_mods: true,
+            learn_event_mods: true,
+            learn_event_mods_runs: realmhound_core::settings::LEARN_EVENT_MOD_RUNS_DEFAULT,
+            dungeon_mod_sets: HashMap::new(),
+            realm_status: realmhound_core::settings::RealmStatusMode::default(),
+            realm_status_threshold: 50,
             callout_percent: false,
             reward_mods: realmhound_core::settings::default_reward_mods(),
             dungeon_name_overrides: std::collections::BTreeMap::new(),
@@ -1055,6 +1111,14 @@ impl LiveFeedPanel {
             || self.loot_label != settings.loot_label
             || self.dust_label != settings.dust_label
             || self.xp_label != settings.xp_label
+            || self.loot_threshold != settings.loot_threshold
+            || self.dust_threshold != settings.dust_threshold
+            || self.xp_threshold != settings.xp_threshold
+            || self.call_event_mods != settings.call_event_mods
+            || self.learn_event_mods != settings.learn_event_mods
+            || self.learn_event_mods_runs != settings.learn_event_mods_runs
+            || self.realm_status != settings.realm_status
+            || self.realm_status_threshold != settings.realm_status_threshold
             || self.callout_percent != settings.callout_percent
             || self.reward_mods != settings.reward_mods
             || self.dungeon_name_overrides != settings.dungeon_name_overrides;
@@ -1070,6 +1134,17 @@ impl LiveFeedPanel {
         self.loot_label = settings.loot_label;
         self.dust_label = settings.dust_label;
         self.xp_label = settings.xp_label;
+        self.loot_threshold = settings.loot_threshold;
+        self.dust_threshold = settings.dust_threshold;
+        self.xp_threshold = settings.xp_threshold;
+        self.call_event_mods = settings.call_event_mods;
+        self.learn_event_mods = settings.learn_event_mods;
+        self.learn_event_mods_runs = settings.learn_event_mods_runs.clamp(
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+        );
+        self.realm_status = settings.realm_status;
+        self.realm_status_threshold = settings.realm_status_threshold;
         self.callout_percent = settings.callout_percent;
         self.reward_mods = settings.reward_mods.clone();
         self.dungeon_name_overrides = settings.dungeon_name_overrides.clone();
@@ -1111,17 +1186,104 @@ impl LiveFeedPanel {
             realmhound_core::season::battlepass_target(season, chrono::Utc::now());
     }
 
+    /// The realm-status suffix for a dungeon callout (`in a closing realm` or
+    /// `in 74% realm`), or `None` when the mode is off, the realm the dungeon was
+    /// entered from is unknown, or its score is below the configured threshold.
+    ///
+    /// `realm_score` must already be gated on the realm still being the one the
+    /// dungeon was entered from: naming a score from a realm the player has since
+    /// left would be wrong.
+    fn realm_status_suffix(&self, realm_score: Option<i32>) -> Option<String> {
+        crate::panels::dungeon_callout::realm_status_suffix(
+            self.realm_status,
+            self.realm_status_threshold,
+            realm_score,
+        )
+    }
+
+    /// Mods the session has seen in *every* one of the last
+    /// [`LiveFeedSettings::learn_event_mods_runs`] entries of `dungeon`, with at
+    /// least one of those entries carrying the mod as its only own: the signature
+    /// of a mod the game applies to the instance itself during an event instead
+    /// of rolling it.
+    ///
+    /// This complements the curated [`EVENT_PRESET_MODS`] table: the game files
+    /// cannot mark an event mod (they all ship as `ROLLABLE`), so a new event is
+    /// only recognizable from the traffic itself. Empty while the feature is off
+    /// and until enough entries of the dungeon have been seen, so a single
+    /// coincidence can't hide a real roll.
+    ///
+    /// [`LiveFeedSettings::learn_event_mods_runs`]: realmhound_core::settings::LiveFeedSettings::learn_event_mods_runs
+    /// [`EVENT_PRESET_MODS`]: realmhound_core::dungeon_modifiers::EVENT_PRESET_MODS
+    fn learned_event_mods(&self, dungeon: &str) -> Vec<String> {
+        if !self.learn_event_mods {
+            return Vec::new();
+        }
+        let runs = self.learn_event_mods_runs.clamp(
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+        ) as usize;
+        let Some(sets) = self.dungeon_mod_sets.get(dungeon) else {
+            return Vec::new();
+        };
+        if sets.len() < runs {
+            return Vec::new();
+        }
+        let recent = &sets[sets.len() - runs..];
+        let mut candidates = recent[0].clone();
+        candidates.retain(|modifier| {
+            recent[1..]
+                .iter()
+                .all(|set| set.iter().any(|t| same_modifier(t, modifier)))
+        });
+        // A mod that stood alone in at least one of those entries cannot be part
+        // of the rolled set (which fills the instance's grade), so it is one the
+        // game added. Requiring this keeps three identical *rolls* from
+        // suppressing a genuine call.
+        candidates.retain(|modifier| {
+            recent
+                .iter()
+                .any(|set| set.len() == 1 && same_modifier(&set[0], modifier))
+        });
+        candidates
+    }
+
+    /// Record a dungeon entry's modifier set for [`Self::learned_event_mods`].
+    fn remember_dungeon_mods(&mut self, dungeon: &str, modifier_tokens: &[String]) {
+        let sets = self
+            .dungeon_mod_sets
+            .entry(dungeon.to_string())
+            .or_default();
+        sets.push(modifier_tokens.to_vec());
+        if sets.len() > MAX_LEARN_EVENT_MOD_SETS {
+            let overflow = sets.len() - MAX_LEARN_EVENT_MOD_SETS;
+            sets.drain(0..overflow);
+        }
+    }
+
     /// Borrow the current dungeon-callout formatting parameters from the panel's
-    /// settings mirrors.
-    fn dungeon_callout_params(&self) -> crate::panels::dungeon_callout::DungeonCalloutParams<'_> {
+    /// settings mirrors. `realm_status` is the realm-status suffix to append
+    /// (see [`Self::realm_status_suffix`]), when any; `learned_event_mods` are the
+    /// mods this session has recognized as applied by an event.
+    fn dungeon_callout_params<'a>(
+        &'a self,
+        realm_status: Option<&'a str>,
+        learned_event_mods: &'a [String],
+    ) -> crate::panels::dungeon_callout::DungeonCalloutParams<'a> {
         crate::panels::dungeon_callout::DungeonCalloutParams {
             name_style: self.dungeon_name_style,
             name_overrides: &self.dungeon_name_overrides,
             loot_label: self.loot_label,
             dust_label: self.dust_label,
             xp_label: self.xp_label,
+            loot_threshold: self.loot_threshold,
+            dust_threshold: self.dust_threshold,
+            xp_threshold: self.xp_threshold,
+            call_event_mods: self.call_event_mods,
             percent: self.callout_percent,
             reward_mods: &self.reward_mods,
+            learned_event_mods,
+            realm_status,
         }
     }
 
@@ -1129,17 +1291,54 @@ impl LiveFeedPanel {
     /// settings mirrors. Called when callout-affecting settings change so that
     /// existing feed entries reflect the new formatting.
     fn recompute_dungeon_callouts(&mut self) {
+        // Copy the settings mirrors out of `self` so the mutable pass over the
+        // entries doesn't conflict with the immutable borrows the parameters need.
+        let current_realm = self.realm_name.clone();
+        // Learned event mods per dungeon, resolved before that mutable pass.
+        let dungeons: Vec<String> = self.dungeon_mod_sets.keys().cloned().collect();
+        let learned_event_mods: HashMap<String, Vec<String>> = dungeons
+            .into_iter()
+            .map(|name| {
+                let mods = self.learned_event_mods(&name);
+                (name, mods)
+            })
+            .collect();
         let params = crate::panels::dungeon_callout::DungeonCalloutParams {
             name_style: self.dungeon_name_style,
             name_overrides: &self.dungeon_name_overrides,
             loot_label: self.loot_label,
             dust_label: self.dust_label,
             xp_label: self.xp_label,
+            loot_threshold: self.loot_threshold,
+            dust_threshold: self.dust_threshold,
+            xp_threshold: self.xp_threshold,
+            call_event_mods: self.call_event_mods,
             percent: self.callout_percent,
             reward_mods: &self.reward_mods,
+            learned_event_mods: &[],
+            realm_status: None,
         };
+        let realm_mode = self.realm_status;
+        let realm_threshold = self.realm_status_threshold;
         for entry in &mut self.entries {
             if let FeedEntry::Dungeon(d) = entry {
+                // The realm status is only named while the realm the dungeon was
+                // entered from is still the one we are in (or last saw): leaving
+                // it for another realm or the nexus drops the suffix.
+                let score = d
+                    .realm_score_percent
+                    .filter(|_| d.realm_name.is_some() && d.realm_name == current_realm);
+                let realm_status = crate::panels::dungeon_callout::realm_status_suffix(
+                    realm_mode,
+                    realm_threshold,
+                    score,
+                );
+                let learned = learned_event_mods.get(&d.dungeon_name);
+                let params = crate::panels::dungeon_callout::DungeonCalloutParams {
+                    realm_status: realm_status.as_deref(),
+                    learned_event_mods: learned.map(Vec::as_slice).unwrap_or_default(),
+                    ..params
+                };
                 d.callout = crate::panels::dungeon_callout::dungeon_callout_for(
                     &d.dungeon_name,
                     &d.modifier_tokens,
@@ -1974,7 +2173,21 @@ impl LiveFeedPanel {
             .filter(|spawn| spawn.elapsed() < DUNGEON_JOIN_WINDOW);
         let estimated = fresh_spawn.is_none();
         let anchor = fresh_spawn.unwrap_or_else(std::time::Instant::now);
-        let params = self.dungeon_callout_params();
+        // Realm status is only called for dungeons entered through a realm
+        // portal: a party-call join (estimated window) belongs to no realm of its
+        // own, and outside a realm there is no score to name (key pops in the
+        // nexus, hub entries).
+        let realm_score_percent = if estimated {
+            None
+        } else {
+            self.get_score_percent()
+        };
+        let realm_status = self.realm_status_suffix(realm_score_percent);
+        // Recognize (and remember) the mods this event applies to every instance
+        // of this dungeon, so calls stop advertising a mod nobody rolled.
+        self.remember_dungeon_mods(&display_name, modifier_tokens);
+        let learned_event_mods = self.learned_event_mods(&display_name);
+        let params = self.dungeon_callout_params(realm_status.as_deref(), &learned_event_mods);
         let mut entry = DungeonEntry::new(
             display_name,
             portal_id,
@@ -1983,6 +2196,7 @@ impl LiveFeedPanel {
             &params,
             self.server_name.clone(),
             self.realm_name.clone(),
+            realm_score_percent,
             anchor,
             estimated,
         );
@@ -5675,8 +5889,14 @@ mod tests {
             loot_label: realmhound_core::settings::LootLabel::Lb,
             dust_label: realmhound_core::settings::DustLabel::Db,
             xp_label: realmhound_core::settings::XpLabel::None,
+            loot_threshold: 5,
+            dust_threshold: 10,
+            xp_threshold: 10,
+            call_event_mods: true,
             percent: false,
             reward_mods: mods,
+            learned_event_mods: &[],
+            realm_status: None,
         }
     }
 
@@ -5705,6 +5925,7 @@ mod tests {
             &[],
             None,
             &params,
+            None,
             None,
             None,
             std::time::Instant::now(),
@@ -6225,6 +6446,7 @@ mod tests {
             &params,
             None,
             None,
+            None,
             std::time::Instant::now(),
             false,
         );
@@ -6246,6 +6468,7 @@ mod tests {
             &["UNKNOWN_MOD".to_string()],
             None,
             &params,
+            None,
             None,
             None,
             std::time::Instant::now(),
@@ -6480,6 +6703,212 @@ mod tests {
         assert!(panel.realm_closed);
         panel.update_location("Nexus", "Nexus", -1, -1);
         assert!(!panel.realm_closed);
+    }
+
+    /// A panel sitting in a realm at `current / max` score, mirroring what
+    /// MapInfo leaves behind on realm entry.
+    fn panel_in_realm(realm: &str, current: i32, max: i32) -> LiveFeedPanel {
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location(
+            "Realm of the Mad God",
+            &format!("NexusPortal.{realm}"),
+            current,
+            max,
+        );
+        panel
+    }
+
+    /// The callout of the newest dungeon entry, if it has one.
+    fn newest_callout(panel: &LiveFeedPanel) -> Option<String> {
+        match panel.entries.front() {
+            Some(FeedEntry::Dungeon(d)) => d.callout.clone(),
+            other => panic!("Expected Dungeon entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn realm_status_names_the_realm_a_dungeon_was_entered_from() {
+        let _assets = crate::test_support::modifier_assets();
+        // Portal entry from a realm at 74%: the score is named (threshold 50).
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake in 74% realm")
+        );
+
+        // Below the threshold nothing is appended.
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // A closing realm is called as such past 90%.
+        let mut panel = panel_in_realm("Medusa", 95, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(1, "Spider Den", &[], None);
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("sden in a closing realm")
+        );
+
+        // Off by default: no realm is named.
+        let mut panel = panel_in_realm("Medusa", 95, 100);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(1, "Spider Den", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
+    }
+
+    #[test]
+    fn learned_event_mods_need_repeated_instances_it_stood_alone_in() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        // Only the option's own effect is observable, so turn it off. None of
+        // these mods are in the curated list: this is the learned path.
+        panel.call_event_mods = false;
+
+        // First two entries: not enough evidence yet, so the tag is called.
+        panel.push_dungeon(1, "Snake Pit", &["GENEROUS".to_string()], None);
+        panel.push_dungeon(2, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+
+        // Third entry: the pattern is now recognizable, so the call drops it.
+        panel.push_dungeon(3, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+        assert_eq!(panel.learned_event_mods("Snake Pit"), ["GENEROUS"]);
+
+        // Other dungeons are unaffected (nothing learned for them yet).
+        panel.push_dungeon(4, "Spider Den", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden generous"));
+
+        // A rolled mod alongside the event mod is still called.
+        panel.push_dungeon(
+            5,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "KEYFAIRY".to_string()],
+            None,
+        );
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake keyf"));
+    }
+
+    #[test]
+    fn learned_event_mods_honor_the_configured_run_count() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        // Ask for four runs instead of the default three: three aren't enough.
+        panel.learn_event_mods_runs = 4;
+        for seed in [1, 2, 3] {
+            panel.push_dungeon(seed, "Snake Pit", &["GENEROUS".to_string()], None);
+        }
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+        panel.push_dungeon(4, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(panel.learned_event_mods("Snake Pit"), ["GENEROUS"]);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn learned_event_mods_can_be_switched_off() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        panel.learn_event_mods = false;
+        for seed in [1, 2, 3, 4] {
+            panel.push_dungeon(seed, "Snake Pit", &["GENEROUS".to_string()], None);
+        }
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+    }
+
+    #[test]
+    fn learned_event_mods_need_equal_tokens_across_runs() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        // Three runs where no single mod appears in all of them, so nothing is
+        // learned and every tag is still called. (None of these mods is in the
+        // curated event list, so only the learning path can drop one.)
+        panel.push_dungeon(
+            1,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "KEYFAIRY".to_string()],
+            None,
+        );
+        panel.push_dungeon(
+            2,
+            "Snake Pit",
+            &["KEYFAIRY".to_string(), "NILDROPS".to_string()],
+            None,
+        );
+        panel.push_dungeon(
+            3,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "NILDROPS".to_string()],
+            None,
+        );
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        // Tags keep their reward-mod list order (Nildrops precedes Generous).
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake nildrop generous")
+        );
+    }
+
+    #[test]
+    fn realm_status_skips_party_joins_and_key_pops() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Medusa", 95, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
+        // No observed portal spawn -> a party-call join, which has no realm of
+        // its own to name.
+        panel.push_dungeon(1, "Spider Den", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
+
+        // A key popped in a hub (no realm score) names nothing either.
+        let mut panel = LiveFeedPanel::new();
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(1, "Spider Den", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
+    }
+
+    #[test]
+    fn realm_status_drops_when_the_realm_is_left() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake in 74% realm")
+        );
+
+        // Leaving for another realm invalidates the captured score: a settings
+        // change must not re-append it to the old row.
+        panel.update_location("Realm of the Mad God", "NexusPortal.Hydra", 10, 100);
+        panel.recompute_dungeon_callouts();
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // Same realm (e.g. re-entering the dungeon) keeps it.
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        panel.recompute_dungeon_callouts();
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake in 74% realm")
+        );
     }
 
     #[test]
