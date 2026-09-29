@@ -833,6 +833,16 @@ pub struct LiveFeedPanel {
     is_score_stale: bool,
     /// True when the player is inside a dungeon (from MapChanged.is_dungeon).
     currently_in_dungeon: bool,
+    /// Whether the map the player is standing on is a realm (MapInfo reported a
+    /// realm score). Set by [`Self::update_location`].
+    map_is_realm: bool,
+    /// Whether the map this location update replaced was a realm. A dungeon call
+    /// only names the realm score when its portal was opened in a realm, so a
+    /// dungeon keyed open in the Nexus, inside another dungeon or in the Oryx
+    /// areas (Castle / Chamber / Wine Cellar / Sanctuary) inherits nothing even
+    /// though the realm score stays remembered there. Captured by
+    /// [`Self::update_location`] and read by [`Self::push_dungeon`].
+    left_from_realm: bool,
     /// Countdown expiry to the castle teleport after a realm close.
     /// `None` when no realm-close countdown is active. Cleared on a fresh realm
     /// entry, hub entry, or disconnect; kept running while diving into a
@@ -1053,6 +1063,8 @@ impl LiveFeedPanel {
             realm_score: None,
             is_score_stale: false,
             currently_in_dungeon: false,
+            map_is_realm: false,
+            left_from_realm: false,
             castle_timer_expires_at: None,
             realm_closed: false,
             // Dust status bar state
@@ -1580,6 +1592,12 @@ impl LiveFeedPanel {
 
         // Check if we're in a realm (has valid score)
         let in_realm = max_score > 0;
+        // Remember what the map this update replaces was before overwriting it: a
+        // dungeon call only names the realm score when its portal was opened in a
+        // realm (see `push_dungeon`). Realms are the only maps MapInfo reports a
+        // score for, so the Oryx areas, hubs and dungeons all clear this.
+        self.left_from_realm = self.map_is_realm;
+        self.map_is_realm = in_realm;
 
         // Parse realm name from realm_name field (e.g., "NexusPortal.Medusa" -> "Medusa")
         // Server name comes from IP lookup, not from this field
@@ -1667,6 +1685,8 @@ impl LiveFeedPanel {
         self.realm_score = None;
         self.is_score_stale = false;
         self.currently_in_dungeon = false;
+        self.map_is_realm = false;
+        self.left_from_realm = false;
         self.castle_timer_expires_at = None;
         self.realm_closed = false;
         self.crystal_pin = None;
@@ -2202,11 +2222,12 @@ impl LiveFeedPanel {
             .filter(|spawn| spawn.elapsed() < DUNGEON_JOIN_WINDOW);
         let estimated = fresh_spawn.is_none();
         let anchor = fresh_spawn.unwrap_or_else(std::time::Instant::now);
-        // Realm status is only called for dungeons entered through a realm
-        // portal: a party-call join (estimated window) belongs to no realm of its
-        // own, and outside a realm there is no score to name (key pops in the
-        // nexus, hub entries).
-        let realm_score_percent = if estimated {
+        // Realm status is only called for dungeons entered through a portal from
+        // a realm: a party-call join (estimated window) belongs to no realm of
+        // its own, and a dungeon keyed open in the Nexus, inside another dungeon
+        // or in the Oryx areas (Castle/Chamber/Wine Cellar/Sanctuary) is not a
+        // realm entry -- the realm score is only remembered there, not current.
+        let realm_score_percent = if estimated || !self.left_from_realm {
             None
         } else {
             self.get_score_percent()
@@ -6828,6 +6849,20 @@ mod tests {
         }
     }
 
+    /// Mirror the MapChanged sequence of entering `dungeon` through a portal:
+    /// the dungeon's own MapInfo reports no realm score, and the call is made
+    /// after that map change, as `handle_event` does. The map the portal was
+    /// opened on must already be established with
+    /// [`LiveFeedPanel::update_location`].
+    fn enter_dungeon(panel: &mut LiveFeedPanel, fp: i32, dungeon: &str) {
+        let realm_field = format!(
+            "NexusPortal.{}",
+            panel.realm_name.clone().unwrap_or_default()
+        );
+        panel.update_location(dungeon, &realm_field, 0, 0);
+        panel.push_dungeon(fp, dungeon, &[], None);
+    }
+
     #[test]
     fn realm_status_names_the_realm_a_dungeon_was_entered_from() {
         let _assets = crate::test_support::modifier_assets();
@@ -6836,7 +6871,7 @@ mod tests {
         panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
         panel.realm_status_threshold = 50;
         panel.pending_portal_spawn = Some(std::time::Instant::now());
-        panel.push_dungeon(1, "Snake Pit", &[], None);
+        enter_dungeon(&mut panel, 1, "Snake Pit");
         assert_eq!(
             newest_callout(&panel).as_deref(),
             Some("snake in 74% realm")
@@ -6847,14 +6882,14 @@ mod tests {
         panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
         panel.realm_status_threshold = 50;
         panel.pending_portal_spawn = Some(std::time::Instant::now());
-        panel.push_dungeon(1, "Snake Pit", &[], None);
+        enter_dungeon(&mut panel, 1, "Snake Pit");
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
 
         // A closing realm is called as such past 90%.
         let mut panel = panel_in_realm("Medusa", 95, 100);
         panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
         panel.pending_portal_spawn = Some(std::time::Instant::now());
-        panel.push_dungeon(1, "Spider Den", &[], None);
+        enter_dungeon(&mut panel, 1, "Spider Den");
         assert_eq!(
             newest_callout(&panel).as_deref(),
             Some("sden in a closing realm")
@@ -6863,7 +6898,7 @@ mod tests {
         // Off by default: no realm is named.
         let mut panel = panel_in_realm("Medusa", 95, 100);
         panel.pending_portal_spawn = Some(std::time::Instant::now());
-        panel.push_dungeon(1, "Spider Den", &[], None);
+        enter_dungeon(&mut panel, 1, "Spider Den");
         assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
     }
 
@@ -6970,6 +7005,7 @@ mod tests {
         panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
         // No observed portal spawn -> a party-call join, which has no realm of
         // its own to name.
+        panel.update_location("Spider Den", "NexusPortal.Medusa", 0, 0);
         panel.push_dungeon(1, "Spider Den", &[], None);
         assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
 
@@ -6977,8 +7013,70 @@ mod tests {
         let mut panel = LiveFeedPanel::new();
         panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
         panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.update_location("Spider Den", "NexusPortal.Medusa", 0, 0);
         panel.push_dungeon(1, "Spider Den", &[], None);
         assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
+    }
+
+    #[test]
+    fn realm_status_is_not_named_for_dungeons_opened_outside_a_realm() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+
+        // Realm -> Oryx's Castle: the realm score is only remembered from here on
+        // (the castle is not a realm), so a dungeon keyed open inside it names
+        // nothing even though the score is still known.
+        panel.update_location("Oryx's Castle", "NexusPortal.Medusa", 0, 0);
+        assert_eq!(
+            panel.get_score_percent(),
+            Some(74),
+            "the castle keeps the remembered score"
+        );
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "The Nest");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("nest"));
+
+        // Same for the rest of the Oryx endgame sequence.
+        for area in ["Oryx's Chamber", "Wine Cellar", "Oryx's Sanctuary"] {
+            let mut panel = panel_in_realm("Medusa", 74, 100);
+            panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+            panel.realm_status_threshold = 50;
+            panel.update_location(area, "NexusPortal.Medusa", 0, 0);
+            panel.pending_portal_spawn = Some(std::time::Instant::now());
+            enter_dungeon(&mut panel, 1, "The Nest");
+            assert_eq!(
+                newest_callout(&panel).as_deref(),
+                Some("nest"),
+                "{area} is not a realm entry"
+            );
+        }
+
+        // A dungeon entered from another dungeon (a key popped inside it) names
+        // nothing either, while the realm entry itself still does.
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake in 74% realm")
+        );
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 2, "The Nest");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("nest"));
+
+        // The Nexus clears the realm score outright, so a key popped there has
+        // nothing to name.
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.update_location("Nexus", "Nexus", -1, -1);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "The Nest");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("nest"));
     }
 
     #[test]
@@ -6988,7 +7086,7 @@ mod tests {
         panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
         panel.realm_status_threshold = 50;
         panel.pending_portal_spawn = Some(std::time::Instant::now());
-        panel.push_dungeon(1, "Snake Pit", &[], None);
+        enter_dungeon(&mut panel, 1, "Snake Pit");
         assert_eq!(
             newest_callout(&panel).as_deref(),
             Some("snake in 74% realm")
@@ -7005,7 +7103,7 @@ mod tests {
         panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
         panel.realm_status_threshold = 50;
         panel.pending_portal_spawn = Some(std::time::Instant::now());
-        panel.push_dungeon(1, "Snake Pit", &[], None);
+        enter_dungeon(&mut panel, 1, "Snake Pit");
         panel.recompute_dungeon_callouts();
         assert_eq!(
             newest_callout(&panel).as_deref(),
