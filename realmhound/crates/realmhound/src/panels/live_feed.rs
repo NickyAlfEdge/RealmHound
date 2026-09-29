@@ -1061,7 +1061,7 @@ impl LiveFeedPanel {
             learn_event_mods_runs: realmhound_core::settings::LEARN_EVENT_MOD_RUNS_DEFAULT,
             dungeon_mod_sets: HashMap::new(),
             realm_status: realmhound_core::settings::RealmStatusMode::default(),
-            realm_status_threshold: 50,
+            realm_status_threshold: 33,
             callout_percent: false,
             reward_mods: realmhound_core::settings::default_reward_mods(),
             dungeon_name_overrides: std::collections::BTreeMap::new(),

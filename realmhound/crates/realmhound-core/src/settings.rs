@@ -357,7 +357,7 @@ pub struct LiveFeedSettings {
     pub realm_status: RealmStatusMode,
 
     /// Minimum realm score (percent) for [`RealmStatusMode::Score`] to append
-    /// `in <n>% realm`. Defaults to 50.
+    /// `in <n>% realm`. Defaults to 33.
     #[serde(default = "default_realm_status_threshold")]
     pub realm_status_threshold: i32,
 
@@ -818,9 +818,9 @@ fn default_xp_threshold() -> i32 {
     10
 }
 
-/// Default minimum realm score for the `in <n>% realm` callout tag (50%).
+/// Default minimum realm score for the `in <n>% realm` callout tag (33%).
 fn default_realm_status_threshold() -> i32 {
-    50
+    33
 }
 
 /// Default number of consecutive dungeon spawns compared when recognizing an
@@ -2803,7 +2803,7 @@ mod tests {
         assert!(lf.learn_event_mods, "runs are learned from by default");
         assert_eq!(lf.learn_event_mods_runs, 3);
         assert_eq!(lf.realm_status, RealmStatusMode::None);
-        assert_eq!(lf.realm_status_threshold, 50);
+        assert_eq!(lf.realm_status_threshold, 33);
         // The name-less dungeon style round-trips.
         let json = serde_json::to_string(&DungeonNameStyle::None).unwrap();
         assert_eq!(json, "\"None\"");

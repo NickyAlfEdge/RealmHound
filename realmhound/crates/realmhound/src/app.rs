@@ -328,44 +328,97 @@ fn legacy_callable_split(stats_name: &str) -> &'static [&'static str] {
     }
 }
 
-/// A compact numeric field for a callout threshold: the minimum reward bonus
-/// (in percent) at which a tag is called. Greyed out when the tag it belongs to
-/// is set to `none`, so the field reads as inert rather than ignored. Returns
-/// whether the value changed.
-fn threshold_field(ui: &mut egui::Ui, value: &mut i32, enabled: bool, tip: &str) -> bool {
+/// Width of the label column in the Dungeon Callouts card. Every field row
+/// reserves it so its dropdown starts at the same x no matter how long the
+/// label before it is.
+const CALLOUT_LABEL_WIDTH: f32 = 120.0;
+
+/// A bordered integer input matching the card's other text fields (e.g. the
+/// slang-name editor). `range` clamps a parsed value; `id` keys a persistent
+/// edit buffer so partial typing survives the frame, and the buffer re-syncs
+/// from `value` whenever the field is not focused. Returns whether the value
+/// changed.
+fn number_box(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    enabled: bool,
+    tip: &str,
+) -> bool {
+    let buf_id = egui::Id::new(id).with("number_box");
+    let mut buf: String = ui.data_mut(|d| d.get_temp(buf_id).unwrap_or_else(|| value.to_string()));
     let response = ui.add_enabled(
         enabled,
-        egui::DragValue::new(value)
-            .speed(1.0)
-            .range(0..=100)
-            .suffix("%"),
+        egui::TextEdit::singleline(&mut buf)
+            .desired_width(46.0)
+            .char_limit(4),
     );
-    let changed = response.changed();
+    let mut changed = false;
+    if response.changed() {
+        if let Ok(n) = buf.trim().parse::<i32>() {
+            let n = n.clamp(*range.start(), *range.end());
+            if n != *value {
+                *value = n;
+                changed = true;
+            }
+        }
+    }
+    if !response.has_focus() {
+        buf = value.to_string();
+    }
     if enabled {
         response.hover_tip(tip);
     } else {
         response.disabled_hover_tip("This tag is not called (set to \"none\").");
     }
-    ui.label(RichText::new("or more").weak().small());
+    ui.data_mut(|d| d.insert_temp(buf_id, buf));
     changed
 }
 
-/// A compact numeric field for how many of a dungeon's recent spawns are
+/// A callout threshold as the "Add to the call if [n] % or more" requirement:
+/// the minimum reward bonus (in percent) at which a tag is called. Greyed out
+/// when the tag it belongs to is set to `none`, so the field reads as inert
+/// rather than ignored. Returns whether the value changed.
+fn threshold_field(ui: &mut egui::Ui, id: &str, value: &mut i32, enabled: bool, tip: &str) -> bool {
+    ui.label(RichText::new("Add to the call if").weak());
+    let changed = number_box(ui, id, value, 0..=100, enabled, tip);
+    ui.label(RichText::new("% or more").weak());
+    changed
+}
+
+/// A bordered numeric field for how many of a dungeon's recent spawns are
 /// compared when recognizing an event mod from the user's own runs. Returns
 /// whether the value changed.
 fn run_count_field(ui: &mut egui::Ui, value: &mut u32) -> bool {
+    let buf_id = egui::Id::new("learn_event_mods_runs").with("number_box");
+    let mut buf: String = ui.data_mut(|d| d.get_temp(buf_id).unwrap_or_else(|| value.to_string()));
     let response = ui.add(
-        egui::DragValue::new(value)
-            .speed(0.2)
-            .range(realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE),
+        egui::TextEdit::singleline(&mut buf)
+            .desired_width(32.0)
+            .char_limit(2),
     );
-    let changed = response.changed();
+    let mut changed = false;
+    if response.changed() {
+        if let Ok(n) = buf.trim().parse::<u32>() {
+            let n = n.clamp(
+                *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+                *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+            );
+            if n != *value {
+                *value = n;
+                changed = true;
+            }
+        }
+    }
+    if !response.has_focus() {
+        buf = value.to_string();
+    }
     response.hover_tip(
-        "How many consecutive spawns of the same dungeon must carry the mod before it counts \
-         as an event mod. Three tells an event mod from a coincidence while still adapting \
-         within a session; higher is stricter.",
+        "Select the number of dungeon runs based on which RealmHound will attempt to \
+         identify which dungeon mods is guaranteed for that dungeon this week.",
     );
-    ui.label(RichText::new("runs in a row").weak().small());
+    ui.data_mut(|d| d.insert_temp(buf_id, buf));
     changed
 }
 
@@ -3617,7 +3670,9 @@ impl RealmHoundApp {
         shadcn.card(ui, "lf_dungeon_callouts", "Dungeon Callouts", |ui| {
             // Join marker placement (dungeon default: end).
             shadcn.field_row(ui, |ui| {
-                ui.label("Join marker (j):");
+                fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                    ui.label("Join marker (j):");
+                });
                 let cur = match current.dungeon_join_position {
                     JoinPosition::End => "end",
                     JoinPosition::Beginning => "start",
@@ -3647,7 +3702,9 @@ impl RealmHoundApp {
             ui.add_space(6.0);
 
             shadcn.field_row(ui, |ui| {
-                ui.label("Dungeon names:");
+                fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                    ui.label("Dungeon names:");
+                });
                 let cur = match current.dungeon_name_style {
                     DungeonNameStyle::Short => "short",
                     DungeonNameStyle::Full => "full",
@@ -3715,7 +3772,9 @@ impl RealmHoundApp {
             // Reward-value label modes, each with the minimum bonus it takes to
             // call the value (the field only matters when the tag is called).
             shadcn.field_row(ui, |ui| {
-                ui.label("Loot boost:");
+                fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                    ui.label("Loot boost:");
+                });
                 let cur = match current.loot_label {
                     LootLabel::Lb => "lb",
                     LootLabel::Loot => "loot",
@@ -3741,6 +3800,7 @@ impl RealmHoundApp {
                 }
                 settings_changed |= threshold_field(
                     ui,
+                    "loot_threshold",
                     &mut current.loot_threshold,
                     !matches!(current.loot_label, LootLabel::None),
                     "Only call the loot boost when it is at least this much.",
@@ -3750,7 +3810,9 @@ impl RealmHoundApp {
             ui.add_space(6.0);
 
             shadcn.field_row(ui, |ui| {
-                ui.label("Dust boost:");
+                fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                    ui.label("Dust boost:");
+                });
                 let cur = match current.dust_label {
                     DustLabel::Db => "db",
                     DustLabel::Dust => "dust",
@@ -3776,6 +3838,7 @@ impl RealmHoundApp {
                 }
                 settings_changed |= threshold_field(
                     ui,
+                    "dust_threshold",
                     &mut current.dust_threshold,
                     !matches!(current.dust_label, DustLabel::None),
                     "Only call the dust boost when it is at least this much.",
@@ -3785,7 +3848,9 @@ impl RealmHoundApp {
             ui.add_space(6.0);
 
             shadcn.field_row(ui, |ui| {
-                ui.label("XP boost:");
+                fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                    ui.label("XP boost:");
+                });
                 let cur = match current.xp_label {
                     XpLabel::Xp => "xp",
                     XpLabel::None => "none",
@@ -3810,6 +3875,7 @@ impl RealmHoundApp {
                 }
                 settings_changed |= threshold_field(
                     ui,
+                    "xp_threshold",
                     &mut current.xp_threshold,
                     matches!(current.xp_label, XpLabel::Xp),
                     "Only call the XP boost when it is at least this much.",
@@ -3818,30 +3884,32 @@ impl RealmHoundApp {
 
             ui.add_space(6.0);
 
-            ui.horizontal(|ui| {
-                ui.label("Realm status:");
+            shadcn.field_row(ui, |ui| {
+                fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                    ui.label("Realm status:");
+                });
                 let cur = match current.realm_status {
                     RealmStatusMode::None => "none",
                     RealmStatusMode::Closing => "closing",
                     RealmStatusMode::Score => "score",
                 };
                 let mut sel = Some(cur.to_string());
+                // The score option is named after the configured minimum, so it
+                // tracks the number field as the user edits it.
+                let score_label = format!("in {}% realm", current.realm_status_threshold);
+                let opts = [
+                    ("none", "none".to_string()),
+                    ("closing", "in a closing realm".to_string()),
+                    ("score", score_label),
+                ];
+                let opts_ref: Vec<(&str, &str)> =
+                    opts.iter().map(|(v, l)| (*v, l.as_str())).collect();
                 if shadcn
-                    .select(
-                        ui,
-                        "realm_status",
-                        &mut sel,
-                        170.0,
-                        &[
-                            ("none", "none"),
-                            ("closing", "in a closing realm"),
-                            ("score", "in Y% realm"),
-                        ],
-                    )
+                    .select(ui, "realm_status", &mut sel, 170.0, &opts_ref)
                     .hover_tip(
                         "Appended to calls for dungeons entered through a realm portal (a party \
                          join has no realm of its own). \"in a closing realm\" covers realms past \
-                         90%; \"in Y% realm\" names the realm score the dungeon was entered at.",
+                         90%; the score option names the realm score the dungeon was entered at.",
                     )
                     .changed()
                 {
@@ -3852,50 +3920,17 @@ impl RealmHoundApp {
                     };
                     settings_changed = true;
                 }
-                settings_changed |= threshold_field(
-                    ui,
-                    &mut current.realm_status_threshold,
-                    matches!(current.realm_status, RealmStatusMode::Score),
-                    "Call the realm score from this percentage up.",
-                );
-            });
-
-            ui.add_space(4.0);
-
-            settings_changed |= shadcn
-                .switch(ui, &mut current.call_event_mods, "Call special event mods")
-                .hover_tip(
-                    "Events make participating dungeons spawn with a preset mod (e.g. Steamworks \
-                     Maintenance on Kogbold Steamworks, called as \"turrets off\", or Found \
-                     Treasure! on Woodland Labyrinth), even when nothing else was rolled. On \
-                     (default) they are called like any other mod; off drops their tags. The \
-                     loot/dust/xp it grants is called either way.",
-                )
-                .changed();
-
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                settings_changed |= shadcn
-                    .switch(
+                // The threshold only applies to the score option, so the box
+                // appears with that option instead of sitting greyed out.
+                if matches!(current.realm_status, RealmStatusMode::Score) {
+                    settings_changed |= threshold_field(
                         ui,
-                        &mut current.learn_event_mods,
-                        "Learn event mods from my runs",
-                    )
-                    .hover_tip(
-                        "Recognizes an event mod from your own dungeons instead of the built-in \
-                         list: a mod carried by every one of the last few spawns of the same \
-                         dungeon - with at least one of those spawns having no other mods - is \
-                         treated as an event mod for the rest of the session. A mod that stands \
-                         alone in an instance can't be part of the roll, and one that repeats \
-                         across spawns isn't a coincidence. This is what picks up an event a \
-                         table update never mentioned. Only affects calls while \"Call special \
-                         event mods\" is off.",
-                    )
-                    .changed();
-                ui.add_enabled_ui(current.learn_event_mods, |ui| {
-                    settings_changed |= run_count_field(ui, &mut current.learn_event_mods_runs);
-                });
+                        "realm_status_threshold",
+                        &mut current.realm_status_threshold,
+                        true,
+                        "Call the realm score from this percentage up.",
+                    );
+                }
             });
 
             ui.add_space(6.0);
@@ -3913,7 +3948,7 @@ impl RealmHoundApp {
                 .changed();
 
             ui.add_space(10.0);
-            ui.label(RichText::new("Reward mods").strong());
+            ui.label(RichText::new("Unique and Reward mods").strong());
             ui.label(
                 RichText::new(
                     "These mods get a tag in callouts. Toggle one off to stop calling it, or edit \
@@ -4008,6 +4043,41 @@ impl RealmHoundApp {
 
                 ui.data_mut(|d| {
                     d.insert_temp(revealed_id, revealed);
+                });
+            }
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("Dungeon Event mods").strong());
+            ui.label(
+                RichText::new(
+                    "Unique and reward mods guaranteed by Deca's scheduled dungeon events",
+                )
+                .weak()
+                .small(),
+            );
+            ui.add_space(4.0);
+            settings_changed |= shadcn
+                .switch(ui, &mut current.call_event_mods, "Always call event mods")
+                .hover_tip(
+                    "Toggle this off to identify and exclude guaranteed event mods from quick \
+                     calls based on your logged dungeon runs. Loot, dust and XP derived from \
+                     guaranteed event mods will still be called out according to their settings.",
+                )
+                .changed();
+
+            // Identifying event mods is what replaces always-called ones, so the
+            // option only appears (and is only meaningful) while the switch above
+            // is off.
+            if !current.call_event_mods {
+                if !current.learn_event_mods {
+                    current.learn_event_mods = true;
+                    settings_changed = true;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Identify event mods from");
+                    settings_changed |= run_count_field(ui, &mut current.learn_event_mods_runs);
+                    ui.label("logged runs of the same dungeon");
                 });
             }
 
