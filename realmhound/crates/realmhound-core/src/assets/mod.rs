@@ -82,11 +82,12 @@ pub use manager::{
     is_mv_leisurely_mode_notification, is_mv_spirit, is_optional_secondary_boss_type,
     is_post_boss_bonus_type, is_second_coming_boss, is_second_coming_transition_taunt,
     is_shatters_main_boss, is_treasure_crate_type, lod_dragon_chest_pairs, loot_emitter_for_boss,
-    mv_loot_completion_targets, parse_grave_tier, prismimic_display_name, shatters_hm_boss_name,
-    shatters_hm_boss_sprite, AssetManager, AssetStats, AuxTarget, CharacterDyeInfo, DyeInfo,
-    DyeStyle, Encounter, GraveTier, ASSET_MANAGER, LEGACY_LOD_IVORY_BOSS, MV_DANCER_TYPES,
-    MV_SPIRIT_TYPE, MV_UMI_TYPE, SHATTERS_BRIDGE_SENTINEL_TYPE, SHATTERS_KING_TYPE,
-    SHATTERS_STONE_IDOL_TYPE, SHATTERS_THE_SOURCE_TYPE, SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+    mv_loot_completion_targets, parse_grave_tier, prismimic_display_name, shatters_boss_name,
+    shatters_hm_boss_name, shatters_hm_boss_sprite, AssetManager, AssetStats, AuxTarget,
+    CharacterDyeInfo, DyeInfo, DyeStyle, Encounter, GraveTier, ASSET_MANAGER,
+    LEGACY_LOD_IVORY_BOSS, MV_DANCER_TYPES, MV_SPIRIT_TYPE, MV_UMI_TYPE,
+    SHATTERS_BRIDGE_SENTINEL_TYPE, SHATTERS_KING_TYPE, SHATTERS_STONE_IDOL_TYPE,
+    SHATTERS_THE_SOURCE_TYPE, SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
 };
 pub use object_list::{
     AbilityEffect, AbilityEffects, BleedingEffect, ConditionSelfEffect, DamageNovaEffect,

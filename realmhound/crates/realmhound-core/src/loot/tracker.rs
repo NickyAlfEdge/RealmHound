@@ -928,8 +928,8 @@ impl LootTracker {
     /// invisible spawner, seconds after the boss's death line closed the
     /// attribution window. Those bags arrive Unknown and hold loot the drop-table
     /// path cannot pin to one boss, so credit them to the boss the run just
-    /// fought -- Combat History's last kill in this instance -- under the name
-    /// hard mode revealed it as.
+    /// fought -- Combat History's last kill in this instance -- under the boss's
+    /// own `(HM)`-suffixed name (see [`Self::resolve_mob_name`]).
     fn resolve_shatters_hm_bag(
         recent_boss_kills: &[RecentBossKill],
         bag_type: LootBagType,
@@ -955,18 +955,16 @@ impl LootTracker {
                 let lag = bag_time_ms - kill.ended_at_ms;
                 lag >= -KILL_CORRELATION_EARLY_TOLERANCE_MS && lag <= KILL_CORRELATION_MAX_LAG_MS
             })?;
-        // Hard mode reveals the boss as a new name (see
-        // [`crate::assets::shatters_hm_boss_name`]), so show the same name the
-        // fight card carries.
-        let name = crate::assets::shatters_hm_boss_name(object_type)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if name.ends_with("(HM)") {
-                    name
-                } else {
-                    format!("{name} (HM)")
-                }
-            });
+        // Loot History keeps the boss's own name so searching a boss finds its
+        // hard-mode drops too; the revealed names live on the fight card only.
+        // The kill's name comes from Combat History, which carries the revealed
+        // name for these fights, so prefer the object's own name.
+        let name = get_asset_manager().object_name(object_type).unwrap_or(name);
+        let name = if name.ends_with("(HM)") {
+            name
+        } else {
+            format!("{name} (HM)")
+        };
         Some((object_type, name))
     }
 
@@ -978,6 +976,32 @@ impl LootTracker {
     /// *when* her loot is recorded); the backfill passes `false`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_boss_override_with(
+        recent_boss_kills: &[RecentBossKill],
+        bag_type: LootBagType,
+        dungeon: &str,
+        prior_mob_type: i32,
+        item_ids: &[i32],
+        map_seed: i32,
+        now_ms: i64,
+        mv_umi_latched: bool,
+    ) -> Option<(i32, String)> {
+        let (object_type, name) = Self::attribute_bag_to_boss(
+            recent_boss_kills,
+            bag_type,
+            dungeon,
+            prior_mob_type,
+            item_ids,
+            map_seed,
+            now_ms,
+            mv_umi_latched,
+        )?;
+        Some((object_type, Self::loot_source_name(object_type, name)))
+    }
+
+    /// The boss a loot bag is attributed to, before the Loot History naming rule
+    /// is applied (see [`Self::loot_source_name`]).
+    #[allow(clippy::too_many_arguments)]
+    fn attribute_bag_to_boss(
         recent_boss_kills: &[RecentBossKill],
         bag_type: LootBagType,
         dungeon: &str,
@@ -1394,6 +1418,25 @@ impl LootTracker {
         Self::select_last_boss_where(recent_boss_kills, map_seed, |k| k.started_at_ms <= now_ms)
     }
 
+    /// The name Loot History stores a bag's source under. Hard mode's Shatters
+    /// bosses keep their own name plus the `(HM)` variant suffix there, so
+    /// searching a boss finds every bag it dropped; the revealed names are
+    /// flavour for the fight card only. Combat History names those fights after
+    /// the revealed boss, so that spelling is translated back here.
+    fn loot_source_name(object_type: i32, name: String) -> String {
+        let Some(revealed) = crate::assets::shatters_hm_boss_name(object_type) else {
+            return name;
+        };
+        if name != revealed && name != format!("{revealed} (HM)") {
+            return name;
+        }
+        let original = crate::assets::shatters_boss_name(object_type)
+            .map(str::to_string)
+            .or_else(|| get_asset_manager().object_name(object_type))
+            .unwrap_or_else(|| revealed.to_string());
+        format!("{original} (HM)")
+    }
+
     /// Process bag items into resolved item list.
     fn process_items(&self, bag: &PendingBag) -> Vec<ProcessedLootItem> {
         let mut items = Vec::new();
@@ -1424,11 +1467,11 @@ impl LootTracker {
             // Try to get base name and append suffix
             if let Some(base_name) = mgr.object_name(mob_type) {
                 if ov.ends_with("HM") {
-                    // The Shatters renames its hard-mode bosses rather than
-                    // swapping the object, so show the revealed name.
-                    return crate::assets::shatters_hm_boss_name(mob_type)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("{} (HM)", base_name));
+                    // Loot History keeps the boss's own name so searching a boss
+                    // finds its hard-mode drops too; the revealed hard-mode names
+                    // live on the fight card only. The suffix keeps the variants
+                    // apart, like "(True)" does for true-variant bosses.
+                    return format!("{} (HM)", base_name);
                 } else if ov.ends_with("TR") {
                     return format!("{} (True)", base_name);
                 }
@@ -1767,6 +1810,37 @@ mod tests {
     }
 
     #[test]
+    fn shatters_hm_loot_keeps_the_boss_name_for_searching() {
+        let king = super::super::boss_ids::ACCURSED_KING;
+        // The fight card names these fights after the revealed boss; Loot
+        // History keeps the boss's own name plus the variant suffix.
+        assert_eq!(
+            LootTracker::loot_source_name(king, "King Azamoth".to_string()),
+            "The Forgotten King (HM)"
+        );
+        assert_eq!(
+            LootTracker::loot_source_name(king, "King Azamoth (HM)".to_string()),
+            "The Forgotten King (HM)"
+        );
+        // Regular spells and other bosses pass through untouched.
+        assert_eq!(
+            LootTracker::loot_source_name(king, "The Forgotten King".to_string()),
+            "The Forgotten King"
+        );
+        assert_eq!(
+            LootTracker::loot_source_name(
+                super::super::boss_ids::BRIDGE_SENTINEL,
+                "King Azamoth".to_string()
+            ),
+            "King Azamoth"
+        );
+        assert_eq!(
+            LootTracker::loot_source_name(0x8200, "Stone Idol".to_string()),
+            "Stone Idol"
+        );
+    }
+
+    #[test]
     fn shatters_hm_extra_bag_credits_the_last_boss() {
         // Valen's second bag is emitted by an invisible spawner seconds after
         // his death line, so proximity leaves it Unknown.
@@ -1789,7 +1863,7 @@ mod tests {
             picked,
             Some((
                 super::super::boss_ids::BRIDGE_SENTINEL,
-                "Valen the Unbreakable".to_string()
+                "The Bridge Sentinel (HM)".to_string()
             ))
         );
     }
@@ -1825,7 +1899,7 @@ mod tests {
             picked,
             Some((
                 super::super::boss_ids::ACCURSED_KING,
-                "King Azamoth".to_string()
+                "The Forgotten King (HM)".to_string()
             ))
         );
     }

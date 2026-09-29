@@ -804,6 +804,19 @@ pub fn shatters_hm_boss_name(id: i32) -> Option<&'static str> {
     }
 }
 
+/// The name a Shatters boss fights under in its regular form, or `None` for any
+/// other object. Mirrors the bosses' display names in the game catalog so
+/// callers that must not depend on the assets (Loot History naming, the loot
+/// database's rename migration) stay deterministic.
+pub fn shatters_boss_name(id: i32) -> Option<&'static str> {
+    match id {
+        SHATTERS_BRIDGE_SENTINEL_TYPE => Some("The Bridge Sentinel"),
+        SHATTERS_TWILIGHT_ARCHMAGE_TYPE => Some("Twilight Archmage"),
+        SHATTERS_KING_TYPE => Some("The Forgotten King"),
+        _ => None,
+    }
+}
+
 /// Whether `id` is one of the three Shatters bosses the run is scored on (the
 /// card is labelled hard mode when every one fought was a hard-mode variant).
 pub fn is_shatters_main_boss(id: i32) -> bool {
