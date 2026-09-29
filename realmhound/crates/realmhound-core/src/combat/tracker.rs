@@ -737,6 +737,16 @@ pub struct CombatTracker {
     /// can label the run -- the mode shortens the phases and cuts the loot, so
     /// the run is not comparable with a normal clear. Reset on map change.
     mv_leisurely: bool,
+    /// The Shatters hard mode, stage: the Stone Idol only becomes damageable
+    /// once the Void Phantasm was absorbed next to it, so real HP loss on it
+    /// means the run is in hard mode and the Bridge Sentinel will be Valen the
+    /// Unbreakable. Reset on map change.
+    shatters_hm_bridge: bool,
+    /// The Shatters hard mode, late stage: The Source is the secret object
+    /// destroyed in the Alchemy Lab wing; destroying it makes the Twilight
+    /// Archmage Nox the Wild Shadow and carries through to the Forgotten King,
+    /// who becomes King Azamoth. Reset on map change.
+    shatters_hm_late: bool,
 }
 
 impl Default for CombatTracker {
@@ -795,6 +805,8 @@ impl CombatTracker {
             pending_mv_spirits: 0,
             mv_boss_engaged: false,
             mv_leisurely: false,
+            shatters_hm_bridge: false,
+            shatters_hm_late: false,
         }
     }
 
@@ -894,6 +906,8 @@ impl CombatTracker {
         self.pending_mv_spirits = 0;
         self.mv_boss_engaged = false;
         self.mv_leisurely = false;
+        self.shatters_hm_bridge = false;
+        self.shatters_hm_late = false;
         finished
     }
 
@@ -937,6 +951,8 @@ impl CombatTracker {
         self.pending_mv_spirits = 0;
         self.mv_boss_engaged = false;
         self.mv_leisurely = false;
+        self.shatters_hm_bridge = false;
+        self.shatters_hm_late = false;
         finished
     }
 
@@ -1068,11 +1084,32 @@ impl CombatTracker {
         } else {
             0
         };
-        let (new_hp, obj_type, obj_max_hp) = {
+        let (new_hp, obj_type, obj_max_hp, previous_hp) = {
             let entry = self.objects.entry(object_id).or_default();
+            let previous_hp = entry.hp as i64;
             apply_stats(entry, status, time_ms);
-            (entry.hp as i64, entry.object_type, entry.max_hp)
+            (
+                entry.hp as i64,
+                entry.object_type,
+                entry.max_hp,
+                previous_hp,
+            )
         };
+        // The Shatters hard mode is unlocked by two objects the group has to
+        // destroy, and both are invincible or unreachable until then:
+        //   - the Stone Idol only loses HP once the Void Phantasm was absorbed,
+        //     which turns The Bridge Sentinel into Valen the Unbreakable;
+        //   - The Source only exists behind a secret wall past Valen, and
+        //     destroying it makes the Twilight Archmage Nox the Wild Shadow and
+        //     the Forgotten King King Azamoth.
+        // Real HP loss therefore means the run is in hard mode from that stage on.
+        if previous_hp > 0 && new_hp < previous_hp {
+            match obj_type {
+                crate::assets::SHATTERS_STONE_IDOL_TYPE => self.shatters_hm_bridge = true,
+                crate::assets::SHATTERS_THE_SOURCE_TYPE => self.shatters_hm_late = true,
+                _ => {}
+            }
+        }
         self.note_aux_instance(object_id, obj_type, obj_max_hp);
         // Rogue Lethal Strike: the buff starts when the local player
         // exits sneak, so open a window on the Invisible condition falling edge.
@@ -1223,6 +1260,27 @@ impl CombatTracker {
         self.mv_leisurely = true;
     }
 
+    /// The hard-mode name of a Shatters boss the group has already unlocked, or
+    /// `None` when the boss is not a hard-mode rename (or its unlock object was
+    /// never destroyed). Hard mode is per run, so the bridge and late stages are
+    /// tracked separately: a group that stops after Valen keeps the regular
+    /// names for the bosses it never reached.
+    pub fn shatters_hm_revealed_name(&self, boss_object_type: i32) -> Option<&'static str> {
+        use crate::assets::{
+            SHATTERS_BRIDGE_SENTINEL_TYPE, SHATTERS_KING_TYPE, SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+        };
+        let revealed = match boss_object_type {
+            SHATTERS_BRIDGE_SENTINEL_TYPE => self.shatters_hm_bridge,
+            SHATTERS_TWILIGHT_ARCHMAGE_TYPE | SHATTERS_KING_TYPE => self.shatters_hm_late,
+            _ => false,
+        };
+        if revealed {
+            crate::assets::shatters_hm_boss_name(boss_object_type)
+        } else {
+            None
+        }
+    }
+
     /// A loot bag was recorded in the current instance. Moonlight Village's
     /// mechanics bosses never die, so the run is scored Completed by its loot:
     /// the invisible `MV Dungeon Complete` / `MV Umi Complete` droppers emit the
@@ -1322,6 +1380,18 @@ impl CombatTracker {
         self.pending_summon_shots
             .retain(|&(owner, _), _| owner != object_id);
         let last = self.objects.remove(&object_id);
+        // The Shatters' The Source is the breakable the group destroys past Valen
+        // to unlock the late hard-mode bosses; it can vanish without its HP ever
+        // being reported, so a removal counts just like damage would. It is only
+        // treated as a hard-mode signal once the bridge stage confirmed the route,
+        // because a plain Shatters instance can also drop it out of view.
+        if self.shatters_hm_bridge
+            && last
+                .as_ref()
+                .is_some_and(|obj| obj.object_type == crate::assets::SHATTERS_THE_SOURCE_TYPE)
+        {
+            self.shatters_hm_late = true;
+        }
         // Record a participant departure for death/nexus detection:
         // an object that is currently an attacker in some active fight is leaving
         // view. Snapshot its last-seen position BEFORE it is dropped so a
@@ -2631,15 +2701,24 @@ impl CombatTracker {
         }
 
         let assets = get_asset_manager();
+        // The Shatters hard mode is a property of the run (see
+        // [`Self::shatters_hm_revealed_name`]), not of the boss packets: the game
+        // only reveals the renamed boss in dialogue, so the card carries it.
+        let shatters_hm = self
+            .shatters_hm_revealed_name(fight.boss_object_type)
+            .is_some();
         // Aggregated aux fights carry an explicit name ("Marble Core"); real
         // bosses resolve theirs from assets and may carry a segment suffix
         // ("Marble Colossus (Post-survival)").
         let boss_name = match fight.display_name_override {
             Some(name) => name.to_string(),
             None => {
-                let base = assets
-                    .object_name(fight.boss_object_type)
-                    .unwrap_or_else(|| format!("Boss 0x{:04X}", fight.boss_object_type as u16));
+                let base = match self.shatters_hm_revealed_name(fight.boss_object_type) {
+                    Some(name) => name.to_string(),
+                    None => assets
+                        .object_name(fight.boss_object_type)
+                        .unwrap_or_else(|| format!("Boss 0x{:04X}", fight.boss_object_type as u16)),
+                };
                 match fight.segment_label {
                     Some(label) => format!("{base} ({label})"),
                     None => base,
@@ -2781,6 +2860,7 @@ impl CombatTracker {
             }),
             spirits: fight.spirits,
             leisurely: self.mv_leisurely,
+            shatters_hm,
             participants,
         };
 
@@ -8236,5 +8316,226 @@ mod tests {
             .find(|p| p.name == "Bob")
             .expect("Bob");
         assert_eq!(bob.damage, 30_000);
+    }
+
+    /// Spawn, damage, engage and finish `object_type` under `object_id`.
+    fn finish_shatters_fight(
+        t: &mut CombatTracker,
+        object_id: i32,
+        object_type: i32,
+        max_hp: i32,
+        base: i64,
+    ) -> CompletedFight {
+        t.on_object_spawn(
+            object_id,
+            object_type,
+            &status(
+                object_id,
+                vec![stat(StatType::MaxHP, max_hp), stat(StatType::HP, max_hp)],
+            ),
+            base,
+        );
+        t.on_damage(object_id, 600, (max_hp / 2) as i64, base + 10);
+        t.on_local_hit(object_id, 7, 1000, 1000, base + 12);
+        t.on_object_status(
+            object_id,
+            &status(object_id, vec![stat(StatType::HP, 0)]),
+            base + 16,
+        );
+        t.on_object_removed(object_id, base + 20)
+            .expect("fight finalized")
+    }
+
+    #[test]
+    fn shatters_stone_idol_marks_the_bridge_sentinel_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        // The Idol is invulnerable until it absorbs the Void Phantasm, so any HP
+        // loss on it means the group is on the hard-mode route.
+        hard_mode_idol(&mut t);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
+        assert!(bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_bridge_sentinel_keeps_its_name_without_the_idol() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "regular name kept, got {}",
+            bridge.boss_name
+        );
+        assert!(!bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_the_source_marks_only_the_late_bosses_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        hard_mode_idol(&mut t);
+
+        // The Source exists past Valen; destroying it locks the late bosses in.
+        t.on_object_spawn(
+            901,
+            crate::assets::SHATTERS_THE_SOURCE_TYPE,
+            &status(901, vec![stat(StatType::HP, 1)]),
+            20,
+        );
+        t.on_object_removed(901, 22);
+
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            100,
+        );
+        assert_eq!(archmage.boss_name, "Nox the Wild Shadow");
+        assert!(archmage.shatters_hm);
+        let king =
+            finish_shatters_fight(&mut t, 702, crate::assets::SHATTERS_KING_TYPE, 400_000, 300);
+        assert_eq!(king.boss_name, "King Azamoth");
+        assert!(king.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_bridge_only_hard_mode_keeps_the_archmage_regular() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        hard_mode_idol(&mut t);
+
+        // The group stopped after Valen (no Alchemy Lab, or the Source survived),
+        // so the archmage is fought in its regular form.
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
+        assert!(bridge.shatters_hm);
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            300,
+        );
+        assert!(
+            !archmage.shatters_hm,
+            "a regular archmage keeps its own phase regular"
+        );
+        assert!(
+            !archmage.boss_name.contains("Nox"),
+            "got {}",
+            archmage.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_stone_idol_is_its_own_phase_of_the_run() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        let idol = finish_shatters_fight(
+            &mut t,
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            25_000,
+            5,
+        );
+        assert_eq!(
+            idol.boss_object_type,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE
+        );
+        assert!(idol.killed);
+        // The Idol is tracked as its own row of the dungeon's card, so the loot it
+        // drops can be shown under it.
+        assert!(
+            idol.encounter_run_id.is_some(),
+            "the idol joins the dungeon run"
+        );
+        // It is an object hard mode unlocks, not a boss hard mode renames, so the
+        // phase itself is not a hard-mode variant.
+        assert!(!idol.shatters_hm);
+    }
+
+    /// Damage the Stone Idol, which is invincible outside hard mode.
+    fn hard_mode_idol(t: &mut CombatTracker) {
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            5,
+        );
+        t.on_object_status(900, &status(900, vec![stat(StatType::HP, 24_000)]), 8);
+    }
+
+    #[test]
+    fn shatters_hard_mode_resets_with_the_instance() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        hard_mode_idol(&mut t);
+        let hard = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(hard.shatters_hm);
+
+        // The next Shatters instance starts regular again.
+        t.on_map_change("Nexus", 0, 500);
+        t.on_map_change("The Shatters", 778, 600);
+        t.on_player_loaded(1000, 778);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 600);
+        let regular = finish_shatters_fight(
+            &mut t,
+            710,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            700,
+        );
+        assert!(!regular.shatters_hm);
+        assert!(
+            !regular.boss_name.contains("Valen"),
+            "got {}",
+            regular.boss_name
+        );
     }
 }

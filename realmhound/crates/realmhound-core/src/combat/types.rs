@@ -315,6 +315,10 @@ pub struct CompletedFight {
     /// group consumed a Tofu Delicacy), which shortens the phases and reduces
     /// the loot. False for every other dungeon.
     pub leisurely: bool,
+    /// Whether this Shatters fight happened in hard mode, i.e. the group
+    /// destroyed the Stone Idol (or The Source) that unlocks the renamed
+    /// bosses. Only meaningful for The Shatters' main bosses; false otherwise.
+    pub shatters_hm: bool,
     /// Per-participant contributions, sorted by damage descending on finalize.
     pub participants: Vec<FightParticipant>,
 }

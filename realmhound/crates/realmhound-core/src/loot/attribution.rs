@@ -13,11 +13,11 @@ pub mod boss_ids {
     /// Void Entity (The Void)
     pub const VOID_ENTITY: i32 = 45076;
     /// Bridge Sentinel (The Shatters)
-    pub const BRIDGE_SENTINEL: i32 = 29003;
+    pub const BRIDGE_SENTINEL: i32 = crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE;
     /// Twilight Archmage (The Shatters)
-    pub const TWILIGHT_ARCHMAGE: i32 = 29021;
+    pub const TWILIGHT_ARCHMAGE: i32 = crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE;
     /// Accursed King (The Shatters)
-    pub const ACCURSED_KING: i32 = 29039;
+    pub const ACCURSED_KING: i32 = crate::assets::SHATTERS_KING_TYPE;
 }
 
 /// Variant suffixes for hard mode / true variant bosses.

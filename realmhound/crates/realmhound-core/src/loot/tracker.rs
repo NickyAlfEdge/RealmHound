@@ -928,8 +928,8 @@ impl LootTracker {
     /// invisible spawner, seconds after the boss's death line closed the
     /// attribution window. Those bags arrive Unknown and hold loot the drop-table
     /// path cannot pin to one boss, so credit them to the boss the run just
-    /// fought -- Combat History's last kill in this instance -- carrying the same
-    /// `(HM)` variant suffix the main bag gets from the death-line trigger.
+    /// fought -- Combat History's last kill in this instance -- under the name
+    /// hard mode revealed it as.
     fn resolve_shatters_hm_bag(
         recent_boss_kills: &[RecentBossKill],
         bag_type: LootBagType,
@@ -955,11 +955,18 @@ impl LootTracker {
                 let lag = bag_time_ms - kill.ended_at_ms;
                 lag >= -KILL_CORRELATION_EARLY_TOLERANCE_MS && lag <= KILL_CORRELATION_MAX_LAG_MS
             })?;
-        let name = if name.ends_with("(HM)") {
-            name
-        } else {
-            format!("{name} (HM)")
-        };
+        // Hard mode reveals the boss as a new name (see
+        // [`crate::assets::shatters_hm_boss_name`]), so show the same name the
+        // fight card carries.
+        let name = crate::assets::shatters_hm_boss_name(object_type)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if name.ends_with("(HM)") {
+                    name
+                } else {
+                    format!("{name} (HM)")
+                }
+            });
         Some((object_type, name))
     }
 
@@ -1417,7 +1424,11 @@ impl LootTracker {
             // Try to get base name and append suffix
             if let Some(base_name) = mgr.object_name(mob_type) {
                 if ov.ends_with("HM") {
-                    return format!("{} (HM)", base_name);
+                    // The Shatters renames its hard-mode bosses rather than
+                    // swapping the object, so show the revealed name.
+                    return crate::assets::shatters_hm_boss_name(mob_type)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{} (HM)", base_name));
                 } else if ov.ends_with("TR") {
                     return format!("{} (True)", base_name);
                 }
@@ -1778,7 +1789,7 @@ mod tests {
             picked,
             Some((
                 super::super::boss_ids::BRIDGE_SENTINEL,
-                "The Bridge Sentinel (HM)".to_string()
+                "Valen the Unbreakable".to_string()
             ))
         );
     }
@@ -1814,7 +1825,7 @@ mod tests {
             picked,
             Some((
                 super::super::boss_ids::ACCURSED_KING,
-                "The Forgotten King (HM)".to_string()
+                "King Azamoth".to_string()
             ))
         );
     }

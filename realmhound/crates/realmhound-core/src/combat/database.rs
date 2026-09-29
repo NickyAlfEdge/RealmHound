@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 52;
+pub const SCHEMA_VERSION: i32 = 53;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -78,6 +78,10 @@ pub struct FightRecord {
     /// Tofu Delicacy was consumed). False for every other dungeon and for rows
     /// recorded before the mode was tracked.
     pub leisurely: bool,
+    /// Whether the fight was a Shatters hard-mode variant (the renamed bosses
+    /// are revealed only in hard mode). False for every other dungeon and for
+    /// rows recorded before the mode was tracked.
+    pub shatters_hm: bool,
     /// Participants (sorted by damage descending as stored).
     pub participants: Vec<ParticipantRecord>,
 }
@@ -128,6 +132,9 @@ pub struct EncounterRecord {
     /// Whether the run was played in Moonlight Village's Leisurely Mode (a Tofu
     /// Delicacy was consumed). False for every other dungeon.
     pub leisurely: bool,
+    /// Whether the run was played in The Shatters' hard mode. False for every
+    /// other dungeon.
+    pub shatters_hm: bool,
     /// Object type of the run anchor (last real boss) for the header icon.
     pub anchor_object_type: i32,
     /// Member phase fights, ordered by start time.
@@ -343,6 +350,9 @@ pub struct FightSummary {
     /// False for every other dungeon; set for the whole run when any of its
     /// phases recorded it.
     pub leisurely: bool,
+    /// Whether the run was played in The Shatters' hard mode. False for every
+    /// other dungeon; set for the whole run when any of its phases recorded it.
+    pub shatters_hm: bool,
 }
 
 impl FightSummary {
@@ -1269,6 +1279,18 @@ impl CombatDatabase {
                 )?;
             }
             self.conn.execute_batch("PRAGMA user_version = 52")?;
+        }
+        if from_version < 53 {
+            // v52 -> v53: whether the fight was a Shatters hard-mode variant. The
+            // mode is unlocked by destroying the Stone Idol / The Source, which
+            // rename The Bridge Sentinel, the Twilight Archmage and the Forgotten
+            // King. Legacy rows default to 0 (the mode was never captured).
+            if !self.column_exists("fights", "shatters_hm")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN shatters_hm INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 53")?;
         }
         Ok(())
     }
@@ -2242,7 +2264,8 @@ impl CombatDatabase {
                 reached_zero INTEGER NOT NULL DEFAULT 0,
                 joined_late INTEGER NOT NULL DEFAULT 0,
                 spirits INTEGER NOT NULL DEFAULT 0,
-                leisurely INTEGER NOT NULL DEFAULT 0
+                leisurely INTEGER NOT NULL DEFAULT 0,
+                shatters_hm INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS stat_awards (
@@ -2367,8 +2390,8 @@ impl CombatDatabase {
                (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
-                dungeon_entered_at, reached_zero, joined_late, spirits, leisurely)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"#,
+                dungeon_entered_at, reached_zero, joined_late, spirits, leisurely, shatters_hm)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -2391,6 +2414,7 @@ impl CombatDatabase {
                 fight.joined_late as i32,
                 fight.spirits,
                 fight.leisurely as i32,
+                fight.shatters_hm as i32,
             ],
         )?;
         let fight_id = tx.last_insert_rowid();
@@ -2473,7 +2497,7 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely
+                      leisurely, shatters_hm
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -2503,6 +2527,7 @@ impl CombatDatabase {
             dungeon_entered_at: row.get(14)?,
             spirits: row.get(15)?,
             leisurely: row.get::<_, i32>(16)? != 0,
+            shatters_hm: row.get::<_, i32>(17)? != 0,
             participants: Vec::new(),
         })
     }
@@ -3021,7 +3046,7 @@ impl CombatDatabase {
                          WHERE p.fight_id = f.id AND p.is_local = 1 LIMIT 1),
                       (SELECT p.end_status FROM fight_participants p
                          WHERE p.fight_id = f.id AND p.is_local = 1 LIMIT 1),
-                      f.map_seed, f.local_close_calls, f.leisurely
+                      f.map_seed, f.local_close_calls, f.leisurely, f.shatters_hm
                FROM fights f"#,
         );
         let mut conds: Vec<String> = vec!["f.encounter_run_id IS NULL".to_string()];
@@ -3077,6 +3102,7 @@ impl CombatDatabase {
                 last_hero_standing: false,
                 most_damage_taken: false,
                 leisurely: row.get::<_, i32>(18)? != 0,
+                shatters_hm: row.get::<_, i32>(19)? != 0,
             })
         })?;
         rows.collect()
@@ -3170,13 +3196,13 @@ impl CombatDatabase {
         let fight_sql = format!(
             "SELECT encounter_run_id, boss_object_type, boss_max_hp, boss_start_hp,
                     killed, ended_at, boss_name, local_char_id, started_at, map_seed,
-                    local_close_calls
+                    local_close_calls, shatters_hm
              FROM fights WHERE encounter_run_id IN ({placeholders})"
         );
         let mut stmt = self.conn.prepare(&fight_sql)?;
         let mut fights_by_run: HashMap<
             String,
-            Vec<(i32, i32, i32, bool, i64, String, i32, i64, i32, i64)>,
+            Vec<(i32, i32, i32, bool, i64, String, i32, i64, i32, i64, bool)>,
         > = HashMap::new();
         for row in stmt.query_map(rusqlite::params_from_iter(run_ids.iter()), |row| {
             Ok((
@@ -3191,6 +3217,7 @@ impl CombatDatabase {
                 row.get(8)?,
                 row.get(9)?,
                 row.get(10)?,
+                row.get::<_, i32>(11)? != 0,
             ))
         })? {
             let (
@@ -3205,6 +3232,7 @@ impl CombatDatabase {
                 started_at,
                 map_seed,
                 close_calls,
+                shatters_hm,
             ) = row?;
             fights_by_run.entry(run_id).or_default().push((
                 otype,
@@ -3217,6 +3245,7 @@ impl CombatDatabase {
                 started_at,
                 map_seed,
                 close_calls,
+                shatters_hm,
             ));
         }
 
@@ -3267,6 +3296,7 @@ impl CombatDatabase {
         for (run_id, encounter_id, dungeon, started_at, ended_at, stored_killed) in runs {
             let leisurely = leisurely_runs.get(&run_id).copied().unwrap_or(false);
             let phases = fights_by_run.remove(&run_id).unwrap_or_default();
+            let shatters_hm = shatters_run_is_hard_mode(phases.iter().map(|p| (p.0, p.10)));
             let phase_stats: Vec<PhaseStat> =
                 phases.iter().map(|p| (p.0, p.1, p.2, p.3, p.4)).collect();
             let (mut boss_object_type, boss_max_hp, boss_start_hp, killed) =
@@ -3409,6 +3439,7 @@ impl CombatDatabase {
                 last_hero_standing: false,
                 most_damage_taken: false,
                 leisurely,
+                shatters_hm,
             });
         }
         Ok(out)
@@ -3420,7 +3451,7 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely
+                      leisurely, shatters_hm
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -3449,7 +3480,7 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely
+                      leisurely, shatters_hm
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -3492,7 +3523,7 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely
+                      leisurely, shatters_hm
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -3546,6 +3577,9 @@ impl CombatDatabase {
             ended_at,
             killed,
             leisurely: phases.iter().any(|p| p.leisurely),
+            shatters_hm: shatters_run_is_hard_mode(
+                phases.iter().map(|p| (p.boss_object_type, p.shatters_hm)),
+            ),
             anchor_object_type,
             phases,
             roster,
@@ -4502,6 +4536,7 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             },
             spirits: group.iter().map(|g| g.spirits).sum(),
             leisurely: group.iter().any(|g| g.leisurely),
+            shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
         });
     }
@@ -4582,6 +4617,7 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             aux_member_count: p.aux_member_count,
             spirits: group.iter().map(|g| g.spirits).sum(),
             leisurely: group.iter().any(|g| g.leisurely),
+            shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
         });
     }
@@ -4747,6 +4783,20 @@ fn run_killed(enc_id: Option<&str>, phases: &[PhaseStat], anchor_killed: bool) -
         Some(types) => phases.iter().any(|p| p.3 && types.contains(&p.0)),
         None => anchor_killed,
     }
+}
+
+/// Whether a Shatters run played in hard mode, which only holds when every main
+/// boss the run fought was a hard-mode variant. The Idol and The Source phases
+/// are objects hard mode unlocks, not bosses it renames, so they are ignored: a
+/// group that destroyed the Stone Idol (Valen) but never The Source fights a
+/// hard-mode first boss and a regular second one, and the card stays regular. A
+/// run escaped before reaching the next boss still counts while every boss
+/// fought until then was hard mode.
+fn shatters_run_is_hard_mode(phases: impl IntoIterator<Item = (i32, bool)>) -> bool {
+    let mut main_bosses = phases
+        .into_iter()
+        .filter(|(object_type, _)| crate::assets::is_shatters_main_boss(*object_type));
+    main_bosses.next().is_some_and(|(_, hm)| hm) && main_bosses.all(|(_, hm)| hm)
 }
 
 /// Whether a Moonlight Village run defeated every dancer. The dungeon is
@@ -4919,6 +4969,7 @@ mod tests {
             aux_member_count: None,
             spirits: 0,
             leisurely: false,
+            shatters_hm: false,
             participants: vec![
                 FightParticipant {
                     object_id: 600,
@@ -5025,6 +5076,7 @@ mod tests {
             aux_member_count: None,
             spirits: 0,
             leisurely: false,
+            shatters_hm: false,
             participants,
         }
     }
@@ -7237,6 +7289,90 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, 0, "a phase without the mode stores 0");
+    }
+
+    #[test]
+    fn shatters_hard_mode_labels_a_run_only_when_every_main_boss_was_hard_mode() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // A full hard-mode run: Valen, Nox and King Azamoth all recorded.
+        for object_type in [29003, 29021, 29039] {
+            let mut f = flawless_fight("The Shatters", object_type, vec![]);
+            f.encounter_id = Some("shtrs".to_string());
+            f.encounter_run_id = Some("shtrs-hm".to_string());
+            f.shatters_hm = true;
+            db.insert_fight(&f).unwrap();
+        }
+        // The Idol and The Source are objects, not renamed bosses, so they never
+        // carry the mode and must not veto the run card.
+        for object_type in [33280, 33346] {
+            let mut f = flawless_fight("The Shatters", object_type, vec![]);
+            f.encounter_id = Some("shtrs".to_string());
+            f.encounter_run_id = Some("shtrs-hm".to_string());
+            db.insert_fight(&f).unwrap();
+        }
+        // A run that unlocked the bridge but not The Source: hard-mode Valen,
+        // regular Twilight Archmage.
+        for (object_type, shatters_hm) in [(29003, true), (29021, false)] {
+            let mut f = flawless_fight("The Shatters", object_type, vec![]);
+            f.encounter_id = Some("shtrs".to_string());
+            f.encounter_run_id = Some("shtrs-bridge-only".to_string());
+            f.shatters_hm = shatters_hm;
+            db.insert_fight(&f).unwrap();
+        }
+        // A regular run.
+        let mut plain = flawless_fight("The Shatters", 29003, vec![]);
+        plain.encounter_id = Some("shtrs".to_string());
+        plain.encounter_run_id = Some("shtrs-plain".to_string());
+        db.insert_fight(&plain).unwrap();
+
+        let cards = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let card = |run: &str| {
+            cards
+                .iter()
+                .find(|c| c.encounter_run_id.as_deref() == Some(run))
+                .unwrap_or_else(|| panic!("card for {run}"))
+        };
+        assert!(card("shtrs-hm").shatters_hm, "every boss was hard mode");
+        assert!(
+            !card("shtrs-bridge-only").shatters_hm,
+            "a regular Archmage keeps the run card regular"
+        );
+        assert!(!card("shtrs-plain").shatters_hm);
+        assert!(
+            db.encounter_detail("shtrs-hm")
+                .unwrap()
+                .unwrap()
+                .shatters_hm,
+            "the run page agrees with the list card"
+        );
+        assert!(
+            !db.encounter_detail("shtrs-bridge-only")
+                .unwrap()
+                .unwrap()
+                .shatters_hm
+        );
+        // Per-phase values stay per-phase: the flag lives on the renamed boss.
+        let stored: i64 = db
+            .conn
+            .query_row(
+                "SELECT shatters_hm FROM fights WHERE encounter_run_id = 'shtrs-bridge-only'
+                 AND boss_object_type = 29021",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "the regular phase stores 0");
+        // A standalone (ungrouped) hard-mode fight carries its own flag.
+        let mut solo = flawless_fight("The Shatters", 29021, vec![]);
+        solo.shatters_hm = true;
+        db.insert_fight(&solo).unwrap();
+        assert!(
+            db.list_fights(&FightQuery::default(), 50)
+                .unwrap()
+                .iter()
+                .any(|c| c.encounter_run_id.is_none() && c.shatters_hm),
+            "an ungrouped hard-mode fight keeps the flag"
+        );
     }
 
     #[test]
@@ -9958,6 +10094,7 @@ mod tests {
             aux_member_count: None,
             spirits: 0,
             leisurely: false,
+            shatters_hm: false,
             participants: vec![],
         }
     }

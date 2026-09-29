@@ -770,6 +770,49 @@ pub fn is_legacy_lod_ivory_boss(object_type: i32) -> bool {
     object_type == LEGACY_LOD_IVORY_BOSS
 }
 
+/// The Shatters hard mode: the object types whose hard-mode behaviour the
+/// tracker has to know about, plus the names hard mode reveals the bosses as.
+///
+/// Hard mode is unlocked in stages and renames the boss *entity* rather than
+/// its object type, so the fight card has to carry the revealed name itself:
+///
+/// - The Stone Idol (`0x8200`) is invincible until the Void Phantasm is absorbed
+///   next to it; damaging it means the run is in hard mode, and its defeat turns
+///   The Bridge Sentinel into **Valen the Unbreakable**.
+/// - The Source (`0x8242`, `Shatters Experimental Generator`) is the secret
+///   object destroyed in the Alchemy Lab wing; destroying it turns the Twilight
+///   Archmage into **Nox the Wild Shadow** and carries through to the Forgotten
+///   King, who becomes **King Azamoth**.
+pub const SHATTERS_STONE_IDOL_TYPE: i32 = 0x8200;
+/// The Bridge Sentinel (The Shatters boss 1).
+pub const SHATTERS_BRIDGE_SENTINEL_TYPE: i32 = 29003;
+/// The Twilight Archmage (The Shatters boss 2).
+pub const SHATTERS_TWILIGHT_ARCHMAGE_TYPE: i32 = 29021;
+/// The Forgotten King (The Shatters boss 3, final).
+pub const SHATTERS_KING_TYPE: i32 = 29039;
+/// The Source -- the secret hard-mode object destroyed in the Alchemy Lab.
+pub const SHATTERS_THE_SOURCE_TYPE: i32 = 0x8242;
+
+/// The name hard mode reveals a Shatters boss as, or `None` for bosses hard mode
+/// does not rename (or for any other object).
+pub fn shatters_hm_boss_name(id: i32) -> Option<&'static str> {
+    match id {
+        SHATTERS_BRIDGE_SENTINEL_TYPE => Some("Valen the Unbreakable"),
+        SHATTERS_TWILIGHT_ARCHMAGE_TYPE => Some("Nox the Wild Shadow"),
+        SHATTERS_KING_TYPE => Some("King Azamoth"),
+        _ => None,
+    }
+}
+
+/// Whether `id` is one of the three Shatters bosses the run is scored on (the
+/// card is labelled hard mode when every one fought was a hard-mode variant).
+pub fn is_shatters_main_boss(id: i32) -> bool {
+    matches!(
+        id,
+        SHATTERS_BRIDGE_SENTINEL_TYPE | SHATTERS_TWILIGHT_ARCHMAGE_TYPE | SHATTERS_KING_TYPE
+    )
+}
+
 /// The boss object types a completion marker signals as cleared, or `None` when
 /// `id` is not a known completion marker ([`COMPLETION_MARKER_MAP`]).
 fn completion_marker_targets_for(id: i32) -> Option<&'static [i32]> {

@@ -106,13 +106,20 @@ fn boss_row_hp_label(
 /// The dungeon name shown as a card/header title. Moonlight Village runs played
 /// in Leisurely Mode (a Tofu Delicacy was consumed) are marked, since the mode
 /// shortens the dance phases and cuts the loot -- such a run is not comparable
-/// with a normal clear.
-fn dungeon_display_name(portal_map: &DungeonPortalMap, dungeon: &str, leisurely: bool) -> String {
+/// with a normal clear. The same applies to The Shatters' hard mode, whose
+/// renamed bosses and extra mechanics make the run a different fight.
+fn dungeon_display_name(
+    portal_map: &DungeonPortalMap,
+    dungeon: &str,
+    leisurely: bool,
+    shatters_hm: bool,
+) -> String {
     let name = portal_map.normalize_dungeon_name(dungeon);
-    if leisurely {
-        format!("{name} (Leisurely)")
-    } else {
-        name
+    match (leisurely, shatters_hm) {
+        (true, true) => format!("{name} (Leisurely, HM)"),
+        (true, false) => format!("{name} (Leisurely)"),
+        (false, true) => format!("{name} (HM)"),
+        (false, false) => name,
     }
 }
 
@@ -1737,8 +1744,12 @@ impl CombatHistoryPanel {
                     cui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 let dungeon_label = portal_map.normalize_dungeon_name(&fight.dungeon);
-                let dungeon_title =
-                    dungeon_display_name(portal_map, &fight.dungeon, fight.leisurely);
+                let dungeon_title = dungeon_display_name(
+                    portal_map,
+                    &fight.dungeon,
+                    fight.leisurely,
+                    fight.shatters_hm,
+                );
                 if resp
                     .hover_tip(format!("{}\n(Click to filter)", dungeon_label))
                     .clicked()
@@ -2358,7 +2369,12 @@ impl CombatHistoryPanel {
                         ui.label(
                             RichText::new(format!(
                                 "{}  ·  {}",
-                                dungeon_display_name(portal_map, &fight.dungeon, fight.leisurely),
+                                dungeon_display_name(
+                                    portal_map,
+                                    &fight.dungeon,
+                                    fight.leisurely,
+                                    fight.shatters_hm,
+                                ),
                                 datetime_s,
                             ))
                             .color(Color32::GRAY),
@@ -3448,7 +3464,12 @@ impl CombatHistoryPanel {
                         ui.label(
                             RichText::new(format!(
                                 "{}  ·  {}",
-                                dungeon_display_name(portal_map, &enc.dungeon, enc.leisurely),
+                                dungeon_display_name(
+                                    portal_map,
+                                    &enc.dungeon,
+                                    enc.leisurely,
+                                    enc.shatters_hm,
+                                ),
                                 datetime_s,
                             ))
                             .color(Color32::GRAY),
@@ -3796,17 +3817,31 @@ mod tests {
     fn leisurely_mode_is_appended_to_the_dungeon_name() {
         let portal_map = get_dungeon_portal_map();
         assert_eq!(
-            dungeon_display_name(portal_map, "Moonlight Village", true),
+            dungeon_display_name(portal_map, "Moonlight Village", true, false),
             "Moonlight Village (Leisurely)"
         );
         assert_eq!(
-            dungeon_display_name(portal_map, "Moonlight Village", false),
+            dungeon_display_name(portal_map, "Moonlight Village", false, false),
             "Moonlight Village"
         );
         // Every other dungeon ignores the flag (it is never set for them).
         assert_eq!(
-            dungeon_display_name(portal_map, "The Shatters", false),
+            dungeon_display_name(portal_map, "The Shatters", false, false),
             "The Shatters"
+        );
+    }
+
+    #[test]
+    fn shatters_hard_mode_is_appended_to_the_dungeon_name() {
+        let portal_map = get_dungeon_portal_map();
+        assert_eq!(
+            dungeon_display_name(portal_map, "The Shatters", false, true),
+            "The Shatters (HM)"
+        );
+        // The two run-level modes are independent and can combine.
+        assert_eq!(
+            dungeon_display_name(portal_map, "The Shatters", true, true),
+            "The Shatters (Leisurely, HM)"
         );
     }
 
