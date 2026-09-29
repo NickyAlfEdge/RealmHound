@@ -63,6 +63,19 @@ pub struct ChatPings {
     pub custom_chat: bool,
 }
 
+/// Whether `body` is a guild presence notice about a member ("Lovens has come
+/// online.", "Lovens has gone offline.") rather than a player writing something.
+/// The notice names the member in the message body, which is not someone
+/// mentioning them, so it must not raise the character-name ping.
+pub fn is_presence_notice(body: &str) -> bool {
+    let body = body.trim();
+    let body = body.strip_suffix('.').unwrap_or(body).trim_end();
+    let body = body.to_lowercase();
+    [" has come online", " has gone offline"]
+        .iter()
+        .any(|suffix| body.ends_with(suffix))
+}
+
 impl ChatPings {
     /// True if either ping matched.
     pub fn any(&self) -> bool {
@@ -78,7 +91,9 @@ impl ChatPings {
 /// the configured custom chat text.
 pub fn pings_for(body: &str, ign: Option<&str>, trigger: &str) -> ChatPings {
     ChatPings {
-        ign_mention: ign.is_some_and(|name| contains_word(body, name)),
+        // A guild presence notice names the member without anyone mentioning
+        // them, so it never raises the character-name ping.
+        ign_mention: !is_presence_notice(body) && ign.is_some_and(|name| contains_word(body, name)),
         custom_chat: contains_word(body, trigger),
     }
 }
@@ -175,5 +190,30 @@ mod tests {
         let pings = pings_for("Bob saw loot", Some("Bob"), "");
         assert!(pings.ign_mention);
         assert!(!pings.custom_chat);
+    }
+
+    #[test]
+    fn guild_presence_notices_do_not_mention_the_member() {
+        for body in [
+            "Lovens has come online.",
+            "Lovens has come online",
+            "Lovens has gone offline.",
+            "  Lovens has gone offline.  ",
+        ] {
+            let pings = pings_for(body, Some("Lovens"), "");
+            assert!(
+                !pings.ign_mention,
+                "{body:?} is a presence notice, not a mention"
+            );
+        }
+        assert!(is_presence_notice("Lovens has come online."));
+        assert!(is_presence_notice("Lovens has gone offline"));
+        // A player writing about someone coming online still mentions them.
+        assert!(!is_presence_notice("did Bob come online?"));
+        assert!(!is_presence_notice("Bob has come online before"));
+        assert!(!is_presence_notice("online"));
+        assert!(!is_presence_notice(""));
+        let pings = pings_for("did Bob come online?", Some("Bob"), "");
+        assert!(pings.ign_mention);
     }
 }
