@@ -2245,8 +2245,11 @@ impl PacketProcessor {
                             });
                         }
                     } else {
-                        let me = self.session.connection.detected_account_name.as_deref();
+                        // Owned so the pings below do not hold a borrow of `self`
+                        // across the audio emits.
+                        let me = self.session.connection.detected_account_name.clone();
                         let is_self = me
+                            .as_deref()
                             .map(|m| chat_msg.sender.eq_ignore_ascii_case(m))
                             .unwrap_or(false);
                         if chat_msg.chat_type == ChatType::Whisper && is_self {
@@ -2270,6 +2273,49 @@ impl PacketProcessor {
                                     .unwrap_or(false);
                                 if enabled {
                                     self.emit(UiPayload::Audio(AudioCommand::Play(sound)));
+                                }
+                            }
+
+                            // Opt-in extras: ping when the body of a player chat
+                            // message mentions our character name, or when it
+                            // contains the trigger word the user configured. Only
+                            // the body is searched, so authoring the message or
+                            // being the whisper recipient never triggers them by
+                            // itself. Server announcements and boss calls are not
+                            // chat traffic and never ping.
+                            if matches!(
+                                chat_msg.chat_type,
+                                ChatType::Normal
+                                    | ChatType::Party
+                                    | ChatType::Guild
+                                    | ChatType::Whisper
+                            ) {
+                                let (mention_ping, custom_ping) = self
+                                    .settings
+                                    .read()
+                                    .map(|s| {
+                                        let pings = realmhound_core::chat_ping::pings_for(
+                                            &chat_msg.text,
+                                            me.as_deref(),
+                                            s.sound.custom_chat_text.as_str(),
+                                        );
+                                        (
+                                            pings.ign_mention
+                                                && SoundType::IgnMention.is_enabled(&s.sound),
+                                            pings.custom_chat
+                                                && SoundType::CustomChat.is_enabled(&s.sound),
+                                        )
+                                    })
+                                    .unwrap_or((false, false));
+                                if mention_ping {
+                                    self.emit(UiPayload::Audio(AudioCommand::Play(
+                                        SoundType::IgnMention,
+                                    )));
+                                }
+                                if custom_ping {
+                                    self.emit(UiPayload::Audio(AudioCommand::Play(
+                                        SoundType::CustomChat,
+                                    )));
                                 }
                             }
                         }

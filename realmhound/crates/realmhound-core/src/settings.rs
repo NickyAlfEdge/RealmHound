@@ -2049,6 +2049,25 @@ pub struct SoundSettings {
     #[serde(default)]
     pub trade: bool,
 
+    /// Play a ping when a chat message from another player mentions the local
+    /// character name (IGN) as a whole word. Only the message body is searched,
+    /// never the author or the whisper recipient. Off by default.
+    #[serde(default)]
+    pub ign_mention: bool,
+
+    /// Play a ping when a chat message contains the trigger text configured in
+    /// [`Self::custom_chat_text`] as a whole word. Off by default.
+    #[serde(default)]
+    pub custom_chat: bool,
+
+    /// Trigger text for the custom chat ping. Empty by default, so no custom
+    /// ping fires until the user sets a word (the settings field shows `abyss` as
+    /// its example). Matched case-insensitively against whole words, so it never
+    /// fires on a substring such as `abyssal`. Capped at
+    /// [`crate::chat_ping::CUSTOM_CHAT_TEXT_MAX`] characters by the settings UI.
+    #[serde(default)]
+    pub custom_chat_text: String,
+
     /// Play the Dimitus alert sound when entering a dungeon with the Dimitus
     /// modifier (golden outline). Off by default.
     #[serde(default)]
@@ -2336,6 +2355,10 @@ impl Default for SoundSettings {
             guild: false,
             pm: false,
             trade: false,
+            // Extra chat pings (IGN mention, custom trigger) are opt-in
+            ign_mention: false,
+            custom_chat: false,
+            custom_chat_text: String::new(),
             // Dimitus dungeon alert disabled by default
             dimitus_dungeon: false,
             // Bad-mod warning disabled by default
@@ -2666,6 +2689,33 @@ mod tests {
         assert_eq!(back.realm_events.veteran.overrides.len(), 1);
         assert_eq!(back.realm_events.veteran.overrides[0].boss_id, 22146);
         assert_eq!(back.realm_events.veteran.overrides[0].volume, 0.8);
+    }
+
+    #[test]
+    fn chat_ping_sounds_default_off_and_survive_missing_json() {
+        // Both extra chat pings are opt-in and the trigger word starts empty.
+        let d = SoundSettings::default();
+        assert!(!d.ign_mention);
+        assert!(!d.custom_chat);
+        assert!(d.custom_chat_text.is_empty());
+
+        // Back-compat: configs saved before these options existed still load.
+        let legacy = r#"{ "volume": 0.5, "whitebag": true, "pm": true, "guild": true }"#;
+        let parsed: SoundSettings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.pm && parsed.guild);
+        assert!(!parsed.ign_mention);
+        assert!(!parsed.custom_chat);
+        assert!(parsed.custom_chat_text.is_empty());
+
+        // Round-trip preserves both toggles and the configured trigger.
+        let mut s = SoundSettings::default();
+        s.ign_mention = true;
+        s.custom_chat = true;
+        s.custom_chat_text = "abyss".into();
+        let back: SoundSettings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.ign_mention && back.custom_chat);
+        assert_eq!(back.custom_chat_text, "abyss");
     }
 
     #[test]

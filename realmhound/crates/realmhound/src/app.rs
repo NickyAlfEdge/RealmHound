@@ -5043,6 +5043,17 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.ign_mention, "IGN mention")
+                        .hover_tip(
+                            "Plays when another player's chat message mentions your \
+                             character name (IGN). Matches whole words only, and never \
+                             plays for your own messages.",
+                        )
+                        .changed();
+                    settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::IgnMention, current_settings);
+                    ui.end_row();
+
+                    settings_changed |= shadcn
                         .switch(ui, &mut current_settings.party, "Party message")
                         .hover_tip("Plays when a party member sends a party chat message.")
                         .changed();
@@ -5054,6 +5065,38 @@ impl RealmHoundApp {
                         .hover_tip("Plays when a guild member sends a guild chat message.")
                         .changed();
                     settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::Guild, current_settings);
+                    ui.end_row();
+
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.custom_chat, "Custom chat")
+                        .hover_tip(
+                            "Plays when any chat message contains your trigger word. \
+                             Whole words only: a trigger of \"abyss\" does not play for \
+                             \"abyssal\". Set the word on the line below.",
+                        )
+                        .changed();
+                    settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::CustomChat, current_settings);
+                    ui.end_row();
+
+                    // The trigger word gets its own line under its toggle so the
+                    // ping controls stay aligned with every other row.
+                    ui.label("Trigger word:");
+                    if shadcn
+                        .text_edit_counted(
+                            ui,
+                            &mut current_settings.custom_chat_text,
+                            realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_MAX,
+                            150.0,
+                            Some("abyss"),
+                        )
+                        .on_hover_text(
+                            "Word or phrase that triggers the Custom chat ping. Max 50 \
+                             characters, matched case-insensitively as whole words.",
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
                     ui.end_row();
 
                     settings_changed |= shadcn
