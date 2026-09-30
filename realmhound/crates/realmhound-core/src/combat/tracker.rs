@@ -6316,6 +6316,33 @@ mod tests {
     }
 
     #[test]
+    fn curated_event_adds_never_become_their_own_fight() {
+        // Goblin Fire (34557) and Legion Soldier (53007) are label-less event
+        // adds whose realm HP is scaled past the boss fallback, so the curated
+        // deny-list is the only thing keeping them out of combat history -- even
+        // when the local player lands hits on them.
+        for (object_type, name) in [(34557, "Goblin Fire"), (53007, "Legion Soldier")] {
+            let mut t = CombatTracker::new();
+            t.on_map_change("Realm", 1, 0);
+            t.on_player_loaded(1000, 1);
+            t.on_object_spawn(
+                500,
+                object_type,
+                &status(
+                    500,
+                    vec![stat(StatType::MaxHP, 20_000), stat(StatType::HP, 20_000)],
+                ),
+                0,
+            );
+            t.on_damage(500, 1000, 5_000, 10);
+            t.on_local_hit(500, 7, 1000, 1000, 12);
+            t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+            let done = t.on_map_change("Nexus", 0, 100);
+            assert!(done.is_empty(), "{name} must not be tracked as a fight");
+        }
+    }
+
+    #[test]
     fn untagged_setpiece_without_local_engagement_is_dropped() {
         // A high-HP enemy with no boss-like labels (only the HP fallback), killed
         // by remote players while the local player never engaged: teleport-past

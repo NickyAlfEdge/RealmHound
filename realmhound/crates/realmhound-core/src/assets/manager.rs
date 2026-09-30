@@ -293,6 +293,7 @@ const CURATED_NON_BOSS_TYPES: &[i32] = &[
     34547, // World's Oyster Coral (Spawner) -- World's Oyster add, no labels
     34552, // Goblin Patriarch Villager ("Goblin Villager") -- Goblin Patriarch Adept Encounter minion, event-scaled HP, no labels
     34556, // Goblin Villager -- Goblin Patriarch Adept Encounter minion, event-scaled HP, no labels
+    34557, // Goblin Patriarch Fire ("Goblin Fire") -- Goblin Patriarch add, event-scaled HP, no labels
     34583, // White Blood Cell -- Bloodroot Heart add, no labels, event-scaled >10k HP
     34587, // Lich King Grave -- The Lich King add, 5k HP, no boss labels
     34604, // Angry Hornet -- Hornet's Nest add, routed to the aggregated hornet row
@@ -376,6 +377,7 @@ const CURATED_NON_BOSS_TYPES: &[i32] = &[
     52658, // Retro Woodland Ultimate Squirrel ("Mecha Squirrel")
     52659, // Retro Woodland Goblin Mage ("Forest Goblin Necromancer")
     52660, // Retro Woodland Goblin ("Forest Goblin Bruiser")
+    53007, // Beacon Guardian Carboniferous Minion ("Legion Soldier") -- realm beacon set-piece add, no labels, event-scaled HP
     53017, // Legion Missionary Holy Orb -- Legion Missionary add, no labels, 12.5k HP
     53018, // Legion Missionary Chaos Orb -- Legion Missionary add, no labels, 17.5k HP
 ];
@@ -4428,6 +4430,8 @@ mod tests {
             assert!(is_curated_non_boss_type(prop)); // SpecPen switch / gravestone props
         }
         assert!(is_curated_non_boss_type(34547)); // World's Oyster Coral (add)
+        assert!(is_curated_non_boss_type(34557)); // Goblin Fire (Goblin Patriarch event add)
+        assert!(is_curated_non_boss_type(53007)); // Legion Soldier (Beacon Guardian add)
         assert!(is_curated_non_boss_type(34583)); // White Blood Cell (Bloodroot Heart add)
         assert!(is_curated_non_boss_type(51080)); // Bramblethorn Bud (Corrupted Bramblethorn add)
         assert!(is_curated_non_boss_type(45408)); // LH Spawn Pillar (Lost Halls spawner)
