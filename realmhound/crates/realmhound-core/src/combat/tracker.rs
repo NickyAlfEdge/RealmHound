@@ -6317,11 +6317,15 @@ mod tests {
 
     #[test]
     fn curated_event_adds_never_become_their_own_fight() {
-        // Goblin Fire (34557) and Legion Soldier (53007) are label-less event
-        // adds whose realm HP is scaled past the boss fallback, so the curated
-        // deny-list is the only thing keeping them out of combat history -- even
-        // when the local player lands hits on them.
-        for (object_type, name) in [(34557, "Goblin Fire"), (53007, "Legion Soldier")] {
+        // Goblin Fire (34557), the Goblin Shaman (34555) and Legion Soldier (53007)
+        // are label-less event adds whose realm HP is scaled past the boss
+        // fallback, so the curated deny-list is the only thing keeping them out of
+        // combat history -- even when the local player lands hits on them.
+        for (object_type, name) in [
+            (34555, "Goblin Priest"),
+            (34557, "Goblin Fire"),
+            (53007, "Legion Soldier"),
+        ] {
             let mut t = CombatTracker::new();
             t.on_map_change("Realm", 1, 0);
             t.on_player_loaded(1000, 1);

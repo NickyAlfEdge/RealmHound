@@ -292,6 +292,7 @@ const CURATED_NON_BOSS_TYPES: &[i32] = &[
     34546, // World's Pearl -- World's Oyster add, routed to the pearl row
     34547, // World's Oyster Coral (Spawner) -- World's Oyster add, no labels
     34552, // Goblin Patriarch Villager ("Goblin Villager") -- Goblin Patriarch Adept Encounter minion, event-scaled HP, no labels
+    34555, // Goblin Shaman ("Goblin Priest") -- Goblin Patriarch Adept Encounter minion, event-scaled HP, no labels
     34556, // Goblin Villager -- Goblin Patriarch Adept Encounter minion, event-scaled HP, no labels
     34557, // Goblin Patriarch Fire ("Goblin Fire") -- Goblin Patriarch add, event-scaled HP, no labels
     34583, // White Blood Cell -- Bloodroot Heart add, no labels, event-scaled >10k HP
@@ -4431,6 +4432,7 @@ mod tests {
         }
         assert!(is_curated_non_boss_type(34547)); // World's Oyster Coral (add)
         assert!(is_curated_non_boss_type(34557)); // Goblin Fire (Goblin Patriarch event add)
+        assert!(is_curated_non_boss_type(34555)); // Goblin Priest (Goblin Patriarch event add)
         assert!(is_curated_non_boss_type(53007)); // Legion Soldier (Beacon Guardian add)
         assert!(is_curated_non_boss_type(34583)); // White Blood Cell (Bloodroot Heart add)
         assert!(is_curated_non_boss_type(51080)); // Bramblethorn Bud (Corrupted Bramblethorn add)
