@@ -361,6 +361,15 @@ pub struct LiveFeedSettings {
     #[serde(default = "default_realm_status_threshold")]
     pub realm_status_threshold: i32,
 
+    /// Whether a dungeon *opened in the Nexus* -- entered through a dungeon
+    /// portal there (a key, or one that had already spawned) or joined by a party
+    /// call with no realm instance in play -- gets `in nex` appended to its
+    /// callout. Independent of [`Self::realm_status`], which covers portals used
+    /// in a realm; realm entries reached from the Nexus keep their own map names
+    /// and are never Nexus entries. Defaults to `false`.
+    #[serde(default)]
+    pub opened_in_nexus: bool,
+
     /// Whether loot/dust/xp callout values include the `%` sign. Defaults to
     /// `false` (e.g. `15 lb`).
     #[serde(default)]
@@ -960,6 +969,7 @@ impl Default for LiveFeedSettings {
             learn_event_mods_runs: default_learn_event_mods_runs(),
             realm_status: RealmStatusMode::default(),
             realm_status_threshold: default_realm_status_threshold(),
+            opened_in_nexus: false,
             callout_percent: false,
             auto_clipboard_dungeon_calls: false,
             event_name_style: DungeonNameStyle::default(),
@@ -2862,6 +2872,10 @@ mod tests {
         assert_eq!(lf.learn_event_mods_runs, 3);
         assert_eq!(lf.realm_status, RealmStatusMode::None);
         assert_eq!(lf.realm_status_threshold, 33);
+        assert!(
+            !lf.opened_in_nexus,
+            "dungeons opened in the nexus are not named by default"
+        );
         assert!(
             !lf.auto_clipboard_dungeon_calls,
             "auto clipboard is off by default"

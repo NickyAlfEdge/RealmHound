@@ -215,10 +215,12 @@ pub struct DungeonCalloutParams<'a> {
     /// Their tags are dropped along with [`Self::call_event_mods`]'s curated set;
     /// empty when nothing has been learned yet.
     pub learned_event_mods: &'a [String],
-    /// Realm-status suffix to append, e.g. `in a closing realm` or
-    /// `in 74% realm`. Resolved and gated by the caller (`None` appends
-    /// nothing). See [`realm_status_suffix`].
-    pub realm_status: Option<&'a str>,
+    /// Named origin to append to the call, e.g. `in a closing realm`,
+    /// `in 74% realm` or `in nex`. Resolved and gated by the caller (`None`
+    /// appends nothing): a dungeon is opened either in a realm (see
+    /// [`realm_status_suffix`]) or in the Nexus, never both, so one slot carries
+    /// whichever applies.
+    pub origin_status: Option<&'a str>,
 }
 
 /// The realm-status callout suffix for a dungeon entered from a realm, or
@@ -373,8 +375,9 @@ pub fn build_dungeon_callout(
         }
     }
 
-    // The realm the dungeon was entered from (when the caller resolved one).
-    if let Some(status) = params.realm_status {
+    // Where the dungeon was opened (the realm it was entered from, or the
+    // Nexus), when the caller resolved one.
+    if let Some(status) = params.origin_status {
         let status = status.trim();
         if !status.is_empty() {
             tags.push(status.to_string());
@@ -514,7 +517,7 @@ mod tests {
             percent,
             reward_mods: mods,
             learned_event_mods: &[],
-            realm_status: None,
+            origin_status: None,
         }
     }
 
@@ -1084,7 +1087,7 @@ mod tests {
         let mods = default_reward_mods();
         let ov = BTreeMap::new();
         let mut p = default_params(&mods, &ov);
-        p.realm_status = Some("in 74% realm");
+        p.origin_status = Some("in 74% realm");
         let out = build_dungeon_callout("halls", &tokens(&["LOOTING", "GENEROUS"]), &p).unwrap();
         assert!(out.ends_with("in 74% realm"), "{out}");
         assert!(out.starts_with("halls 50% lb"), "{out}");

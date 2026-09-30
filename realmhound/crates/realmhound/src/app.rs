@@ -3561,7 +3561,7 @@ impl RealmHoundApp {
             percent: current.callout_percent,
             reward_mods: &current.reward_mods,
             learned_event_mods: &[],
-            realm_status: None,
+            origin_status: None,
         };
         let tokens = [
             "REWARDING".to_string(),
@@ -4091,6 +4091,18 @@ impl RealmHoundApp {
                         );
                     }
                 });
+
+                ui.add_space(6.0);
+
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.opened_in_nexus, "Opened in Nexus")
+                    .hover_tip(
+                        "Append \"in nex\" to calls for dungeons opened in the Nexus: entered \
+                         through a dungeon portal there (a key, or one already spawned), or \
+                         joined by a party call with no realm in play. Realms entered from the \
+                         Nexus (Meridian, Hearth, ...) are never Nexus entries.",
+                    )
+                    .changed();
 
                 ui.add_space(6.0);
 
