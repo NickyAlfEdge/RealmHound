@@ -187,6 +187,14 @@ struct PetTrack {
 /// Max distance (tiles) between a pet and a player for a proximity vote to count.
 const PET_ASSOC_MAX_DIST: f32 = 8.0;
 
+/// Max distance (tiles) between the local player and The Shatters' Stone Idol
+/// for its removal to count as a destruction rather than a view cull. The
+/// server drops an object from our world only once it leaves the view, which is
+/// far more than this, so a removal this close can only be the Idol being
+/// destroyed -- the hard-mode unlock that happens when it absorbs the Void
+/// Phantasm and the group kills it.
+const SHATTERS_IDOL_NEAR_DIST: f32 = 4.0;
+
 /// Soft cap on buffered enemy projectiles awaiting a local `PlayerHit`. Enemy
 /// bullets that never hit the local player are only freed on map change, so the
 /// buffer is cleared once it grows past this (a damage-taken estimate tolerates
@@ -1011,6 +1019,9 @@ impl CombatTracker {
         }
         let spawn_max_hp = self.objects.get(&object_id).map(|o| o.max_hp).unwrap_or(0);
         self.note_aux_instance(object_id, object_type, spawn_max_hp);
+        // The Idol's pool may already be damaged when we first see it (a run we
+        // arrived late to): reading it once is enough to spot hard mode.
+        self.note_shatters_hm_unlock_hp(object_id, 0);
         // A Moonlight Village spirit released at the end of a dance/Umi phase.
         // The server re-adds the same object as it re-enters view, so count each
         // id once per run and credit it to the fight that released it. The
@@ -1096,20 +1107,14 @@ impl CombatTracker {
             )
         };
         // The Shatters hard mode is unlocked by two objects the group has to
-        // destroy, and both are invincible or unreachable until then:
-        //   - the Stone Idol only loses HP once the Void Phantasm was absorbed,
-        //     which turns The Bridge Sentinel into Valen the Unbreakable;
-        //   - The Source only exists behind a secret wall past Valen, and
-        //     destroying it makes the Twilight Archmage Nox the Wild Shadow and
-        //     the Forgotten King King Azamoth.
-        // Real HP loss therefore means the run is in hard mode from that stage on.
-        if previous_hp > 0 && new_hp < previous_hp {
-            match obj_type {
-                crate::assets::SHATTERS_STONE_IDOL_TYPE => self.shatters_hm_bridge = true,
-                crate::assets::SHATTERS_THE_SOURCE_TYPE => self.shatters_hm_late = true,
-                _ => {}
-            }
-        }
+        // destroy, and both are invulnerable or unreachable until then:
+        //   - the Stone Idol cannot be damaged until the Void Phantasm is
+        //     absorbed next to it, which turns The Bridge Sentinel into Valen the
+        //     Unbreakable;
+        //   - The Source only exists behind the secret wall past Valen, and
+        //     destroying it turns the Twilight Archmage into Nox the Wild Shadow
+        //     and the Forgotten King into King Azamoth.
+        self.note_shatters_hm_unlock_hp(object_id, previous_hp);
         self.note_aux_instance(object_id, obj_type, obj_max_hp);
         // Rogue Lethal Strike: the buff starts when the local player
         // exits sneak, so open a window on the Invisible condition falling edge.
@@ -1281,6 +1286,71 @@ impl CombatTracker {
         }
     }
 
+    /// Latch The Shatters' hard-mode stages from an unlock object's HP reading.
+    ///
+    /// Both unlock objects are invulnerable or unreachable until the group
+    /// destroys them, so any damage they show means hard mode -- including a pool
+    /// they had already lost before we arrived (a fight we joined late), which is
+    /// why a reading below max counts, not just a drop since the previous tick.
+    /// `previous_hp` is the pool before this reading (0 when it is the first we
+    /// get). Readings only count while the pool is known, so an object whose HP
+    /// the server never reports is never mistaken for one that is at zero.
+    fn note_shatters_hm_unlock_hp(&mut self, object_id: i32, previous_hp: i64) {
+        let Some(obj) = self.objects.get(&object_id) else {
+            return;
+        };
+        let obj_type = obj.object_type;
+        let idol = obj_type == crate::assets::SHATTERS_STONE_IDOL_TYPE;
+        let source = obj_type == crate::assets::SHATTERS_THE_SOURCE_TYPE;
+        if !(idol || source)
+            || (idol && self.shatters_hm_bridge)
+            || (source && self.shatters_hm_late)
+        {
+            return;
+        }
+        let max_hp = obj.max_hp as i64;
+        if max_hp <= 0 {
+            return;
+        }
+        let new_hp = obj.hp as i64;
+        let damaged = new_hp > 0 && new_hp < max_hp;
+        let lethal = previous_hp > 0 && new_hp * 10 <= max_hp;
+        if !(damaged || lethal) {
+            return;
+        }
+        if idol {
+            self.confirm_shatters_hm_bridge(&format!("Stone Idol at {new_hp}/{max_hp} HP"));
+        } else {
+            self.confirm_shatters_hm_late(&format!("The Source at {new_hp}/{max_hp} HP"));
+        }
+    }
+
+    /// Latch The Shatters' bridge-stage hard mode, logging the evidence the first
+    /// time so a run whose unlock object was never observed at all can be
+    /// diagnosed from the log.
+    fn confirm_shatters_hm_bridge(&mut self, evidence: &str) {
+        if !self.shatters_hm_bridge {
+            tracing::info!("[SHATTERS_HM] hard mode at the bridge stage: {evidence}");
+            self.shatters_hm_bridge = true;
+        }
+    }
+
+    /// Latch The Shatters' late-stage hard mode (the archmage and the king), with
+    /// the same logging as [`Self::confirm_shatters_hm_bridge`].
+    fn confirm_shatters_hm_late(&mut self, evidence: &str) {
+        if !self.shatters_hm_late {
+            tracing::info!("[SHATTERS_HM] hard mode at the late stage: {evidence}");
+            self.shatters_hm_late = true;
+        }
+    }
+
+    /// Distance in tiles from the local player to `(x, y)`, or `None` when the
+    /// local player's position isn't known.
+    fn local_distance_to(&self, x: f32, y: f32) -> Option<f32> {
+        let me = self.objects.get(&self.local_object_id)?;
+        Some(((me.last_x - x).powi(2) + (me.last_y - y).powi(2)).sqrt())
+    }
+
     /// A loot bag was recorded in the current instance. Moonlight Village's
     /// mechanics bosses never die, so the run is scored Completed by its loot:
     /// the invisible `MV Dungeon Complete` / `MV Umi Complete` droppers emit the
@@ -1380,6 +1450,33 @@ impl CombatTracker {
         self.pending_summon_shots
             .retain(|&(owner, _), _| owner != object_id);
         let last = self.objects.remove(&object_id);
+        // The Shatters' Stone Idol never disappears on its own: it is either
+        // destroyed (hard mode) or simply leaves our view, and the server sends
+        // the same removal for both. Two cases can only be a destruction: a
+        // removal at lethal HP, and one that happens right next to the local
+        // player -- far inside the view radius, where a view cull cannot fire.
+        // Both latch hard mode, so a group that killed the Idol while we were
+        // elsewhere or before we ever read its HP is still recognised.
+        if let Some(obj) = &last {
+            if obj.object_type == crate::assets::SHATTERS_STONE_IDOL_TYPE
+                && !self.shatters_hm_bridge
+            {
+                let max_hp = obj.max_hp as i64;
+                let hp = obj.hp as i64;
+                let lethal = max_hp > 0 && hp > 0 && hp * 10 <= max_hp;
+                let distance = self.local_distance_to(obj.last_x, obj.last_y);
+                let near = distance.is_some_and(|d| d <= SHATTERS_IDOL_NEAR_DIST);
+                tracing::info!(
+                    "[SHATTERS_HM] Stone Idol removed: hp={hp}/{max_hp} \
+                     distance={distance:?} lethal={lethal} near={near}"
+                );
+                if lethal || near {
+                    self.confirm_shatters_hm_bridge(&format!(
+                        "Stone Idol destroyed (hp {hp}/{max_hp}, distance {distance:?})"
+                    ));
+                }
+            }
+        }
         // The Shatters' The Source is the breakable the group destroys past Valen
         // to unlock the late hard-mode bosses; it can vanish without its HP ever
         // being reported, so a removal counts just like damage would. It is only
@@ -1390,7 +1487,7 @@ impl CombatTracker {
                 .as_ref()
                 .is_some_and(|obj| obj.object_type == crate::assets::SHATTERS_THE_SOURCE_TYPE)
         {
-            self.shatters_hm_late = true;
+            self.confirm_shatters_hm_late("The Source removed");
         }
         // Record a participant departure for death/nexus detection:
         // an object that is currently an attacker in some active fight is leaving
@@ -8501,6 +8598,167 @@ mod tests {
             5,
         );
         t.on_object_status(900, &status(900, vec![stat(StatType::HP, 24_000)]), 8);
+    }
+
+    #[test]
+    fn shatters_stone_idol_found_damaged_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        // We arrive after the Idol lost part of its pool (the group already
+        // absorbed the Phantasm): hard mode, even though we never saw the drop.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 12_000)],
+            ),
+            5,
+        );
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
+        assert!(bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_stone_idol_killed_in_view_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        // The group destroys the Idol while we watch, without us landing a hit:
+        // its HP only becomes readable because it is in our view.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            5,
+        );
+        t.on_object_status(900, &status(900, vec![stat(StatType::HP, 0)]), 8);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_stone_idol_destroyed_beside_the_player_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(
+            1000,
+            0x0321,
+            &status_at(1000, 10.0, 10.0, vec![name_stat("Bob")]),
+            1,
+        );
+        // The server never reports the Idol's HP (unknown pool), so only its
+        // removal tells us anything: one that close can't be a view cull.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status_at(900, 11.0, 11.0, vec![]),
+            2,
+        );
+        t.on_object_removed(900, 6);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
+        assert!(bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_stone_idol_leaving_view_marks_nothing() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        // The local player walks away from the Idol: the removal is a view cull,
+        // so the run stays regular. This is the common case in a non-hard-mode
+        // Shatters, where the Idol cannot be killed at all -- and the cull fires
+        // far outside the near radius, so it is never mistaken for a kill.
+        t.on_object_spawn(
+            1000,
+            0x0321,
+            &status_at(1000, 40.0, 40.0, vec![name_stat("Bob")]),
+            1,
+        );
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status_at(
+                900,
+                0.0,
+                0.0,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            2,
+        );
+        t.on_object_removed(900, 6);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(!bridge.shatters_hm);
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_stone_idol_removed_at_lethal_hp_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        // Killed out of our view after we saw it at lethal HP: the group
+        // destroyed it, so the run was hard mode.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            2,
+        );
+        t.on_object_status(900, &status(900, vec![stat(StatType::HP, 1_000)]), 4);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(bridge.shatters_hm);
     }
 
     #[test]
