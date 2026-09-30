@@ -362,11 +362,12 @@ pub struct LiveFeedSettings {
     pub realm_status_threshold: i32,
 
     /// Whether a dungeon *opened in the Nexus* -- entered through a dungeon
-    /// portal there (a key, or one that had already spawned) or joined by a party
-    /// call with no realm instance in play -- gets `in nex` appended to its
-    /// callout. Independent of [`Self::realm_status`], which covers portals used
-    /// in a realm; realm entries reached from the Nexus keep their own map names
-    /// and are never Nexus entries. Defaults to `false`.
+    /// portal there (a key, or one that had already spawned) or joined into an
+    /// instance running on the region's hub server (a party call from a realm) --
+    /// gets `in nex` appended to its callout. Independent of
+    /// [`Self::realm_status`], which covers portals used in a realm; realm
+    /// entries reached from the Nexus keep their own map names and are never
+    /// Nexus entries. Defaults to `false`.
     #[serde(default)]
     pub opened_in_nexus: bool,
 

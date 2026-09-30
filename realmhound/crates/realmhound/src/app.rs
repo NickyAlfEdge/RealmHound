@@ -4098,9 +4098,10 @@ impl RealmHoundApp {
                     .switch(ui, &mut current.opened_in_nexus, "Opened in Nexus")
                     .hover_tip(
                         "Append \"in nex\" to calls for dungeons opened in the Nexus: entered \
-                         through a dungeon portal there (a key, or one already spawned), or \
-                         joined by a party call with no realm in play. Realms entered from the \
-                         Nexus (Meridian, Hearth, ...) are never Nexus entries.",
+                         through a portal there (a key, or one already spawned), or joined into \
+                         an instance that runs on the Nexus server (a party call from a realm). \
+                         Realms entered from the Nexus (Meridian, Hearth, ...) are never Nexus \
+                         entries.",
                     )
                     .changed();
 

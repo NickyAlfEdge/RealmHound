@@ -599,6 +599,11 @@ const DUNGEON_WINDOW_ESTIMATED: std::time::Duration = std::time::Duration::from_
 /// Time from a realm-close message to the castle teleport.
 const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long after entering a dungeon the connection to its instance still counts
+/// as that instance's host. The host is identified from the new socket a beat
+/// after the dungeon's MapInfo arrives, so the hint is always slightly late.
+const NEXUS_ORIGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How many recent entries of one dungeon the panel remembers, and therefore the
 /// widest window `learn_event_mods_runs` can compare. An event that started
 /// mid-session is recognized a few runs in, so a handful of spawns is enough.
@@ -850,6 +855,12 @@ pub struct LiveFeedPanel {
     is_score_stale: bool,
     /// True when the player is inside a dungeon (from MapChanged.is_dungeon).
     currently_in_dungeon: bool,
+    /// Whether the map this dungeon entry replaced was itself a dungeon (set
+    /// alongside [`Self::currently_in_dungeon`]). A dungeon keyed open inside
+    /// another instance runs on that instance's host, which for a hub-opened
+    /// parent is the hub: the host hint alone would then call the child a Nexus
+    /// entry, so it only counts for entries that came from outside a dungeon.
+    left_from_dungeon: bool,
     /// Whether the map the player is standing on is a realm (MapInfo reported a
     /// realm score). Set by [`Self::update_location`].
     map_is_realm: bool,
@@ -1094,6 +1105,7 @@ impl LiveFeedPanel {
             realm_score: None,
             is_score_stale: false,
             currently_in_dungeon: false,
+            left_from_dungeon: false,
             map_is_realm: false,
             left_from_realm: false,
             map_is_nexus: false,
@@ -1550,8 +1562,42 @@ impl LiveFeedPanel {
     /// Set the server name (from IP address lookup). Called when a new server
     /// connection to a known nexus IP is detected. Unmapped IPs (in-realm and
     /// dungeon backend hosts) are ignored so the last known name persists.
+    ///
+    /// A *named* host is always a region hub (the Nexus and the other hub
+    /// spaces); realm and dungeon backends are unmapped. Since a dungeon instance
+    /// runs on the host that ran the portal used to enter it, connecting to a
+    /// named host right after entering a dungeon means that instance is running
+    /// on the hub, i.e. its portal was popped in the Nexus. That is the only way
+    /// to name the origin when the entry never loaded a Nexus map at all -- a
+    /// party-call join from a realm teleports straight into the instance.
     pub fn set_server_name(&mut self, name: String) {
         self.server_name = Some(name);
+        self.note_hub_hosted_dungeon();
+    }
+
+    /// Mark the dungeon just entered as opened in the Nexus, for the case where
+    /// its host turned out to be the hub (see [`Self::set_server_name`]).
+    fn note_hub_hosted_dungeon(&mut self) {
+        if !self.currently_in_dungeon || self.left_from_dungeon {
+            return;
+        }
+        let marked = match self.entries.front_mut() {
+            Some(FeedEntry::Dungeon(entry))
+                if !entry.entered_from_nexus
+                    && entry.entered_at.elapsed() < NEXUS_ORIGIN_WINDOW =>
+            {
+                entry.entered_from_nexus = true;
+                tracing::info!(
+                    "[LIVE_FEED] '{}' is hosted on a hub server: naming it as opened in the nexus",
+                    entry.dungeon_name
+                );
+                true
+            }
+            _ => false,
+        };
+        if marked {
+            self.recompute_dungeon_callouts();
+        }
     }
 
     /// Authoritatively set the header server and realm from a `/server` command
@@ -1736,6 +1782,7 @@ impl LiveFeedPanel {
         self.realm_score = None;
         self.is_score_stale = false;
         self.currently_in_dungeon = false;
+        self.left_from_dungeon = false;
         self.map_is_realm = false;
         self.left_from_realm = false;
         self.map_is_nexus = false;
@@ -5345,6 +5392,7 @@ impl Panel for LiveFeedPanel {
                     *max_realm_score,
                 );
                 self.clear_encounters();
+                self.left_from_dungeon = self.currently_in_dungeon;
                 self.currently_in_dungeon = *is_dungeon;
 
                 if *is_dungeon {
@@ -7044,6 +7092,62 @@ mod tests {
 
         panel.opened_in_nexus = false;
         panel.recompute_dungeon_callouts();
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn opened_in_nexus_from_a_party_call_is_named_once_its_host_is_known() {
+        let _assets = crate::test_support::modifier_assets();
+        // The reported case: standing in a realm, a friend pops a key in the
+        // Nexus and calls it, and the party call teleports us straight into that
+        // instance. No Nexus map is ever loaded, so the only hint is the host we
+        // end up on: the hub is the one host RH can name, realm and dungeon
+        // backends are unmapped.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.opened_in_nexus = true;
+        // The dungeon's MapInfo follows the realm's directly (no portal of ours).
+        panel.update_location("Davy Jones' Locker", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake"),
+            "the host is only learned a beat later"
+        );
+
+        // The instance turns out to live on the USMidWest hub (18.221.120.59).
+        panel.set_server_name("USMidWest".to_string());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nex"));
+
+        // Off by default: the same sequence names nothing.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.update_location("Davy Jones' Locker", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        panel.set_server_name("USMidWest".to_string());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // A named host that arrives outside a dungeon (the Nexus itself, or a
+        // later reconnect) never rewrites an entry.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.opened_in_nexus = true;
+        panel.update_location("Sprite World", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        panel.currently_in_dungeon = false;
+        panel.set_server_name("USMidWest".to_string());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // A dungeon keyed open inside another dungeon runs on that instance's
+        // host, which for a hub-opened parent is the hub: the host hint must not
+        // call the child a Nexus entry.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.opened_in_nexus = true;
+        panel.update_location("Sprite World", "NexusPortal.Zephyr", 0, 0);
+        panel.left_from_dungeon = true;
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        panel.set_server_name("USMidWest".to_string());
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
     }
 
