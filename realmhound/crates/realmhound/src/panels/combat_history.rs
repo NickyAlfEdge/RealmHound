@@ -15,7 +15,7 @@ use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
     assets::{
         get_asset_manager, get_dungeon_portal_map, is_mv_boss, BossGroup, CatalogEntry,
-        DungeonPortalMap,
+        DungeonPortalMap, MV_UMI_TYPE,
     },
     combat::{
         build_bundle, sanitize_player_name, CombatDatabase, DamageProvenance,
@@ -143,6 +143,69 @@ fn draw_boss_sprite(
         }
     }
     sprite_renderer.draw_outlined_sprite_in_rect(ui, object_type, rect);
+}
+
+/// Draw a Moonlight Village spirit tally sprite: the dancers share the bundled
+/// spirit flame, while Kitsune Umi's own spirits (her phases and her total) use
+/// the "Concentrated Soul Fire" object sprite. Falls back to the shared flame
+/// when the object sprite isn't available, so a tally is never left blank.
+fn draw_spirit_sprite(
+    sprite_renderer: &mut crate::rendering::SpriteRenderer,
+    ui: &egui::Ui,
+    umi: bool,
+    rect: egui::Rect,
+) {
+    if umi
+        && sprite_renderer.draw_sprite_in_rect(
+            ui,
+            realmhound_core::assets::MV_UMI_SPIRIT_TYPE,
+            rect,
+        )
+    {
+        return;
+    }
+    // `draw_embedded_icon_fitted` keeps the flame's own aspect ratio instead of
+    // stretching it to the rect (it is a tall 24x48 sprite in a square cell).
+    sprite_renderer.draw_embedded_icon_fitted(ui, EmbeddedIcon::MvSpirit, rect);
+}
+
+/// A boss row's stats split around its spirit tally, so the spirit sprite can be
+/// drawn directly before the count: `(leading, spirits)`, where `spirits` is
+/// `Some` only for a Moonlight Village phase that collected any.
+fn boss_row_stats_parts(
+    boss_object_type: i32,
+    boss_start_hp: i32,
+    boss_max_hp: i32,
+    damage: i64,
+    spirits: i32,
+) -> (String, Option<i32>) {
+    if is_mv_boss(boss_object_type) && spirits > 0 {
+        (
+            format!("Damage {}  ·  ", fmt_thousands(damage)),
+            Some(spirits),
+        )
+    } else {
+        (
+            boss_row_hp_label(
+                boss_object_type,
+                boss_start_hp,
+                boss_max_hp,
+                damage,
+                spirits,
+            ),
+            None,
+        )
+    }
+}
+
+/// The header line for a Moonlight Village spirit total, carrying the loot tier
+/// the total earned ("(Tier:N)", 4 being the best). `umi` scores the total on
+/// Kitsune Umi's own thresholds; a Leisurely Mode dance is scored on them too.
+fn spirit_total_label(label: &str, spirits: i32, leisurely: bool, umi: bool) -> String {
+    match realmhound_core::assets::mv_spirit_tier(spirits, leisurely, umi) {
+        Some(tier) => format!("{label}{spirits} (Tier:{tier})"),
+        None => format!("{label}{spirits}"),
+    }
 }
 
 /// Cached autocomplete data (distinct bosses/dungeons) for search suggestions.
@@ -3380,18 +3443,26 @@ impl CombatHistoryPanel {
             .filter(|p| !(hide_crates && get_asset_manager().is_treasure_crate(p.boss_object_type)))
             .collect();
 
-        // Display order: final boss at the top, earlier bosses below in
-        // reverse-kill order. Crates done after the main boss are the latest
-        // phases, so they land above the main boss (folded). Sort by kill time
-        // descending.
-        visible_phases.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+        // Display order: the last boss fought at the top, so reading the rows
+        // bottom-to-top is the order the party fought them. Ordering is by fight
+        // start, not finalization: an earlier phase can flush after a later one
+        // (e.g. a Moonlight Village dancer suspended and folded at the run's end),
+        // and it must not jump above the boss the run actually finished on.
+        visible_phases.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then(b.ended_at.cmp(&a.ended_at))
+        });
 
         // The main dungeon boss: the run anchor (last real boss), else the last
         // non-crate phase. Its section auto-expands and shows the "Main" badge.
+        // The latest row of that object type is the anchor phase itself, since a
+        // single boss can be recorded under several rows (re-detections).
         let am = get_asset_manager();
         let anchor_id: Option<i64> = enc
             .phases
             .iter()
+            .rev()
             .find(|p| p.boss_object_type == enc.anchor_object_type)
             .or_else(|| {
                 enc.phases
@@ -3540,41 +3611,43 @@ impl CombatHistoryPanel {
                             .filter(|p| p.boss_object_type == 20493)
                             .map(|p| p.spirits)
                             .sum();
-                        for (label, count, tip) in [
+                        for (label, count, umi, tip) in [
                             (
                                 "Total spirits collected (Dancers): ",
                                 dancer_spirits,
+                                false,
                                 "Moonlight Village spirits collected from Sage Genji, \
                                  Dancer Miko and Drummer Kaguya. This total sets the \
-                                 dancers' loot tier and the odds of the Kitsune Umi \
-                                 encounter.",
+                                 dancers' loot tier (Tier 4 from 78, Tier 3 from 58, \
+                                 Tier 2 from 40) and the odds of the Kitsune Umi \
+                                 encounter. A Leisurely Mode dance is scored on Umi's \
+                                 lower thresholds instead.",
                             ),
                             (
                                 "Total spirits collected (Umi): ",
                                 umi_spirits,
+                                true,
                                 "Moonlight Village spirits collected during the \
                                  Kitsune Umi phases, scored on their own, lower tier \
-                                 thresholds.",
+                                 thresholds (Tier 4 from 48, Tier 3 from 36, Tier 2 \
+                                 from 24).",
                             ),
                         ] {
                             if count <= 0 {
                                 continue;
                             }
+                            // Tier the total earned: 4 is the best, and a Leisurely
+                            // Mode dance shares Umi's thresholds.
+                            let text = spirit_total_label(label, count, enc.leisurely, umi);
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::vec2(16.0, 16.0),
                                     egui::Sense::hover(),
                                 );
-                                ctx.sprite_renderer.draw_embedded_icon(
-                                    ui,
-                                    EmbeddedIcon::MvSpirit,
-                                    rect,
-                                );
-                                ui.label(
-                                    RichText::new(format!("{label}{count}")).color(Color32::GRAY),
-                                )
-                                .hover_tip(tip);
+                                draw_spirit_sprite(ctx.sprite_renderer, ui, umi, rect);
+                                ui.label(RichText::new(text).color(Color32::GRAY))
+                                    .hover_tip(tip);
                             });
                         }
                         let enc_close_calls = enc.total_close_calls();
@@ -3688,18 +3761,16 @@ impl CombatHistoryPanel {
                     };
                     // An uncapped boss (Moonlight Village mechanics bosses) has no
                     // finite HP, so its row shows the party's total damage instead
-                    // of an HP fraction.
-                    let phase_hp = boss_row_hp_label(
+                    // of an HP fraction. Its spirit tally is split out so the
+                    // spirit sprite can precede the count.
+                    let (phase_stats, phase_spirits) = boss_row_stats_parts(
                         phase.boss_object_type,
                         phase.boss_start_hp,
                         phase.boss_max_hp,
                         phase.total_damage(),
                         phase.spirits,
                     );
-                    let header = format!(
-                        "{arrow}  {phase_name}   {phase_hp}   {dur}",
-                        dur = fmt_duration(phase.duration_ms()),
-                    );
+                    let header = format!("{arrow}  {phase_name}   {phase_stats}");
                     ui.horizontal(|ui| {
                         if phase.boss_object_type != 0 {
                             let (rect, _) = ui
@@ -3719,10 +3790,26 @@ impl CombatHistoryPanel {
                                 self.expanded_phases.insert(phase.id);
                             }
                         }
+                        if let Some(spirits) = phase_spirits {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            draw_spirit_sprite(
+                                ctx.sprite_renderer,
+                                ui,
+                                phase.boss_object_type == MV_UMI_TYPE,
+                                rect,
+                            );
+                            ui.label(format!("Spirits {spirits}"));
+                        }
+                        ui.label(fmt_duration(phase.duration_ms()));
                         ui.label(RichText::new(state).color(scolor).small());
-                        if Some(phase.id) == anchor_id
+                        // Kitsune Umi is an optional boss: a card she is the only
+                        // boss of still headlines on her, but she is never the
+                        // run's "Main".
+                        let show_main = Some(phase.id) == anchor_id
                             && !am.is_treasure_crate(phase.boss_object_type)
-                        {
+                            && phase.boss_object_type != MV_UMI_TYPE;
+                        if show_main {
                             ui.label(
                                 RichText::new("Main")
                                     .color(Color32::from_rgb(0xff, 0xc1, 0x00))
@@ -3837,10 +3924,68 @@ fn assign_drops_exclusive(
 #[cfg(test)]
 mod tests {
     use super::{
-        assign_drops_exclusive, boss_bar_label, boss_row_hp_label, dungeon_display_name,
-        share_hp_pool,
+        assign_drops_exclusive, boss_bar_label, boss_row_hp_label, boss_row_stats_parts,
+        dungeon_display_name, share_hp_pool, spirit_total_label,
     };
     use realmhound_core::assets::get_dungeon_portal_map;
+
+    #[test]
+    fn mv_boss_rows_split_out_the_spirit_tally() {
+        // A dancer that collected spirits splits the tally out, so the spirit
+        // sprite can be drawn directly before the count.
+        assert_eq!(
+            boss_row_stats_parts(20450, 360_000, 360_000, 328_071, 24),
+            ("Damage 328,071  ·  ".to_string(), Some(24))
+        );
+        // No spirits: the row keeps the plain damage text.
+        assert_eq!(
+            boss_row_stats_parts(20451, 360_000, 360_000, 1_000, 0),
+            ("Damage 1,000".to_string(), None)
+        );
+        // Umi is an MV boss too, so her row splits the same way.
+        assert_eq!(
+            boss_row_stats_parts(20493, 360_000, 360_000, 893_980, 50),
+            ("Damage 893,980  ·  ".to_string(), Some(50))
+        );
+        // Ordinary bosses keep their HP label and never split.
+        assert_eq!(
+            boss_row_stats_parts(45073, 50, 100, 0, 0),
+            ("HP 50/100".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn spirit_totals_show_the_loot_tier_they_earned() {
+        let dancers = "Total spirits collected (Dancers): ";
+        let umi = "Total spirits collected (Umi): ";
+        assert_eq!(
+            spirit_total_label(dancers, 88, false, false),
+            "Total spirits collected (Dancers): 88 (Tier:4)"
+        );
+        assert_eq!(
+            spirit_total_label(dancers, 45, false, false),
+            "Total spirits collected (Dancers): 45 (Tier:2)"
+        );
+        // Umi is scored on her own, lower thresholds.
+        assert_eq!(
+            spirit_total_label(umi, 50, false, true),
+            "Total spirits collected (Umi): 50 (Tier:4)"
+        );
+        // A Leisurely Mode dance shares Umi's thresholds.
+        assert_eq!(
+            spirit_total_label(dancers, 50, true, false),
+            "Total spirits collected (Dancers): 50 (Tier:4)"
+        );
+        assert_eq!(
+            spirit_total_label(dancers, 50, false, false),
+            "Total spirits collected (Dancers): 50 (Tier:2)"
+        );
+        // An empty tally names no tier (the line is hidden anyway).
+        assert_eq!(
+            spirit_total_label(dancers, 0, false, false),
+            "Total spirits collected (Dancers): 0"
+        );
+    }
 
     #[test]
     fn leisurely_mode_is_appended_to_the_dungeon_name() {

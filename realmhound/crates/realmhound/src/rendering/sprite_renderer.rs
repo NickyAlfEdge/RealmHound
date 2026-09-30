@@ -844,6 +844,17 @@ impl SpriteRenderer {
         true
     }
 
+    /// Like [`Self::draw_embedded_icon`] but scales the icon to fit `rect` while
+    /// preserving its aspect ratio, centered. Use for non-square icons (e.g. the
+    /// tall Moonlight Village spirit flame) that would otherwise be stretched to
+    /// the caller's rect shape.
+    pub fn draw_embedded_icon_fitted(&self, ui: &egui::Ui, icon: EmbeddedIcon, rect: Rect) -> bool {
+        let Some(fitted) = self.embedded_scaled_rect(ui, icon, rect) else {
+            return false;
+        };
+        self.draw_embedded_icon(ui, icon, fitted)
+    }
+
     /// Like [`Self::draw_embedded_icon`] but multiplies the icon by `tint`
     /// (alpha-masked), so callers can dim an embedded icon (e.g. a claimed
     /// mission's objective marker) without a covering rect.

@@ -589,6 +589,7 @@ const OPTIONAL_SECONDARY_BOSS_TYPES: &[i32] = &[
     43924, // Cursed Phantom (Cursed Library) -- Avalon the Archivist is main
     46385, // Infested Janus the Doorwarden (Oryx's Castle) -- Stone Guardians are main
     47387, // Calamity Crab (Deadwater Docks) -- Bilgewater is main
+    20493, // Kitsune Umi (Moonlight Village) -- the dancers are main
 ];
 
 /// Whether `id` is a dungeon's optional secondary boss ([`OPTIONAL_SECONDARY_BOSS_TYPES`])
@@ -638,6 +639,33 @@ pub fn is_mv_boss(id: i32) -> bool {
 pub const MV_DANCER_TYPES: &[i32] = &[20450, 20451, 20452];
 /// Moonlight Village's optional secret boss, Kitsune Umi.
 pub const MV_UMI_TYPE: i32 = 20493;
+
+/// The object whose sprite the card draws for Kitsune Umi's spirit tally:
+/// "Concentrated Soul Fire" (0x513C). Umi's spirits are her own, so they get
+/// their own flame instead of the dancers' shared spirit icon.
+pub const MV_UMI_SPIRIT_TYPE: i32 = 0x513C;
+
+/// The Moonlight Village loot tier a spirit total earns (4 is the best), or
+/// `None` when no spirits were collected at all.
+///
+/// RealmEye / issue #30: the dance is scored out of 88 spirits (Tier 4 from 78,
+/// Tier 3 from 58, Tier 2 from 40, Tier 1 from 2), while Kitsune Umi's shorter
+/// fight -- and a Leisurely Mode dance, which shares her thresholds -- is scored
+/// out of 56 (Tier 4 from 48, Tier 3 from 36, Tier 2 from 24, Tier 1 from 2).
+pub fn mv_spirit_tier(spirits: i32, leisurely: bool, umi: bool) -> Option<u8> {
+    if spirits <= 0 {
+        return None;
+    }
+    let thresholds: [(i32, u8); 4] = if umi || leisurely {
+        [(48, 4), (36, 3), (24, 2), (2, 1)]
+    } else {
+        [(78, 4), (58, 3), (40, 2), (2, 1)]
+    };
+    thresholds
+        .iter()
+        .find(|(minimum, _)| spirits >= *minimum)
+        .map(|(_, tier)| *tier)
+}
 
 /// Which Moonlight Village bosses a recorded loot bag clears. The invisible
 /// `MV Dungeon Complete` (0x50B2) and `MV Umi Complete` (0xC0BB) objects spawn
@@ -4727,6 +4755,66 @@ mod tests {
         // The Stone Idol is a curated standalone boss (no encounter grouping).
         assert!(is_curated_boss_type(33280));
         assert!(encounter_for_boss_type(33280).is_none());
+    }
+
+    #[test]
+    fn mv_spirit_tiers_follow_the_published_thresholds() {
+        // Dancers: scored out of 88 spirits.
+        for (spirits, tier) in [
+            (88, 4),
+            (78, 4),
+            (77, 3),
+            (76, 3),
+            (58, 3),
+            (56, 2),
+            (40, 2),
+            (38, 1),
+            (2, 1),
+        ] {
+            assert_eq!(
+                mv_spirit_tier(spirits, false, false),
+                Some(tier),
+                "{spirits} spirits"
+            );
+        }
+        // Umi (and any Leisurely Mode dance): scored out of 56.
+        for (spirits, tier) in [
+            (56, 4),
+            (48, 4),
+            (47, 3),
+            (46, 3),
+            (36, 3),
+            (34, 2),
+            (24, 2),
+            (22, 1),
+            (2, 1),
+        ] {
+            assert_eq!(
+                mv_spirit_tier(spirits, false, true),
+                Some(tier),
+                "Umi at {spirits} spirits"
+            );
+            assert_eq!(
+                mv_spirit_tier(spirits, true, false),
+                Some(tier),
+                "Leisurely dance at {spirits} spirits"
+            );
+        }
+        // A Leisurely dance is never scored on the dancers' 88-spirit scale.
+        assert_eq!(mv_spirit_tier(60, true, false), Some(4));
+        assert_eq!(mv_spirit_tier(60, false, false), Some(3));
+        // No tally means no tier.
+        assert_eq!(mv_spirit_tier(0, false, false), None);
+        assert_eq!(mv_spirit_tier(0, true, false), None);
+        assert_eq!(mv_spirit_tier(0, false, true), None);
+        assert_eq!(mv_spirit_tier(-3, false, false), None);
+    }
+
+    #[test]
+    fn mv_spirit_sprite_ids_are_the_umi_flame() {
+        assert_eq!(MV_UMI_SPIRIT_TYPE, 0x513C);
+        assert!(MV_DANCER_TYPES.contains(&20450) && MV_DANCER_TYPES.contains(&20452));
+        assert_eq!(MV_UMI_TYPE, 20493);
     }
 
     #[test]

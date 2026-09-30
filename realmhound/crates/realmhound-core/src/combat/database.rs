@@ -3121,20 +3121,33 @@ impl CombatDatabase {
     /// `(boss_object_type, boss_max_hp, boss_start_hp, killed)`.
     fn run_anchor(&self, run_id: &str) -> SqlResult<Option<(i32, i32, i32, bool)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT boss_object_type, boss_max_hp, boss_start_hp, killed, ended_at
+            "SELECT boss_object_type, boss_max_hp, boss_start_hp, killed, ended_at, started_at
              FROM fights WHERE encounter_run_id = ?1",
         )?;
-        let rows: Vec<PhaseStat> = stmt
+        let phase_rows: Vec<(PhaseStat, i64)> = stmt
             .query_map(params![run_id], |r| {
                 Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get::<_, i32>(3)? != 0,
-                    r.get(4)?,
+                    (
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get::<_, i32>(3)? != 0,
+                        r.get(4)?,
+                    ),
+                    r.get(5)?,
                 ))
             })?
             .collect::<SqlResult<_>>()?;
+        let rows: Vec<PhaseStat> = phase_rows.iter().map(|(phase, _)| *phase).collect();
+        if let Some(dancer) = mv_dancer_main(phase_rows.iter().map(|(p, start)| (p.0, *start))) {
+            if let Some(p) = rows.iter().filter(|p| p.0 == dancer).max_by_key(|p| p.4) {
+                let enc_id = rows
+                    .iter()
+                    .find_map(|p| crate::assets::encounter_for_boss_type(p.0))
+                    .map(|e| e.id);
+                return Ok(Some((p.0, p.1, p.2, run_killed(enc_id, &rows, p.3))));
+            }
+        }
         Ok(pick_anchor(&rows))
     }
 
@@ -3305,8 +3318,26 @@ impl CombatDatabase {
             let shatters_hm = shatters_run_is_hard_mode(phases.iter().map(|p| (p.0, p.10)));
             let phase_stats: Vec<PhaseStat> =
                 phases.iter().map(|p| (p.0, p.1, p.2, p.3, p.4)).collect();
+            // Moonlight Village headlines on the dancer the dance ended on (see
+            // `mv_dancer_main`); its row is picked the same way as every other
+            // anchor so the HP bar and completion state come from that phase.
             let (mut boss_object_type, boss_max_hp, boss_start_hp, killed) =
-                pick_anchor(&phase_stats).unwrap_or((0, 0, 0, false));
+                mv_dancer_main(phases.iter().map(|p| (p.0, p.7)))
+                    .and_then(|dancer| {
+                        phase_stats
+                            .iter()
+                            .filter(|p| p.0 == dancer)
+                            .max_by_key(|p| p.4)
+                            .copied()
+                    })
+                    .map(|p| {
+                        let enc_id = phase_stats
+                            .iter()
+                            .find_map(|q| crate::assets::encounter_for_boss_type(q.0))
+                            .map(|e| e.id);
+                        (p.0, p.1, p.2, run_killed(enc_id, &phase_stats, p.3))
+                    })
+                    .unwrap_or_else(|| pick_anchor(&phase_stats).unwrap_or((0, 0, 0, false)));
             // A run-level `killed` completes the card only for loot-completable
             // encounters (Towering Perfection): a bag from a core that was never
             // seen dying, where the anchor phase stays escaped. Other cards ignore
@@ -4821,6 +4852,22 @@ fn mv_dancers_cleared(phases: impl IntoIterator<Item = (i32, bool)>) -> bool {
     crate::assets::MV_DANCER_TYPES
         .iter()
         .all(|t| defeated.contains(t))
+}
+
+/// Moonlight Village's main boss: the dancer the party was recording damage on
+/// last, as an object type.
+///
+/// Only one boss records damage at a time, so the last dancer to start a fight
+/// is the one the dance ended on -- the boss the run's loot and clear belong to,
+/// and the one whose row headlines the card. Finalization order can't be used:
+/// a suspended/re-detected earlier dancer can flush after the final one.
+/// Kitsune Umi is optional and never the main boss; runs without a dancer return
+/// `None` and fall through to the generic anchor rules.
+fn mv_dancer_main(phases: impl Iterator<Item = (i32, i64)>) -> Option<i32> {
+    phases
+        .filter(|(object_type, _)| crate::assets::MV_DANCER_TYPES.contains(object_type))
+        .max_by_key(|(_, started_at)| *started_at)
+        .map(|(object_type, _)| object_type)
 }
 
 /// Pick the anchor phase for a grouped run: the encounter's declared
@@ -6492,11 +6539,22 @@ mod tests {
         run(20493, 40_000, 50_000, false); // Kitsune Umi, escaped
 
         let card = &db.list_fights(&FightQuery::default(), 50).unwrap()[0];
-        assert_eq!(card.boss_object_type, 20493, "Umi anchors the run");
+        assert_eq!(
+            card.boss_object_type, 20452,
+            "the dance's final dancer headlines the run, never Umi"
+        );
         assert!(card.killed, "escaping Umi keeps the card Completed");
         assert!(
             db.encounter_detail("mv-umi").unwrap().unwrap().killed,
             "the Fight Card agrees with the list card",
+        );
+        assert_eq!(
+            db.encounter_detail("mv-umi")
+                .unwrap()
+                .unwrap()
+                .anchor_object_type,
+            20452,
+            "the Fight Card marks the final dancer as its main boss",
         );
 
         // A dance abandoned after two dancers stays Escaped: the dancers floor
@@ -10247,6 +10305,60 @@ mod tests {
             .collect();
         let out = collapse_duplicate_boss_phases(&phases);
         assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn moonlight_village_main_boss_is_the_last_dancer_to_fight() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Only one boss records damage at a time, so the dancer the party was
+        // fighting last is the run's main boss -- even though Sage Genji (the
+        // first dancer) flushes last here, and Umi is fought after the dance.
+        let mut run = |object_type: i32, start: i64, end: i64| {
+            let mut f = flawless_fight("Moonlight Village", object_type, vec![]);
+            f.started_at = start;
+            f.ended_at = end;
+            f.killed = true;
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some("mv-main".to_string());
+            db.insert_fight(&f).unwrap();
+        };
+        run(20450, 1_000, 50_000); // Sage Genji, flushed after the dance
+        run(20451, 11_000, 20_000); // Dancer Miko
+        run(20452, 21_000, 30_000); // Drummer Kaguya, the final dancer
+        run(20493, 60_000, 70_000); // Kitsune Umi, optional
+
+        let card = &db.list_fights(&FightQuery::default(), 50).unwrap()[0];
+        assert_eq!(
+            card.boss_object_type, 20452,
+            "the final dancer headlines, not the last row to finalize or Umi"
+        );
+        let detail = db.encounter_detail("mv-main").unwrap().unwrap();
+        assert_eq!(detail.anchor_object_type, 20452);
+        assert_eq!(detail.phases.len(), 4);
+        assert!(
+            detail.phases.iter().any(|p| p.boss_object_type == 20493),
+            "Umi stays a phase of the card"
+        );
+
+        // A dancer-only run (Umi never engaged) headlines the same way.
+        let mut only_dancers = flawless_fight("Moonlight Village", 20451, vec![]);
+        only_dancers.started_at = 5_000;
+        only_dancers.ended_at = 40_000;
+        only_dancers.encounter_id = Some("dungeon_run".to_string());
+        only_dancers.encounter_run_id = Some("mv-no-umi".to_string());
+        db.insert_fight(&only_dancers).unwrap();
+        let mut late_flush = flawless_fight("Moonlight Village", 20450, vec![]);
+        late_flush.started_at = 1_000;
+        late_flush.ended_at = 90_000;
+        late_flush.encounter_id = Some("dungeon_run".to_string());
+        late_flush.encounter_run_id = Some("mv-no-umi".to_string());
+        db.insert_fight(&late_flush).unwrap();
+        let cards = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let no_umi = cards
+            .iter()
+            .find(|c| c.encounter_run_id.as_deref() == Some("mv-no-umi"))
+            .expect("dancer-only card");
+        assert_eq!(no_umi.boss_object_type, 20451);
     }
 
     #[test]
