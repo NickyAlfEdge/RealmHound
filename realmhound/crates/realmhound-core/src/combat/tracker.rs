@@ -750,10 +750,10 @@ pub struct CombatTracker {
     /// means the run is in hard mode and the Bridge Sentinel will be Valen the
     /// Unbreakable. Reset on map change.
     shatters_hm_bridge: bool,
-    /// The Shatters hard mode, late stage: The Source is the secret object
-    /// destroyed in the Alchemy Lab wing; destroying it makes the Twilight
-    /// Archmage Nox the Wild Shadow and carries through to the Forgotten King,
-    /// who becomes King Azamoth. Reset on map change.
+    /// The Shatters hard mode, late stage: The Source is the secret object in
+    /// the Alchemy Lab wing, which is only ever spawned in hard mode; destroying
+    /// it makes the Twilight Archmage Nox the Wild Shadow and carries through to
+    /// the Forgotten King, who becomes King Azamoth. Reset on map change.
     shatters_hm_late: bool,
 }
 
@@ -1020,8 +1020,9 @@ impl CombatTracker {
         let spawn_max_hp = self.objects.get(&object_id).map(|o| o.max_hp).unwrap_or(0);
         self.note_aux_instance(object_id, object_type, spawn_max_hp);
         // The Idol's pool may already be damaged when we first see it (a run we
-        // arrived late to): reading it once is enough to spot hard mode.
-        self.note_shatters_hm_unlock_hp(object_id, 0);
+        // arrived late to), and The Source needs no HP reading at all: the object
+        // itself proves hard mode.
+        self.note_shatters_hm_unlock_object(object_id, 0);
         // A Moonlight Village spirit released at the end of a dance/Umi phase.
         // The server re-adds the same object as it re-enters view, so count each
         // id once per run and credit it to the fight that released it. The
@@ -1111,10 +1112,10 @@ impl CombatTracker {
         //   - the Stone Idol cannot be damaged until the Void Phantasm is
         //     absorbed next to it, which turns The Bridge Sentinel into Valen the
         //     Unbreakable;
-        //   - The Source only exists behind the secret wall past Valen, and
-        //     destroying it turns the Twilight Archmage into Nox the Wild Shadow
-        //     and the Forgotten King into King Azamoth.
-        self.note_shatters_hm_unlock_hp(object_id, previous_hp);
+        //   - The Source only exists in hard mode, and destroying it turns the
+        //     Twilight Archmage into Nox the Wild Shadow and the Forgotten King
+        //     into King Azamoth.
+        self.note_shatters_hm_unlock_object(object_id, previous_hp);
         self.note_aux_instance(object_id, obj_type, obj_max_hp);
         // Rogue Lethal Strike: the buff starts when the local player
         // exits sneak, so open a window on the Invisible condition falling edge.
@@ -1267,7 +1268,7 @@ impl CombatTracker {
 
     /// The hard-mode name of a Shatters boss the group has already unlocked, or
     /// `None` when the boss is not a hard-mode rename (or its unlock object was
-    /// never destroyed). Hard mode is per run, so the bridge and late stages are
+    /// never observed). Hard mode is per run, so the bridge and late stages are
     /// tracked separately: a group that stops after Valen keeps the regular
     /// names for the bosses it never reached.
     pub fn shatters_hm_revealed_name(&self, boss_object_type: i32) -> Option<&'static str> {
@@ -1286,42 +1287,51 @@ impl CombatTracker {
         }
     }
 
-    /// Latch The Shatters' hard-mode stages from an unlock object's HP reading.
+    /// Latch The Shatters' hard-mode stages from an unlock object we can see.
     ///
-    /// Both unlock objects are invulnerable or unreachable until the group
-    /// destroys them, so any damage they show means hard mode -- including a pool
-    /// they had already lost before we arrived (a fight we joined late), which is
-    /// why a reading below max counts, not just a drop since the previous tick.
+    /// The two unlock objects prove hard mode in different ways:
+    ///
+    /// - The Stone Idol is invulnerable outside hard mode -- it only becomes
+    ///   damageable once the Void Phantasm was absorbed next to it -- so any
+    ///   damage it shows means hard mode, including a pool it had already lost
+    ///   before we arrived (a fight we joined late). That is why a reading below
+    ///   max counts, not just a drop since the previous tick. Readings only count
+    ///   while the pool is known, so an object whose HP the server never reports
+    ///   is never mistaken for one that is at zero.
+    /// - The Source is spawned only in hard mode at all, and it sits in the
+    ///   secret wing the group only reaches past the bridge, so merely having it
+    ///   in view proves both stages -- no matter how far away it is, whether its
+    ///   HP is ever reported, or whether its destruction is ever seen.
+    ///
     /// `previous_hp` is the pool before this reading (0 when it is the first we
-    /// get). Readings only count while the pool is known, so an object whose HP
-    /// the server never reports is never mistaken for one that is at zero.
-    fn note_shatters_hm_unlock_hp(&mut self, object_id: i32, previous_hp: i64) {
-        let Some(obj) = self.objects.get(&object_id) else {
+    /// get).
+    fn note_shatters_hm_unlock_object(&mut self, object_id: i32, previous_hp: i64) {
+        let Some(&TrackedObject {
+            object_type,
+            hp,
+            max_hp,
+            ..
+        }) = self.objects.get(&object_id)
+        else {
             return;
         };
-        let obj_type = obj.object_type;
-        let idol = obj_type == crate::assets::SHATTERS_STONE_IDOL_TYPE;
-        let source = obj_type == crate::assets::SHATTERS_THE_SOURCE_TYPE;
-        if !(idol || source)
-            || (idol && self.shatters_hm_bridge)
-            || (source && self.shatters_hm_late)
-        {
+        let idol = object_type == crate::assets::SHATTERS_STONE_IDOL_TYPE;
+        if object_type == crate::assets::SHATTERS_THE_SOURCE_TYPE {
+            self.confirm_shatters_hm_bridge("The Source in view");
+            self.confirm_shatters_hm_late("The Source in view");
             return;
         }
-        let max_hp = obj.max_hp as i64;
+        if !idol || self.shatters_hm_bridge {
+            return;
+        }
+        let (max_hp, new_hp) = (max_hp as i64, hp as i64);
         if max_hp <= 0 {
             return;
         }
-        let new_hp = obj.hp as i64;
         let damaged = new_hp > 0 && new_hp < max_hp;
         let lethal = previous_hp > 0 && new_hp * 10 <= max_hp;
-        if !(damaged || lethal) {
-            return;
-        }
-        if idol {
+        if damaged || lethal {
             self.confirm_shatters_hm_bridge(&format!("Stone Idol at {new_hp}/{max_hp} HP"));
-        } else {
-            self.confirm_shatters_hm_late(&format!("The Source at {new_hp}/{max_hp} HP"));
         }
     }
 
@@ -1477,18 +1487,8 @@ impl CombatTracker {
                 }
             }
         }
-        // The Shatters' The Source is the breakable the group destroys past Valen
-        // to unlock the late hard-mode bosses; it can vanish without its HP ever
-        // being reported, so a removal counts just like damage would. It is only
-        // treated as a hard-mode signal once the bridge stage confirmed the route,
-        // because a plain Shatters instance can also drop it out of view.
-        if self.shatters_hm_bridge
-            && last
-                .as_ref()
-                .is_some_and(|obj| obj.object_type == crate::assets::SHATTERS_THE_SOURCE_TYPE)
-        {
-            self.confirm_shatters_hm_late("The Source removed");
-        }
+        // The Source needs no removal handling: it only ever exists in hard mode,
+        // so having it in view latched the route already.
         // Record a participant departure for death/nexus detection:
         // an object that is currently an attacker in some active fight is leaving
         // view. Snapshot its last-seen position BEFORE it is dropped so a
@@ -8488,21 +8488,26 @@ mod tests {
     }
 
     #[test]
-    fn shatters_the_source_marks_only_the_late_bosses_hard_mode() {
+    fn shatters_the_source_alone_marks_the_whole_run_hard_mode() {
         let mut t = CombatTracker::new();
         t.on_map_change("The Shatters", 777, 0);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
-        hard_mode_idol(&mut t);
 
-        // The Source exists past Valen; destroying it locks the late bosses in.
+        // The Idol was killed before we ever saw it, so the only hard-mode proof
+        // is The Source -- an object that is never spawned outside hard mode. It
+        // is far away and its HP is never reported, which must not matter.
         t.on_object_spawn(
             901,
             crate::assets::SHATTERS_THE_SOURCE_TYPE,
-            &status(901, vec![stat(StatType::HP, 1)]),
+            &status_at(901, 200.0, 200.0, vec![]),
             20,
         );
-        t.on_object_removed(901, 22);
+        assert_eq!(
+            t.shatters_hm_revealed_name(crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE),
+            Some("Valen the Unbreakable"),
+            "seeing the Source proves the bridge stage too"
+        );
 
         let archmage = finish_shatters_fight(
             &mut t,
@@ -8517,6 +8522,34 @@ mod tests {
             finish_shatters_fight(&mut t, 702, crate::assets::SHATTERS_KING_TYPE, 400_000, 300);
         assert_eq!(king.boss_name, "King Azamoth");
         assert!(king.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_the_source_destroyed_in_view_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            901,
+            crate::assets::SHATTERS_THE_SOURCE_TYPE,
+            &status(
+                901,
+                vec![stat(StatType::MaxHP, 30_000), stat(StatType::HP, 1)],
+            ),
+            20,
+        );
+        t.on_object_removed(901, 22);
+
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            100,
+        );
+        assert_eq!(archmage.boss_name, "Nox the Wild Shadow");
+        assert!(archmage.shatters_hm);
     }
 
     #[test]

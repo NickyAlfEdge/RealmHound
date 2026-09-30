@@ -808,9 +808,9 @@ pub fn is_legacy_lod_ivory_boss(object_type: i32) -> bool {
 ///   next to it; damaging it means the run is in hard mode, and its defeat turns
 ///   The Bridge Sentinel into **Valen the Unbreakable**.
 /// - The Source (`0x8242`, `Shatters Experimental Generator`) is the secret
-///   object destroyed in the Alchemy Lab wing; destroying it turns the Twilight
-///   Archmage into **Nox the Wild Shadow** and carries through to the Forgotten
-///   King, who becomes **King Azamoth**.
+///   object destroyed in the Alchemy Lab wing; it is spawned only in hard mode,
+///   and destroying it turns the Twilight Archmage into **Nox the Wild Shadow**
+///   and carries through to the Forgotten King, who becomes **King Azamoth**.
 pub const SHATTERS_STONE_IDOL_TYPE: i32 = 0x8200;
 /// The Bridge Sentinel (The Shatters boss 1).
 pub const SHATTERS_BRIDGE_SENTINEL_TYPE: i32 = 29003;
