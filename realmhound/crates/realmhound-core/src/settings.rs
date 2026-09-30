@@ -364,10 +364,11 @@ pub struct LiveFeedSettings {
     /// Whether a dungeon *opened in the Nexus* -- entered through a dungeon
     /// portal there (a key, or one that had already spawned) or joined into an
     /// instance running on the region's hub server (a party call from a realm) --
-    /// gets `in nex` appended to its callout. Independent of
-    /// [`Self::realm_status`], which covers portals used in a realm; realm
-    /// entries reached from the Nexus keep their own map names and are never
-    /// Nexus entries. Defaults to `false`.
+    /// gets `in nex` appended to its callout. The Vault, Guild Hall and Bazaar
+    /// count as the Nexus, since the game treats dungeons opened in them the same
+    /// way. Independent of [`Self::realm_status`], which covers portals used in a
+    /// realm; realm entries reached from a hub keep their own map names and are
+    /// never Nexus entries. Defaults to `false`.
     #[serde(default)]
     pub opened_in_nexus: bool,
 

@@ -571,10 +571,10 @@ pub struct DungeonEntry {
     /// when it was entered through a realm portal and the realm is still the one
     /// we are tracking. Drives the optional realm-status callout suffix.
     pub realm_score_percent: Option<i32>,
-    /// True when this dungeon was entered from the Nexus -- its portal was used
-    /// there (key or spawn we saw) or the entry was a party-call join with no
-    /// realm instance in play -- which the optional `Opened in Nexus` setting
-    /// names as `in nex`. Drives that suffix on recomputation.
+    /// True when this dungeon was entered from a hub space counted as the Nexus
+    /// (its portal was used there -- key or spawn we saw -- or the party call out
+    /// of one), or later found hosted on the hub server. Drives the optional
+    /// `Opened in Nexus` suffix, in both cases on recomputation.
     pub entered_from_nexus: bool,
     /// True when the join window is estimated rather than anchored to an observed
     /// portal spawn (e.g. joined via a party call). Estimated entries use a
@@ -615,15 +615,22 @@ fn same_modifier(a: &str, b: &str) -> bool {
         == realmhound_core::dungeon_modifiers::canonical(b)
 }
 
-/// Whether a MapInfo map name is the Nexus, the hub a dungeon is opened in with
-/// a key, an already-spawned portal, or a party call (the origins the `Opened in
-/// Nexus` setting names).
+/// Whether a MapInfo map name is a hub space whose portals are Nexus portals:
+/// the Nexus itself plus the Vault, Guild Hall and Bazaar.
 ///
-/// Realm entries reached from the Nexus are not Nexus maps: they report their
-/// own names (Meridian, Hearth, ...) plus a realm score, so a realm portal used
-/// in the Nexus never produces the `in nex` tag.
-fn is_nexus_map(display_name: &str) -> bool {
-    display_name.trim().to_lowercase().starts_with("nexus")
+/// The game counts all of these as the Nexus -- `/server` answers `Nexus` from
+/// inside them and a dungeon entered from one returns the player to the Nexus --
+/// so a portal used in any of them is a Nexus portal. Names arrive as
+/// localization tokens (`{s.nexus}`, `{s.vault}`, `{s.guildhall}`) or resolved
+/// (`Nexus`, `Guild Hall`), so the match is on the raw name either way.
+///
+/// Realm entries reached from a hub are not hub maps: they report their own
+/// names (Meridian, Hearth, ...) plus a realm score, so a realm portal used in
+/// the Nexus never produces the `in nex` tag.
+fn is_hub_map(display_name: &str) -> bool {
+    const HUB_MARKERS: &[&str] = &["nexus", "vault", "guildhall", "guild hall", "bazaar"];
+    let name = display_name.trim().to_ascii_lowercase();
+    HUB_MARKERS.iter().any(|hub| name.contains(hub))
 }
 
 impl DungeonEntry {
@@ -871,17 +878,17 @@ pub struct LiveFeedPanel {
     /// though the realm score stays remembered there. Captured by
     /// [`Self::update_location`] and read by [`Self::push_dungeon`].
     left_from_realm: bool,
-    /// Whether the map the player is standing on is the Nexus. A dungeon opened
+    /// Whether the map the player is standing on is a hub space (the Nexus, the
+    /// Vault, the Guild Hall, the Bazaar -- see [`is_hub_map`]). A dungeon opened
     /// there (a portal or a key) is what [`Self::opened_in_nexus`] names; realm
-    /// entries reached from the Nexus keep their own map names (Meridian,
-    /// Hearth, ...) and are never Nexus entries. Set by
-    /// [`Self::update_location`].
-    map_is_nexus: bool,
-    /// Whether the map this location update replaced was the Nexus. Only an
-    /// immediately preceding Nexus counts, so a dungeon entered from a realm
-    /// (or from another dungeon) is never labelled `in nex`. Captured by
+    /// entries reached from a hub keep their own map names (Meridian, Hearth,
+    /// ...) and are never Nexus entries. Set by [`Self::update_location`].
+    map_is_hub: bool,
+    /// Whether the map this location update replaced was a hub space. Only an
+    /// immediately preceding hub counts, so a dungeon entered from a realm (or
+    /// from another dungeon) is never labelled `in nex`. Captured by
     /// [`Self::update_location`] and read by [`Self::push_dungeon`].
-    left_from_nexus: bool,
+    left_from_hub: bool,
     /// Countdown expiry to the castle teleport after a realm close.
     /// `None` when no realm-close countdown is active. Cleared on a fresh realm
     /// entry, hub entry, or disconnect; kept running while diving into a
@@ -1108,8 +1115,8 @@ impl LiveFeedPanel {
             left_from_dungeon: false,
             map_is_realm: false,
             left_from_realm: false,
-            map_is_nexus: false,
-            left_from_nexus: false,
+            map_is_hub: false,
+            left_from_hub: false,
             castle_timer_expires_at: None,
             realm_closed: false,
             // Dust status bar state
@@ -1690,11 +1697,12 @@ impl LiveFeedPanel {
         // score for, so the Oryx areas, hubs and dungeons all clear this.
         self.left_from_realm = self.map_is_realm;
         self.map_is_realm = in_realm;
-        // The Nexus is the hub a dungeon can be opened in with a key or a portal.
-        // Realm entries reached from it are not Nexus entries: they report their
-        // own map name (Meridian, Hearth, ...) and a realm score.
-        self.left_from_nexus = self.map_is_nexus;
-        self.map_is_nexus = is_nexus_map(display_name);
+        // A hub space (Nexus/Vault/Guild Hall/Bazaar) is where a dungeon can be
+        // opened with a key or a portal. Realm entries reached from one are not
+        // hub entries: they report their own map name (Meridian, Hearth, ...) and
+        // a realm score.
+        self.left_from_hub = self.map_is_hub;
+        self.map_is_hub = is_hub_map(display_name);
 
         // Parse realm name from realm_name field (e.g., "NexusPortal.Medusa" -> "Medusa")
         // Server name comes from IP lookup, not from this field
@@ -1785,8 +1793,8 @@ impl LiveFeedPanel {
         self.left_from_dungeon = false;
         self.map_is_realm = false;
         self.left_from_realm = false;
-        self.map_is_nexus = false;
-        self.left_from_nexus = false;
+        self.map_is_hub = false;
+        self.left_from_hub = false;
         self.castle_timer_expires_at = None;
         self.realm_closed = false;
         self.crystal_pin = None;
@@ -2334,13 +2342,14 @@ impl LiveFeedPanel {
         };
         let realm_status = self.realm_status_suffix(realm_score_percent);
         // Named origin of the call, resolved in the same slot as the realm status
-        // (a dungeon is opened either in a realm or in the Nexus, never both). The
-        // map we came *from* decides it, which covers both ways a dungeon is
-        // opened in the Nexus: using a dungeon portal (key or already-spawned)
-        // seen there, and joining a party call while no realm instance was in
-        // play. Realm entries reached from the Nexus keep their own map names
-        // (Meridian, Hearth, ...), so they never set this.
-        let entered_from_nexus = self.left_from_nexus;
+        // (a dungeon is opened either in a realm or at the Nexus, never both). The
+        // map we came *from* decides it: a portal used in a hub space (Nexus,
+        // Vault, Guild Hall, Bazaar) or a party call out of one. Realm entries
+        // reached from a hub keep their own map names (Meridian, Hearth, ...), so
+        // they never set this. A party call into an instance that runs on the hub
+        // host is caught later, once its host is identified (see
+        // [`Self::note_hub_hosted_dungeon`]).
+        let entered_from_nexus = self.left_from_hub;
         let origin_status = match realm_status {
             Some(status) => Some(status),
             None if entered_from_nexus && self.opened_in_nexus => Some("in nex".to_string()),
@@ -7054,6 +7063,33 @@ mod tests {
         panel.pending_portal_spawn = Some(std::time::Instant::now());
         enter_dungeon(&mut panel, 1, "Snake Pit");
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // The other hub spaces count as the Nexus for this: a key popped in the
+        // Vault (or the Guild Hall, or the Bazaar) opened the dungeon at the
+        // Nexus too, and the game returns the player to the Nexus from it.
+        for hub in ["{s.vault}", "{s.guildhall}", "Bazaar"] {
+            let mut panel = LiveFeedPanel::new();
+            panel.update_location(hub, hub, 0, 0);
+            panel.opened_in_nexus = true;
+            panel.pending_portal_spawn = Some(std::time::Instant::now());
+            enter_dungeon(&mut panel, 1, "Snake Pit");
+            assert_eq!(
+                newest_callout(&panel).as_deref(),
+                Some("snake in nex"),
+                "{hub} counts as the nexus"
+            );
+        }
+
+        // ...but the Oryx endgame areas do not, even though they are hubs of a
+        // sort: a dungeon keyed open in the castle is not a Nexus entry.
+        for oryx in ["{s.oryx_s_castle}", "{s.wine_cellar}"] {
+            let mut panel = LiveFeedPanel::new();
+            panel.update_location(oryx, oryx, 0, 0);
+            panel.opened_in_nexus = true;
+            panel.pending_portal_spawn = Some(std::time::Instant::now());
+            enter_dungeon(&mut panel, 1, "Snake Pit");
+            assert_eq!(newest_callout(&panel).as_deref(), Some("snake"), "{oryx}");
+        }
 
         // A realm entered from the Nexus is not a dungeon call at all, and the
         // Nexus origin must not survive the visit: a dungeon entered from that

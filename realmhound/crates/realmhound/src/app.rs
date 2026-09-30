@@ -4100,8 +4100,8 @@ impl RealmHoundApp {
                         "Append \"in nex\" to calls for dungeons opened in the Nexus: entered \
                          through a portal there (a key, or one already spawned), or joined into \
                          an instance that runs on the Nexus server (a party call from a realm). \
-                         Realms entered from the Nexus (Meridian, Hearth, ...) are never Nexus \
-                         entries.",
+                         The Vault, Guild Hall and Bazaar count as the Nexus. Realms entered \
+                         from a hub (Meridian, Hearth, ...) are never Nexus entries.",
                     )
                     .changed();
 
