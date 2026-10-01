@@ -103,35 +103,45 @@ fn boss_row_hp_label(
     }
 }
 
+/// The run-level modes a dungeon card is tagged with, in the order the title
+/// lists them. A mode is only ever set for the dungeon that has it (Leisure and
+/// Petless for Moonlight Village, hard mode for The Shatters and Spectral
+/// Penitentiary), so the tags never mix in practice.
+#[derive(Default, Clone, Copy)]
+struct RunModes {
+    /// Moonlight Village's Leisurely Mode: a Tofu Delicacy was consumed.
+    leisurely: bool,
+    /// Moonlight Village's Challenge Mode: the local player whacked the
+    /// Challenge Gate and lost their pet to a permanent stasis.
+    petless: bool,
+    /// The dungeon's hard mode: The Shatters' Stone Idol route, or Spectral
+    /// Penitentiary's objective-cleared mini-boss taunts.
+    hard_mode: bool,
+}
+
 /// The dungeon name shown as a card/header title, with the modes the run was
 /// played in as tags. Moonlight Village marks a Leisurely run (a Tofu Delicacy
 /// was consumed: shorter phases, reduced loot) and a Petless one (the local
 /// player whacked the Challenge Gate, which pet-stasises them for the run) --
-/// neither is comparable with a normal clear. The Shatters marks hard mode the
-/// same way, since its renamed bosses and extra mechanics make it a different
-/// fight.
-fn dungeon_display_name(
-    portal_map: &DungeonPortalMap,
-    dungeon: &str,
-    leisurely: bool,
-    petless: bool,
-    shatters_hm: bool,
-) -> String {
+/// neither is comparable with a normal clear. The Shatters and Spectral
+/// Penitentiary mark hard mode the same way, since its extra mechanics (and, in
+/// the Shatters, its renamed bosses) make it a different fight.
+fn dungeon_display_name(portal_map: &DungeonPortalMap, dungeon: &str, modes: RunModes) -> String {
     let name = portal_map.normalize_dungeon_name(dungeon);
-    let mut modes: Vec<&str> = Vec::new();
-    if leisurely {
-        modes.push("Leisure");
+    let mut tags: Vec<&str> = Vec::new();
+    if modes.leisurely {
+        tags.push("Leisure");
     }
-    if petless {
-        modes.push("Petless");
+    if modes.petless {
+        tags.push("Petless");
     }
-    if shatters_hm {
-        modes.push("HM");
+    if modes.hard_mode {
+        tags.push("HM");
     }
-    if modes.is_empty() {
+    if tags.is_empty() {
         name
     } else {
-        format!("{name} ({})", modes.join(", "))
+        format!("{name} ({})", tags.join(", "))
     }
 }
 
@@ -1847,9 +1857,11 @@ impl CombatHistoryPanel {
                 let dungeon_title = dungeon_display_name(
                     portal_map,
                     &fight.dungeon,
-                    fight.leisurely,
-                    fight.petless,
-                    fight.shatters_hm,
+                    RunModes {
+                        leisurely: fight.leisurely,
+                        petless: fight.petless,
+                        hard_mode: fight.shatters_hm || fight.spectral_hm,
+                    },
                 );
                 if resp
                     .hover_tip(format!("{}\n(Click to filter)", dungeon_label))
@@ -2476,9 +2488,11 @@ impl CombatHistoryPanel {
                                 dungeon_display_name(
                                     portal_map,
                                     &fight.dungeon,
-                                    fight.leisurely,
-                                    fight.petless,
-                                    fight.shatters_hm,
+                                    RunModes {
+                                        leisurely: fight.leisurely,
+                                        petless: fight.petless,
+                                        hard_mode: fight.shatters_hm || fight.spectral_hm,
+                                    },
                                 ),
                                 datetime_s,
                             ))
@@ -3582,9 +3596,11 @@ impl CombatHistoryPanel {
                                 dungeon_display_name(
                                     portal_map,
                                     &enc.dungeon,
-                                    enc.leisurely,
-                                    enc.petless,
-                                    enc.shatters_hm,
+                                    RunModes {
+                                        leisurely: enc.leisurely,
+                                        petless: enc.petless,
+                                        hard_mode: enc.shatters_hm || enc.spectral_hm,
+                                    },
                                 ),
                                 datetime_s,
                             ))
@@ -3943,7 +3959,7 @@ fn assign_drops_exclusive(
 mod tests {
     use super::{
         assign_drops_exclusive, boss_bar_label, boss_row_hp_label, boss_row_stats_parts,
-        dungeon_display_name, share_hp_pool, spirit_total_label,
+        dungeon_display_name, share_hp_pool, spirit_total_label, RunModes,
     };
     use realmhound_core::assets::get_dungeon_portal_map;
 
@@ -4008,36 +4024,44 @@ mod tests {
     #[test]
     fn run_modes_are_appended_to_the_dungeon_name() {
         let portal_map = get_dungeon_portal_map();
+        let modes = |leisurely: bool, petless: bool, hard_mode: bool| RunModes {
+            leisurely,
+            petless,
+            hard_mode,
+        };
         // Moonlight Village's modes, in the order the card lists them.
         assert_eq!(
-            dungeon_display_name(portal_map, "Moonlight Village", true, false, false),
+            dungeon_display_name(portal_map, "Moonlight Village", modes(true, false, false)),
             "Moonlight Village (Leisure)"
         );
         assert_eq!(
-            dungeon_display_name(portal_map, "Moonlight Village", true, true, false),
+            dungeon_display_name(portal_map, "Moonlight Village", modes(true, true, false)),
             "Moonlight Village (Leisure, Petless)"
         );
         assert_eq!(
-            dungeon_display_name(portal_map, "Moonlight Village", false, true, false),
+            dungeon_display_name(portal_map, "Moonlight Village", modes(false, true, false)),
             "Moonlight Village (Petless)"
         );
         assert_eq!(
-            dungeon_display_name(portal_map, "Moonlight Village", false, false, false),
+            dungeon_display_name(portal_map, "Moonlight Village", modes(false, false, false)),
             "Moonlight Village"
         );
-        // Every other dungeon ignores the Moonlight Village flags (they are never
-        // set for them), and hard mode still appends on its own.
-        assert_eq!(
-            dungeon_display_name(portal_map, "The Shatters", false, false, false),
-            "The Shatters"
-        );
-        assert_eq!(
-            dungeon_display_name(portal_map, "The Shatters", false, false, true),
-            "The Shatters (HM)"
-        );
+        // Every other dungeon ignores the Moonlight Village modes (they are never
+        // set for them), and hard mode appends on its own. Spectral
+        // Penitentiary's hard mode is the same tag as the Shatters'.
+        for dungeon in ["The Shatters", "Spectral Penitentiary"] {
+            assert_eq!(
+                dungeon_display_name(portal_map, dungeon, modes(false, false, false)),
+                dungeon
+            );
+            assert_eq!(
+                dungeon_display_name(portal_map, dungeon, modes(false, false, true)),
+                format!("{dungeon} (HM)")
+            );
+        }
         // The run-level modes are independent and can combine.
         assert_eq!(
-            dungeon_display_name(portal_map, "The Shatters", true, true, true),
+            dungeon_display_name(portal_map, "The Shatters", modes(true, true, true)),
             "The Shatters (Leisure, Petless, HM)"
         );
     }

@@ -2207,8 +2207,10 @@ impl PacketProcessor {
                 }
 
                 // Boss taunts drive the Marble Colossus survival-phase split off
-                // its authoritative second-coming taunt (the object id ties the
-                // taunt to the boss's fight, so no fuzzy matching is needed).
+                // its authoritative second-coming taunt, Moonlight Village's
+                // completion and Spectral Penitentiary's hard mode off its
+                // mini-bosses' objective-cleared lines (the object id ties the
+                // taunt to the boss's fight where needed).
                 self.combat
                     .on_boss_text(text.object_id, &text.text, now_ms());
 

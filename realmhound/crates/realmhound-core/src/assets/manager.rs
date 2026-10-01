@@ -708,6 +708,91 @@ pub fn is_mv_leisurely_mode_notification(message: &str) -> bool {
 /// hit to label the run "Petless".
 pub const MV_CHALLENGE_GATE_TYPE: i32 = 0x5049;
 
+/// Spectral Penitentiary's mini-bosses, by the catalog name their fight rows
+/// carry. Two of them guard every run, and both must be hard mode for the run
+/// to be (see [`SPECTRAL_HM_TAUNTS`] and [`is_spectral_murcian`]).
+pub const SPECTRAL_ZOLE_NAME: &str = "Griefkeeper Zole";
+pub const SPECTRAL_LOBOTOMIK_NAME: &str = "Doctor Lobotomik";
+pub const SPECTRAL_OCULON_NAME: &str = "Overseer Oculon";
+pub const SPECTRAL_GRETCH_NAME: &str = "Groundskeeper Gretch";
+
+/// Spectral Penitentiary's boss roster, and the taunt each mini-boss shouts when
+/// the group cleared *every* objective of its wing -- which the game only lets
+/// happen in the dungeon's hard mode. The taunts arrive verbatim as dialogue
+/// (`Text` packets) from the boss, so they are matched by text; the boss names
+/// are the catalog names the fight rows carry.
+///
+/// Verified against captured traffic (`.rhcap` replay): each string below was
+/// observed as an incoming `Text` packet from the boss in question.
+pub const SPECTRAL_HM_TAUNTS: &[(&str, &str)] = &[
+    (
+        SPECTRAL_ZOLE_NAME,
+        "RRRAAAGGH! Isn't it a bit too early for you to be causing a riot? You just got here!",
+    ),
+    (
+        SPECTRAL_LOBOTOMIK_NAME,
+        "WAIT WAIT WAIT! How did you deactivate all of those pylons so quickly?",
+    ),
+    (
+        SPECTRAL_OCULON_NAME,
+        "FINE, I'LL MOVE UP YOUR APPOINTMENT ON MY LIST. MAKE YOUR WAY TOWARDS MY OFFICE THIS INSTANT, AND PLEASE STOP DESTROYING MY EYELONS.",
+    ),
+    (
+        SPECTRAL_GRETCH_NAME,
+        "Calm yourselves, new souls! Come hither, and I will make sure your restlessness is properly handled...",
+    ),
+];
+
+/// The Spectral Penitentiary boss that shouted its hard-mode taunt, or `None`
+/// when `text` is any other line.
+pub fn spectral_hm_taunt_boss(text: &str) -> Option<&'static str> {
+    let line = text.trim();
+    SPECTRAL_HM_TAUNTS
+        .iter()
+        .find(|(_, taunt)| taunt.eq_ignore_ascii_case(line))
+        .map(|(boss, _)| *boss)
+}
+
+/// The object types each taunting mini-boss fights as. A fight is keyed by the
+/// type of the object it tracked, and only some of these carry a usable catalog
+/// name, so the taunt is tied to the boss's own card by type.
+///
+/// Types are the real ones seen in the combat history of the dungeon, including
+/// Doctor Lobotomik's separate transformation forms and the types the loot
+/// tracker attributes to Griefkeeper Zole.
+pub const SPECTRAL_HM_BOSS_TYPES: &[(&str, &[i32])] = &[
+    (
+        SPECTRAL_ZOLE_NAME,
+        &[23659, 23915, 23916, 41482, 44410, 44411],
+    ),
+    (
+        SPECTRAL_LOBOTOMIK_NAME,
+        &[23920, 23934, 23935, 23958, 23959, 23960, 23961],
+    ),
+    (SPECTRAL_OCULON_NAME, &[24071]),
+    (SPECTRAL_GRETCH_NAME, &[23819]),
+];
+
+/// The taunting Spectral Penitentiary mini-boss that fights as `object_type`, or
+/// `None` for any other object (see [`SPECTRAL_HM_BOSS_TYPES`]).
+pub fn spectral_hm_taunt_boss_of_type(object_type: i32) -> Option<&'static str> {
+    SPECTRAL_HM_BOSS_TYPES
+        .iter()
+        .find(|(_, types)| types.contains(&object_type))
+        .map(|(boss, _)| *boss)
+}
+
+/// Spectral Penitentiary's final boss, Soulwarden Murcian. He has no hard-mode
+/// taunt of his own: the dungeon is hard mode exactly when both of the run's
+/// mini-bosses were (which the game then applies to him too).
+pub const SPECTRAL_MURCIAN_TYPE: i32 = 23681;
+
+/// Whether `id` is Spectral Penitentiary's final boss (see
+/// [`SPECTRAL_MURCIAN_TYPE`]).
+pub fn is_spectral_murcian(id: i32) -> bool {
+    id == SPECTRAL_MURCIAN_TYPE
+}
+
 /// Moonlight Village spirit object ("MV Total Counter"). One instance spawns per
 /// spirit released at the end of a dance (or Umi) phase -- always in pairs and
 /// up to 8 per phase -- so the number of distinct instances observed in a run is
@@ -4746,6 +4831,51 @@ mod tests {
         // Gretch and Zole are deliberately NOT curated (plain auto-detected fights).
         assert!(encounter_for_boss_type(23819).is_none()); // Gretch
         assert!(encounter_for_boss_type(23659).is_none()); // Zole
+    }
+
+    #[test]
+    fn spectral_hm_taunts_map_to_the_bosses_own_fight_types() {
+        // Every taunt line names a boss, and every boss fights as at least one
+        // of the types we know, so a latched taunt can be tied to the boss's own
+        // card (the card is keyed by object type).
+        for (boss, taunt) in SPECTRAL_HM_TAUNTS {
+            assert_eq!(spectral_hm_taunt_boss(taunt), Some(*boss));
+            assert!(
+                SPECTRAL_HM_BOSS_TYPES.iter().any(|(name, _)| name == boss),
+                "{boss} has no fight types"
+            );
+        }
+        // The types the combat history of the dungeon carries, including
+        // Lobotomik's transformation forms.
+        assert_eq!(
+            spectral_hm_taunt_boss_of_type(23659),
+            Some(SPECTRAL_ZOLE_NAME)
+        );
+        assert_eq!(
+            spectral_hm_taunt_boss_of_type(24071),
+            Some(SPECTRAL_OCULON_NAME)
+        );
+        assert_eq!(
+            spectral_hm_taunt_boss_of_type(23819),
+            Some(SPECTRAL_GRETCH_NAME)
+        );
+        for form in [23920, 23958, 23959, 23960, 23961, 23934, 23935] {
+            assert_eq!(
+                spectral_hm_taunt_boss_of_type(form),
+                Some(SPECTRAL_LOBOTOMIK_NAME)
+            );
+        }
+        // Murcian has no taunt: he is hard mode only through the others.
+        assert!(!SPECTRAL_HM_TAUNTS.iter().any(|(_, t)| t.is_empty()));
+        assert_eq!(spectral_hm_taunt_boss_of_type(SPECTRAL_MURCIAN_TYPE), None);
+        // Unrelated objects are never mistaken for a taunting mini-boss.
+        assert_eq!(spectral_hm_taunt_boss_of_type(23509), None); // Eyesmall
+        assert_eq!(spectral_hm_taunt_boss_of_type(23804), None); // Spectral Key
+                                                                 // Case and surrounding whitespace in the dialogue are tolerated.
+        assert_eq!(
+            spectral_hm_taunt_boss(&SPECTRAL_HM_TAUNTS[1].1.to_uppercase()),
+            Some(SPECTRAL_LOBOTOMIK_NAME)
+        );
     }
 
     #[test]

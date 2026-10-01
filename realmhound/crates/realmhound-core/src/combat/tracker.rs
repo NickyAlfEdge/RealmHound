@@ -187,6 +187,13 @@ struct PetTrack {
 /// Max distance (tiles) between a pet and a player for a proximity vote to count.
 const PET_ASSOC_MAX_DIST: f32 = 8.0;
 
+/// How many Spectral Penitentiary mini-bosses must have taunted (cleared every
+/// objective) for Soulwarden Murcian -- and therefore the dungeon -- to be in
+/// hard mode. His fight is hard mode only when both of the run's mini-bosses
+/// were: one is not enough, so a single hard-mode mini-boss leaves the run
+/// regular.
+const SPECTRAL_HM_BOSSES_REQUIRED: usize = 2;
+
 /// Max distance (tiles) between the local player and The Shatters' Stone Idol
 /// for its removal to count as a destruction rather than a view cull. The
 /// server drops an object from our world only once it leaves the view, which is
@@ -751,6 +758,12 @@ pub struct CombatTracker {
     /// gate itself is a curated non-boss and never becomes a fight, so this latch
     /// is the only trace it leaves. Reset on map change.
     mv_petless: bool,
+    /// The Spectral Penitentiary mini-bosses that shouted their hard-mode taunt
+    /// this instance (the taunt only plays when every objective of their wing was
+    /// cleared). Kept per instance: the dungeon is hard mode only when both of
+    /// the run's mini-bosses were, which then applies to Soulwarden Murcian too.
+    /// Reset on map change.
+    spectral_hm_bosses: HashSet<&'static str>,
     /// The Shatters hard mode, stage: the Stone Idol only becomes damageable
     /// once the Void Phantasm was absorbed next to it, so real HP loss on it
     /// means the run is in hard mode and the Bridge Sentinel will be Valen the
@@ -826,6 +839,7 @@ impl CombatTracker {
             mv_boss_engaged: false,
             mv_leisurely: false,
             mv_petless: false,
+            spectral_hm_bosses: HashSet::new(),
             shatters_hm_bridge: false,
             shatters_hm_late: false,
             shatters_idol_seen: false,
@@ -929,6 +943,7 @@ impl CombatTracker {
         self.mv_boss_engaged = false;
         self.mv_leisurely = false;
         self.mv_petless = false;
+        self.spectral_hm_bosses.clear();
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
         self.shatters_idol_seen = false;
@@ -976,6 +991,7 @@ impl CombatTracker {
         self.mv_boss_engaged = false;
         self.mv_leisurely = false;
         self.mv_petless = false;
+        self.spectral_hm_bosses.clear();
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
         self.shatters_idol_seen = false;
@@ -1254,6 +1270,16 @@ impl CombatTracker {
         text: &str,
         time_ms: i64,
     ) -> Vec<CompletedFight> {
+        // Spectral Penitentiary: a mini-boss shouts its hard-mode taunt only when
+        // every objective of its wing was cleared, so the line itself proves that
+        // boss was hard mode. Latched for the instance; Murcian's own mode is
+        // inferred from these latches when his fight ends.
+        if let Some(boss) = crate::assets::spectral_hm_taunt_boss(text) {
+            if self.spectral_hm_bosses.insert(boss) {
+                tracing::info!("[SPECTRAL_HM] hard mode: {boss} cleared its objectives");
+            }
+            return Vec::new();
+        }
         // Moonlight Village: the dancers announce the dance is over just before
         // the clear loot lands. This is the earliest completion signal, so the
         // dancer fights are scored here rather than at the (start-of-encounter)
@@ -2903,6 +2929,23 @@ impl CombatTracker {
         };
 
         let dungeon = normalize_dungeon(&self.current_map);
+        // Spectral Penitentiary's hard mode is a property of the run, inferred
+        // from its mini-bosses' objective-cleared taunts (see
+        // [`Self::on_boss_text`]): a mini-boss carries the mode when it taunted,
+        // and Soulwarden Murcian -- who has no taunt of his own -- carries it only
+        // when both mini-bosses did, which is what makes the dungeon hard mode.
+        // Marking his row is what the card's "(HM)" tag reads.
+        let spectral_hm = if crate::assets::is_spectral_murcian(fight.boss_object_type) {
+            self.spectral_hm_bosses.len() >= SPECTRAL_HM_BOSSES_REQUIRED
+        } else {
+            // The type is what ties a latched taunt to this boss's own card; the
+            // name is a fallback for a form carrying an unexpected type.
+            let taunted = crate::assets::spectral_hm_taunt_boss_of_type(fight.boss_object_type);
+            let name = boss_name.trim();
+            self.spectral_hm_bosses
+                .iter()
+                .any(|boss| Some(*boss) == taunted || boss.eq_ignore_ascii_case(name))
+        };
         // Some bosses fought from the realm belong to a rated dungeon the raw
         // map name doesn't reflect (Oryx the Mad God 2 -> Wine Cellar). Remap so
         // the fight classifies by that dungeon's difficulty and shows its card.
@@ -3037,6 +3080,7 @@ impl CombatTracker {
             spirits: fight.spirits,
             leisurely: self.mv_leisurely,
             petless: self.mv_petless,
+            spectral_hm,
             shatters_hm,
             participants,
         };
@@ -8373,6 +8417,68 @@ mod tests {
         let next = t.on_boss_text(600, "This concludes the Moonlight Dance.", 1300);
         assert_eq!(next.len(), 1);
         assert!(!next[0].petless, "a later normal run is not Petless");
+    }
+
+    // Spectral Penitentiary: a mini-boss's objective-cleared taunt marks that
+    // boss hard mode, and Soulwarden Murcian is hard mode only when both
+    // mini-bosses were -- which is what makes the dungeon hard mode.
+    #[test]
+    fn spectral_mini_taunts_decide_murcian_hard_mode() {
+        let zole = crate::assets::SPECTRAL_HM_TAUNTS[0];
+        let lobotomik = crate::assets::SPECTRAL_HM_TAUNTS[1];
+
+        // Only one mini-boss cleared its objectives: Murcian stays regular, so
+        // the run is not hard mode even though a boss was.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Spectral Penitentiary", 7, 0);
+        t.on_player_loaded(1000, 7);
+        t.on_boss_text(500, zole.1, 100);
+        let zole_fight = finish_shatters_fight(&mut t, 500, 23659, 300_000, 150);
+        assert!(zole_fight.spectral_hm, "Zole taunted, so Zole is HM");
+        let murcian = finish_shatters_fight(&mut t, 600, 23681, 400_000, 200);
+        assert!(
+            !murcian.spectral_hm,
+            "one hard-mode mini-boss is not enough for Murcian"
+        );
+
+        // Both mini-bosses taunted: Murcian is hard mode, so is the run. A
+        // repeated taunt from the same boss must not count twice.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Spectral Penitentiary", 7, 0);
+        t.on_player_loaded(1000, 7);
+        t.on_boss_text(500, zole.1, 100);
+        t.on_boss_text(600, lobotomik.1, 110);
+        t.on_boss_text(700, zole.1, 120);
+        let zole_fight = finish_shatters_fight(&mut t, 500, 23659, 300_000, 150);
+        assert!(zole_fight.spectral_hm);
+        let lobo_fight = finish_shatters_fight(&mut t, 600, 23920, 300_000, 160);
+        assert!(lobo_fight.spectral_hm);
+        let murcian = finish_shatters_fight(&mut t, 700, 23681, 400_000, 200);
+        assert!(murcian.spectral_hm, "both mini-bosses were hard mode");
+
+        // The mode is per instance: the next run starts regular.
+        t.on_map_change("Spectral Penitentiary", 8, 500);
+        let next = finish_shatters_fight(&mut t, 800, 23681, 400_000, 600);
+        assert!(!next.spectral_hm, "a later run is not hard mode");
+    }
+
+    // A regular (non-hard-mode) line is never mistaken for a taunt.
+    #[test]
+    fn spectral_hm_taunts_are_exact() {
+        let zole = crate::assets::SPECTRAL_HM_TAUNTS[0];
+        assert_eq!(crate::assets::spectral_hm_taunt_boss(zole.1), Some(zole.0));
+        // Surrounding whitespace and case are tolerated.
+        assert_eq!(
+            crate::assets::spectral_hm_taunt_boss(&format!("  {}  ", zole.1.to_uppercase())),
+            Some(zole.0)
+        );
+        // The line Zole opens the fight with is not the taunt.
+        assert_eq!(
+            crate::assets::spectral_hm_taunt_boss(
+                "Pick cells that aren't already taken you imbeciles!"
+            ),
+            None
+        );
     }
 
     // Only the local player's own hit counts: a teammate ringing the gate makes

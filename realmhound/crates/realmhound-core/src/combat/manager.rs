@@ -657,6 +657,7 @@ mod tests {
             spirits: 0,
             leisurely: false,
             petless: false,
+            spectral_hm: false,
             shatters_hm: false,
             participants,
         }

@@ -319,6 +319,11 @@ pub struct CompletedFight {
     /// attacked the Challenge Gate, which pet-stasises them for the run). False
     /// for every other dungeon.
     pub petless: bool,
+    /// Whether this Spectral Penitentiary fight was hard mode: a mini-boss is
+    /// hard mode when it shouted its objective-cleared taunt, and Soulwarden
+    /// Murcian when both of the run's mini-bosses were. The dungeon is hard mode
+    /// exactly when Murcian's row is; false for every other dungeon.
+    pub spectral_hm: bool,
     /// Whether this Shatters fight happened in hard mode, i.e. the group
     /// destroyed the Stone Idol (or The Source) that unlocks the renamed
     /// bosses. Only meaningful for The Shatters' main bosses; false otherwise.
