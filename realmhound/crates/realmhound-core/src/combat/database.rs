@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 54;
+pub const SCHEMA_VERSION: i32 = 55;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -78,6 +78,11 @@ pub struct FightRecord {
     /// Tofu Delicacy was consumed). False for every other dungeon and for rows
     /// recorded before the mode was tracked.
     pub leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode (they
+    /// whacked the Challenge Gate, which pet-stasises them for the run). False
+    /// for every other dungeon and for rows recorded before the mode was
+    /// tracked.
+    pub petless: bool,
     /// Whether the fight was a Shatters hard-mode variant (the renamed bosses
     /// are revealed only in hard mode). False for every other dungeon and for
     /// rows recorded before the mode was tracked.
@@ -132,6 +137,9 @@ pub struct EncounterRecord {
     /// Whether the run was played in Moonlight Village's Leisurely Mode (a Tofu
     /// Delicacy was consumed). False for every other dungeon.
     pub leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode (they
+    /// whacked the Challenge Gate). False for every other dungeon.
+    pub petless: bool,
     /// Whether the run was played in The Shatters' hard mode. False for every
     /// other dungeon.
     pub shatters_hm: bool,
@@ -350,6 +358,11 @@ pub struct FightSummary {
     /// False for every other dungeon; set for the whole run when any of its
     /// phases recorded it.
     pub leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode (they
+    /// whacked the Challenge Gate and lost their pet to a permanent stasis),
+    /// which makes the run harder. False for every other dungeon; set for the
+    /// whole run when any of its phases recorded it.
+    pub petless: bool,
     /// Whether the run was played in The Shatters' hard mode. False for every
     /// other dungeon; set for the whole run when any of its phases recorded it.
     pub shatters_hm: bool,
@@ -1306,6 +1319,18 @@ impl CombatDatabase {
                 ],
             )?;
             self.conn.execute_batch("PRAGMA user_version = 54")?;
+        }
+        if from_version < 55 {
+            // v54 -> v55: whether the local player took Moonlight Village's
+            // Challenge Mode (they attacked the Challenge Gate, which pet-stasises
+            // them for the run). The card labels such a run "Petless". Legacy rows
+            // default to 0 (the mode was never captured).
+            if !self.column_exists("fights", "petless")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN petless INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 55")?;
         }
         Ok(())
     }
@@ -2280,6 +2305,7 @@ impl CombatDatabase {
                 joined_late INTEGER NOT NULL DEFAULT 0,
                 spirits INTEGER NOT NULL DEFAULT 0,
                 leisurely INTEGER NOT NULL DEFAULT 0,
+                petless INTEGER NOT NULL DEFAULT 0,
                 shatters_hm INTEGER NOT NULL DEFAULT 0
             );
 
@@ -2405,8 +2431,9 @@ impl CombatDatabase {
                (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
-                dungeon_entered_at, reached_zero, joined_late, spirits, leisurely, shatters_hm)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)"#,
+                dungeon_entered_at, reached_zero, joined_late, spirits, leisurely, petless,
+                shatters_hm)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -2429,6 +2456,7 @@ impl CombatDatabase {
                 fight.joined_late as i32,
                 fight.spirits,
                 fight.leisurely as i32,
+                fight.petless as i32,
                 fight.shatters_hm as i32,
             ],
         )?;
@@ -2512,7 +2540,7 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, shatters_hm
+                      leisurely, petless, shatters_hm
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -2542,7 +2570,8 @@ impl CombatDatabase {
             dungeon_entered_at: row.get(14)?,
             spirits: row.get(15)?,
             leisurely: row.get::<_, i32>(16)? != 0,
-            shatters_hm: row.get::<_, i32>(17)? != 0,
+            petless: row.get::<_, i32>(17)? != 0,
+            shatters_hm: row.get::<_, i32>(18)? != 0,
             participants: Vec::new(),
         })
     }
@@ -3067,7 +3096,7 @@ impl CombatDatabase {
                          WHERE p.fight_id = f.id AND p.is_local = 1 LIMIT 1),
                       (SELECT p.end_status FROM fight_participants p
                          WHERE p.fight_id = f.id AND p.is_local = 1 LIMIT 1),
-                      f.map_seed, f.local_close_calls, f.leisurely, f.shatters_hm
+                      f.map_seed, f.local_close_calls, f.leisurely, f.petless, f.shatters_hm
                FROM fights f"#,
         );
         let mut conds: Vec<String> = vec!["f.encounter_run_id IS NULL".to_string()];
@@ -3123,7 +3152,8 @@ impl CombatDatabase {
                 last_hero_standing: false,
                 most_damage_taken: false,
                 leisurely: row.get::<_, i32>(18)? != 0,
-                shatters_hm: row.get::<_, i32>(19)? != 0,
+                petless: row.get::<_, i32>(19)? != 0,
+                shatters_hm: row.get::<_, i32>(20)? != 0,
             })
         })?;
         rows.collect()
@@ -3311,24 +3341,27 @@ impl CombatDatabase {
             })?
             .collect::<SqlResult<_>>()?;
 
-        // Leisurely Mode is recorded per phase but applies to the whole run (the
-        // mode is toggled once, before any boss), so a run is labelled when any
-        // of its phases carries it.
+        // Leisurely Mode and Challenge Mode's pet stasis are recorded per phase
+        // but apply to the whole run (each is activated once, before any boss), so
+        // a run is labelled when any of its phases carries it.
         let leisurely_sql = format!(
-            "SELECT encounter_run_id, MAX(leisurely) FROM fights
+            "SELECT encounter_run_id, MAX(leisurely), MAX(petless) FROM fights
              WHERE encounter_run_id IN ({placeholders})
              GROUP BY encounter_run_id"
         );
         let mut stmt = self.conn.prepare(&leisurely_sql)?;
-        let leisurely_runs: HashMap<String, bool> = stmt
+        let leisurely_runs: HashMap<String, (bool, bool)> = stmt
             .query_map(rusqlite::params_from_iter(run_ids.iter()), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i32>(1)? != 0, row.get::<_, i32>(2)? != 0),
+                ))
             })?
             .collect::<SqlResult<_>>()?;
 
         let mut out = Vec::new();
         for (run_id, encounter_id, dungeon, started_at, ended_at, stored_killed) in runs {
-            let leisurely = leisurely_runs.get(&run_id).copied().unwrap_or(false);
+            let (leisurely, petless) = leisurely_runs.get(&run_id).copied().unwrap_or_default();
             let phases = fights_by_run.remove(&run_id).unwrap_or_default();
             let shatters_hm = shatters_run_is_hard_mode(phases.iter().map(|p| (p.0, p.10)));
             let phase_stats: Vec<PhaseStat> =
@@ -3491,6 +3524,7 @@ impl CombatDatabase {
                 last_hero_standing: false,
                 most_damage_taken: false,
                 leisurely,
+                petless,
                 shatters_hm,
             });
         }
@@ -3503,7 +3537,7 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, shatters_hm
+                      leisurely, petless, shatters_hm
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -3532,7 +3566,7 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, shatters_hm
+                      leisurely, petless, shatters_hm
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -3575,7 +3609,7 @@ impl CombatDatabase {
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                       local_close_calls, aux_member_count, dungeon_entered_at, spirits,
-                      leisurely, shatters_hm
+                      leisurely, petless, shatters_hm
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -3629,6 +3663,7 @@ impl CombatDatabase {
             ended_at,
             killed,
             leisurely: phases.iter().any(|p| p.leisurely),
+            petless: phases.iter().any(|p| p.petless),
             shatters_hm: shatters_run_is_hard_mode(
                 phases.iter().map(|p| (p.boss_object_type, p.shatters_hm)),
             ),
@@ -4588,6 +4623,7 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             },
             spirits: group.iter().map(|g| g.spirits).sum(),
             leisurely: group.iter().any(|g| g.leisurely),
+            petless: group.iter().any(|g| g.petless),
             shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
         });
@@ -4669,6 +4705,7 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             aux_member_count: p.aux_member_count,
             spirits: group.iter().map(|g| g.spirits).sum(),
             leisurely: group.iter().any(|g| g.leisurely),
+            petless: group.iter().any(|g| g.petless),
             shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
         });
@@ -5037,6 +5074,7 @@ mod tests {
             aux_member_count: None,
             spirits: 0,
             leisurely: false,
+            petless: false,
             shatters_hm: false,
             participants: vec![
                 FightParticipant {
@@ -5144,6 +5182,7 @@ mod tests {
             aux_member_count: None,
             spirits: 0,
             leisurely: false,
+            petless: false,
             shatters_hm: false,
             participants,
         }
@@ -9941,6 +9980,48 @@ mod tests {
     }
 
     #[test]
+    fn v54_to_v55_adds_the_petless_flag() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // A Moonlight Village fight recorded before Challenge Mode was tracked:
+        // the row predates the column, so it has to default to "not petless".
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group, leisurely, shatters_hm)
+              VALUES
+              (10, 40, 'Moonlight Village', 7, 20450, 'Kitsune Umi', 360000, 360000, 9, 55, 1, NULL, NULL, 1, 0);
+            "#,
+            )
+            .unwrap();
+
+        db.conn.execute_batch("PRAGMA user_version = 54").unwrap();
+        db.initialize(None).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let legacy = db.fight_detail(1).unwrap().expect("legacy row survives");
+        assert!(!legacy.petless, "legacy rows are not petless");
+        assert!(legacy.leisurely, "the rest of the row is untouched");
+
+        // The flag round-trips through a fresh insert.
+        let mut fight = sample_fight();
+        fight.dungeon = "Moonlight Village".to_string();
+        fight.petless = true;
+        let id = db.insert_fight(&fight).unwrap();
+        let read_back = db.fight_detail(id).unwrap().expect("inserted fight");
+        assert!(read_back.petless, "the petless flag persists");
+    }
+
+    #[test]
     fn v53_to_v54_renames_the_shattered_queen() {
         let mut db = CombatDatabase {
             conn: Connection::open_in_memory().unwrap(),
@@ -10296,6 +10377,7 @@ mod tests {
             aux_member_count: None,
             spirits: 0,
             leisurely: false,
+            petless: false,
             shatters_hm: false,
             participants: vec![],
         }

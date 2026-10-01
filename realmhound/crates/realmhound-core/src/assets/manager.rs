@@ -701,6 +701,13 @@ pub fn is_mv_leisurely_mode_notification(message: &str) -> bool {
     message.contains("Leisurely mode was initiated")
 }
 
+/// Moonlight Village's Challenge Gate ("MV Reward Shrine", 0x5049): the golden
+/// bell past the spawn room's hidden path. Attacking it starts the run's
+/// Challenge Mode, which permanently pet-stasises the player who rang it. The
+/// object has boss-tier HP but is never a fight, so the tracker only uses the
+/// hit to label the run "Petless".
+pub const MV_CHALLENGE_GATE_TYPE: i32 = 0x5049;
+
 /// Moonlight Village spirit object ("MV Total Counter"). One instance spawns per
 /// spirit released at the end of a dance (or Umi) phase -- always in pairs and
 /// up to 8 per phase -- so the number of distinct instances observed in a run is

@@ -193,6 +193,9 @@ fn main() {
         if f.leisurely {
             println!("     leisurely_mode=true");
         }
+        if f.petless {
+            println!("     challenge_mode=true (petless)");
+        }
         println!(
             "     attributed_damage={attributed}  (~{pct:.1}% of start HP)  hp_lost_if_killed={hp_lost}"
         );

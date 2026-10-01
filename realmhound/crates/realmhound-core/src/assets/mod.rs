@@ -85,9 +85,10 @@ pub use manager::{
     mv_loot_completion_targets, mv_spirit_tier, object_name_override, parse_grave_tier,
     prismimic_display_name, shatters_boss_name, shatters_hm_boss_name, shatters_hm_boss_sprite,
     AssetManager, AssetStats, AuxTarget, CharacterDyeInfo, DyeInfo, DyeStyle, Encounter, GraveTier,
-    ASSET_MANAGER, LEGACY_LOD_IVORY_BOSS, MV_DANCER_TYPES, MV_SPIRIT_TYPE, MV_UMI_SPIRIT_TYPE,
-    MV_UMI_TYPE, SHATTERS_BRIDGE_SENTINEL_TYPE, SHATTERS_KING_TYPE, SHATTERS_QUEEN_TYPE,
-    SHATTERS_STONE_IDOL_TYPE, SHATTERS_THE_SOURCE_TYPE, SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+    ASSET_MANAGER, LEGACY_LOD_IVORY_BOSS, MV_CHALLENGE_GATE_TYPE, MV_DANCER_TYPES, MV_SPIRIT_TYPE,
+    MV_UMI_SPIRIT_TYPE, MV_UMI_TYPE, SHATTERS_BRIDGE_SENTINEL_TYPE, SHATTERS_KING_TYPE,
+    SHATTERS_QUEEN_TYPE, SHATTERS_STONE_IDOL_TYPE, SHATTERS_THE_SOURCE_TYPE,
+    SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
 };
 pub use object_list::{
     AbilityEffect, AbilityEffects, BleedingEffect, ConditionSelfEffect, DamageNovaEffect,

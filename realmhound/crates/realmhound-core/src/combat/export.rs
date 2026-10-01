@@ -241,6 +241,7 @@ mod tests {
             aux_member_count: None,
             spirits: 0,
             leisurely: false,
+            petless: false,
             shatters_hm: false,
             participants: vec![sample_participant(Some(300))],
         }

@@ -745,6 +745,12 @@ pub struct CombatTracker {
     /// can label the run -- the mode shortens the phases and cuts the loot, so
     /// the run is not comparable with a normal clear. Reset on map change.
     mv_leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode this run
+    /// (they whacked the Challenge Gate, which pet-stasises them permanently).
+    /// Latched onto the run's fights so the card labels the run "Petless". The
+    /// gate itself is a curated non-boss and never becomes a fight, so this latch
+    /// is the only trace it leaves. Reset on map change.
+    mv_petless: bool,
     /// The Shatters hard mode, stage: the Stone Idol only becomes damageable
     /// once the Void Phantasm was absorbed next to it, so real HP loss on it
     /// means the run is in hard mode and the Bridge Sentinel will be Valen the
@@ -819,6 +825,7 @@ impl CombatTracker {
             pending_mv_spirits: 0,
             mv_boss_engaged: false,
             mv_leisurely: false,
+            mv_petless: false,
             shatters_hm_bridge: false,
             shatters_hm_late: false,
             shatters_idol_seen: false,
@@ -921,6 +928,7 @@ impl CombatTracker {
         self.pending_mv_spirits = 0;
         self.mv_boss_engaged = false;
         self.mv_leisurely = false;
+        self.mv_petless = false;
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
         self.shatters_idol_seen = false;
@@ -967,6 +975,7 @@ impl CombatTracker {
         self.pending_mv_spirits = 0;
         self.mv_boss_engaged = false;
         self.mv_leisurely = false;
+        self.mv_petless = false;
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
         self.shatters_idol_seen = false;
@@ -1273,6 +1282,28 @@ impl CombatTracker {
     /// labelled with it on the card. Latched for the current instance.
     pub fn on_mv_leisurely_mode(&mut self) {
         self.mv_leisurely = true;
+    }
+
+    /// Latch Moonlight Village's Challenge Mode when the *local player* attacked
+    /// `target_id`: whacking the Challenge Gate pet-stasises them for the rest of
+    /// the run, which the card labels "Petless".
+    ///
+    /// The gate is a curated non-boss (it has 500k HP but is never a fight), so
+    /// the fight paths would skip it -- this is the only trace it leaves. Only
+    /// the local player counts: a teammate taking the challenge doesn't make this
+    /// player's run petless.
+    fn note_mv_challenge_gate(&mut self, target_id: i32, local: bool) {
+        if !local || self.mv_petless {
+            return;
+        }
+        let is_gate = self
+            .objects
+            .get(&target_id)
+            .is_some_and(|o| o.object_type == crate::assets::MV_CHALLENGE_GATE_TYPE);
+        if is_gate {
+            tracing::info!("[MV] Challenge Gate attacked by the local player: run is petless");
+            self.mv_petless = true;
+        }
     }
 
     /// The hard-mode name of a Shatters boss the group has already unlocked, or
@@ -1688,6 +1719,9 @@ impl CombatTracker {
     /// "damage done to other players and enemies"), so the local id is rejected
     /// here to avoid double counting with the `PlayerHit` path.
     pub fn on_damage(&mut self, target_id: i32, attacker_id: i32, amount: i64, time_ms: i64) {
+        // A local DamagePacket against the Challenge Gate (recorded for some of
+        // the local player's own hits) also proves Challenge Mode.
+        self.note_mv_challenge_gate(target_id, attacker_id == self.local_object_id);
         if target_id != self.local_object_id
             && self
                 .objects
@@ -2248,6 +2282,10 @@ impl CombatTracker {
         if self.local_object_id == 0 {
             return;
         }
+        // Whacking the Challenge Gate is the only trace Moonlight Village's
+        // Challenge Mode leaves; it is a curated non-boss, so the fight paths
+        // below would skip it.
+        self.note_mv_challenge_gate(target_id, main_id == self.local_object_id);
         let is_boss = self.ensure_fight(target_id, time_ms);
         let aux = if is_boss {
             None
@@ -2998,6 +3036,7 @@ impl CombatTracker {
             }),
             spirits: fight.spirits,
             leisurely: self.mv_leisurely,
+            petless: self.mv_petless,
             shatters_hm,
             participants,
         };
@@ -8272,6 +8311,102 @@ mod tests {
             !next[0].leisurely,
             "a later normal run is not labelled Leisurely Mode"
         );
+    }
+
+    // Challenge Mode (the local player whacked the Challenge Gate, which
+    // pet-stasises them) labels the run's fights "Petless" on the card. The gate
+    // itself is a curated non-boss, so it never becomes a fight of its own.
+    #[test]
+    fn mv_challenge_gate_hit_labels_the_runs_fights_petless() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            700,
+            crate::assets::MV_CHALLENGE_GATE_TYPE,
+            &status(
+                700,
+                vec![stat(StatType::MaxHP, 500_000), stat(StatType::HP, 500_000)],
+            ),
+            50,
+        );
+        t.on_local_hit(700, 7, 1000, 1000, 60);
+        assert!(t.fights.is_empty(), "the gate is never a fight of its own");
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            100,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 200);
+        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 300);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].petless, "the clear is labelled Petless");
+        assert!(
+            !done[0].leisurely,
+            "Challenge Mode is independent of Leisure"
+        );
+
+        // The mode is per instance: the next run's fights are unlabelled.
+        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_object_spawn(
+            600,
+            20450,
+            &status(
+                600,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            1100,
+        );
+        t.pending_shots.insert(
+            11,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(600, 11, 1000, 1000, 1200);
+        let next = t.on_boss_text(600, "This concludes the Moonlight Dance.", 1300);
+        assert_eq!(next.len(), 1);
+        assert!(!next[0].petless, "a later normal run is not Petless");
+    }
+
+    // Only the local player's own hit counts: a teammate ringing the gate makes
+    // *their* run petless, not ours.
+    #[test]
+    fn mv_challenge_gate_hit_by_someone_else_does_not_label_our_run() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            700,
+            crate::assets::MV_CHALLENGE_GATE_TYPE,
+            &status(
+                700,
+                vec![stat(StatType::MaxHP, 500_000), stat(StatType::HP, 500_000)],
+            ),
+            50,
+        );
+        // A DamagePacket from another player, and an EnemyHit owned by them.
+        t.on_damage(700, 2000, 5_000, 60);
+        t.on_local_hit(700, 7, 2000, 2000, 61);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            100,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 200);
+        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 300);
+        assert_eq!(done.len(), 1);
+        assert!(!done[0].petless, "someone else's challenge is not our run");
     }
 
     // A completion in one dungeon instance does not carry to the next: a dancer
