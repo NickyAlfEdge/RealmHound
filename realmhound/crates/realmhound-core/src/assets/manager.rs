@@ -824,6 +824,28 @@ pub const SHATTERS_TWILIGHT_ARCHMAGE_TYPE: i32 = 29021;
 pub const SHATTERS_KING_TYPE: i32 = 29039;
 /// The Source -- the secret hard-mode object destroyed in the Alchemy Lab.
 pub const SHATTERS_THE_SOURCE_TYPE: i32 = 0x8242;
+/// The Shattered Queen, the hard-mode phase that spawns in place of the last
+/// stretch of the Forgotten King's fight (when Nox ended with 2 fire + 2 ice
+/// generators locked in) and reveals him as King Azamoth. The game ships her
+/// object without a display name at all -- its id name is the internal
+/// "Shatters A22" -- so her name comes from [`OBJECT_NAME_OVERRIDES`].
+pub const SHATTERS_QUEEN_TYPE: i32 = 0x4456;
+
+/// The name the UI shows for object types the catalog names internally or not at
+/// all, overriding the catalog name. The Shattered Queen is the only one so far:
+/// she has no `DisplayId` in the game files (deliberate on Deca's part -- her
+/// name is only revealed in the fight's dialogue), which would otherwise leave
+/// the fight card reading "Shatters A22".
+const OBJECT_NAME_OVERRIDES: &[(i32, &str)] = &[(SHATTERS_QUEEN_TYPE, "The Shattered Queen")];
+
+/// The display name overriding the catalog name for `id`, or `None` to use the
+/// catalog's. See [`OBJECT_NAME_OVERRIDES`].
+pub fn object_name_override(id: i32) -> Option<&'static str> {
+    OBJECT_NAME_OVERRIDES
+        .iter()
+        .find(|(object_type, _)| *object_type == id)
+        .map(|(_, name)| *name)
+}
 
 /// The name hard mode reveals a Shatters boss as, or `None` for bosses hard mode
 /// does not rename (or for any other object).
@@ -2430,6 +2452,9 @@ impl AssetManager {
     /// `id_name` has a " xN" suffix but `display_name` does not, the
     /// `id_name` is used so the stack count is visible.
     pub fn object_name(&self, id: i32) -> Option<String> {
+        if let Some(name) = object_name_override(id) {
+            return Some(name.to_string());
+        }
         self.try_load();
         self.objects.read().unwrap().as_ref().and_then(|list| {
             let obj = list.get(id)?;
@@ -4816,6 +4841,30 @@ mod tests {
         assert_eq!(mv_spirit_tier(0, true, false), None);
         assert_eq!(mv_spirit_tier(0, false, true), None);
         assert_eq!(mv_spirit_tier(-3, false, false), None);
+    }
+
+    #[test]
+    fn catalog_name_overrides_only_fix_unnamed_objects() {
+        // The queen ships with no DisplayId, so the catalog's fallback is her
+        // internal id name; the UI shows the name the fight reveals instead.
+        assert_eq!(SHATTERS_QUEEN_TYPE, 0x4456);
+        assert_eq!(
+            object_name_override(SHATTERS_QUEEN_TYPE),
+            Some("The Shattered Queen")
+        );
+        // Named bosses and unrelated objects are untouched.
+        assert_eq!(object_name_override(SHATTERS_KING_TYPE), None);
+        assert_eq!(object_name_override(33280), None);
+        assert_eq!(object_name_override(0), None);
+        // The manager serves the override without needing the game assets (the
+        // lookup happens before `try_load`), so cards rename even on a fresh
+        // install.
+        assert_eq!(
+            get_asset_manager()
+                .object_name(SHATTERS_QUEEN_TYPE)
+                .as_deref(),
+            Some("The Shattered Queen")
+        );
     }
 
     #[test]

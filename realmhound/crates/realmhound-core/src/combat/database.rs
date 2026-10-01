@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 53;
+pub const SCHEMA_VERSION: i32 = 54;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -1291,6 +1291,21 @@ impl CombatDatabase {
                 )?;
             }
             self.conn.execute_batch("PRAGMA user_version = 53")?;
+        }
+        if from_version < 54 {
+            // v53 -> v54: the game ships The Shattered Queen's object with no
+            // display name, so rows recorded for her carry the internal
+            // "Shatters A22" the catalog falls back to. Rename them to the name
+            // the card shows now (see `object_name_override`).
+            self.conn.execute(
+                "UPDATE fights SET boss_name = ?1 WHERE boss_object_type = ?2 AND boss_name <> ?1",
+                params![
+                    crate::assets::object_name_override(crate::assets::SHATTERS_QUEEN_TYPE)
+                        .unwrap_or("The Shattered Queen"),
+                    crate::assets::SHATTERS_QUEEN_TYPE
+                ],
+            )?;
+            self.conn.execute_batch("PRAGMA user_version = 54")?;
         }
         Ok(())
     }
@@ -9923,6 +9938,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(shtrs_span, (10, 100));
+    }
+
+    #[test]
+    fn v53_to_v54_renames_the_shattered_queen() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // A hard-mode Shatters run recorded while the queen's object still fell
+        // back to its internal catalog name.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group, shatters_hm)
+              VALUES
+              (10, 40, 'The Shatters', 7, 17494, 'Shatters A22', 100000, 100000, 9, 55, 1, NULL, NULL, 1),
+              (20, 35, 'The Shatters', 7, 29039, 'King Azamoth', 300000, 300000, 9, 55, 1, NULL, NULL, 1);
+            "#,
+            )
+            .unwrap();
+
+        db.conn.execute_batch("PRAGMA user_version = 53").unwrap();
+        db.initialize(None).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let queen: String = db
+            .conn
+            .query_row(
+                "SELECT boss_name FROM fights WHERE boss_object_type = 17494",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queen, "The Shattered Queen");
+        // Every other row keeps the name it was recorded with.
+        let king: String = db
+            .conn
+            .query_row(
+                "SELECT boss_name FROM fights WHERE boss_object_type = 29039",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(king, "King Azamoth");
     }
 
     #[test]

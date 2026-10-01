@@ -142,7 +142,10 @@ fn draw_boss_sprite(
             }
         }
     }
-    sprite_renderer.draw_outlined_sprite_in_rect(ui, object_type, rect);
+    // A boss whose art is larger than the portrait cell is fitted to it instead
+    // of being drawn at 1x (its smallest integer scale) and spilling over the
+    // row: The Shattered Queen's 32x32 statue in a 22px phase row.
+    sprite_renderer.draw_outlined_sprite_fitting_cell(ui, object_type, rect);
 }
 
 /// Draw a Moonlight Village spirit tally sprite: the dancers share the bundled
