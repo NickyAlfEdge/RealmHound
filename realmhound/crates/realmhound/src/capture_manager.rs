@@ -148,6 +148,7 @@ mod tests {
         RawPacket {
             data,
             timestamp: chrono::Utc::now(),
+            packet_format: realmhound_core::capture::PacketFormat::Ethernet,
             #[cfg(feature = "latency-diagnostics")]
             enqueued_at: None,
         }

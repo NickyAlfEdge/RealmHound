@@ -21,6 +21,12 @@ pub enum CaptureError {
     #[error("Failed to set capture filter: {0}")]
     FilterFailed(String),
 
+    /// The interface uses an unsupported packet framing format.
+    #[error(
+        "Unsupported capture link type {0}; supported formats are Ethernet, raw IP, and loopback"
+    )]
+    UnsupportedLinkType(i32),
+
     /// Capture error
     #[error("Capture error: {0}")]
     CaptureError(String),

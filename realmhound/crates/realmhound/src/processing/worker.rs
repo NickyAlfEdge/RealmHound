@@ -1120,6 +1120,7 @@ mod tests {
         let drained_at = Instant::now();
         let packet = realmhound_core::capture::RawPacket {
             timestamp: chrono::Utc::now() - chrono::Duration::milliseconds(700),
+            packet_format: realmhound_core::capture::PacketFormat::Ethernet,
             enqueued_at: Some(drained_at - Duration::from_millis(200)),
             data: Vec::new(),
         };
@@ -1135,6 +1136,7 @@ mod tests {
         let drained_at = Instant::now();
         let packet = realmhound_core::capture::RawPacket {
             timestamp: chrono::Utc::now() + chrono::Duration::seconds(1),
+            packet_format: realmhound_core::capture::PacketFormat::Ethernet,
             enqueued_at: Some(drained_at),
             data: Vec::new(),
         };
@@ -1149,6 +1151,7 @@ mod tests {
         let drained_at = Instant::now();
         let packet = realmhound_core::capture::RawPacket {
             timestamp: chrono::Utc::now() - chrono::Duration::seconds(90),
+            packet_format: realmhound_core::capture::PacketFormat::Ethernet,
             enqueued_at: Some(drained_at - Duration::from_millis(200)),
             data: Vec::new(),
         };

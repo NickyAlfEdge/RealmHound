@@ -2,7 +2,7 @@
 //!
 //! This module extracts TCP segment information from raw captured packets.
 
-use crate::capture::RawPacket;
+use crate::capture::{PacketFormat, RawPacket};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use std::net::Ipv4Addr;
 
@@ -75,8 +75,20 @@ impl TcpFlags {
 /// Parse a raw captured packet into a [`TcpSegment`], or `None` if it is not a
 /// valid IPv4 TCP packet (UDP, IPv6, or malformed).
 pub fn parse_tcp_segment(packet: &RawPacket) -> Option<TcpSegment> {
-    // Parse the packet using etherparse
-    let sliced = SlicedPacket::from_ethernet(&packet.data).ok()?;
+    let sliced = match packet.packet_format {
+        PacketFormat::Ethernet => SlicedPacket::from_ethernet(&packet.data).ok()?,
+        PacketFormat::RawIp => SlicedPacket::from_ip(&packet.data).ok()?,
+        PacketFormat::Loopback | PacketFormat::LoopbackNetwork => {
+            let family: [u8; 4] = packet.data.get(..4)?.try_into().ok()?;
+            let ipv4 = u32::from_be_bytes(family) == 2
+                || (packet.packet_format == PacketFormat::Loopback
+                    && u32::from_le_bytes(family) == 2);
+            if !ipv4 {
+                return None;
+            }
+            SlicedPacket::from_ip(&packet.data[4..]).ok()?
+        }
+    };
 
     // Extract IPv4 header
     let (src_ip, dst_ip) = match sliced.net {
@@ -160,6 +172,168 @@ fn record_fragmentation(header: &etherparse::Ipv4HeaderSlice) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use etherparse::PacketBuilder;
+
+    fn ipv4_tcp() -> Vec<u8> {
+        let mut data = Vec::new();
+        PacketBuilder::ipv4([192, 0, 2, 1], [198, 51, 100, 2], 64)
+            .tcp(45678, 2050, 123, 32768)
+            .syn()
+            .ack(456)
+            .psh()
+            .write(&mut data, &[1, 2, 3, 4])
+            .unwrap();
+        data
+    }
+
+    fn framed(ip: &[u8], packet_format: PacketFormat) -> RawPacket {
+        let mut data = match packet_format {
+            PacketFormat::Ethernet => {
+                let mut header = vec![0; 12];
+                header.extend_from_slice(&[0x08, 0x00]);
+                header
+            }
+            PacketFormat::RawIp => Vec::new(),
+            PacketFormat::Loopback => 2u32.to_ne_bytes().to_vec(),
+            PacketFormat::LoopbackNetwork => 2u32.to_be_bytes().to_vec(),
+        };
+        data.extend_from_slice(ip);
+        RawPacket {
+            data,
+            packet_format,
+            timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_123_456_789),
+            #[cfg(feature = "latency-diagnostics")]
+            enqueued_at: None,
+        }
+    }
+
+    fn assert_tcp_packet(packet: &RawPacket) {
+        let segment = parse_tcp_segment(packet).expect("valid IPv4 TCP packet");
+        assert_eq!(segment.src_ip, Ipv4Addr::new(192, 0, 2, 1));
+        assert_eq!(segment.dst_ip, Ipv4Addr::new(198, 51, 100, 2));
+        assert_eq!(segment.src_port, 45678);
+        assert_eq!(segment.dst_port, 2050);
+        assert_eq!(segment.sequence, 123);
+        assert_eq!(segment.acknowledgment, 456);
+        assert!(segment.flags.syn);
+        assert!(segment.flags.ack);
+        assert!(segment.flags.psh);
+        assert!(!segment.flags.fin);
+        assert!(!segment.flags.rst);
+        assert_eq!(segment.payload, [1, 2, 3, 4]);
+        assert_eq!(segment.timestamp, packet.timestamp);
+    }
+
+    #[test]
+    fn parses_ethernet_tcp() {
+        assert_tcp_packet(&framed(&ipv4_tcp(), PacketFormat::Ethernet));
+    }
+
+    #[test]
+    fn parses_raw_ip_tcp() {
+        assert_tcp_packet(&framed(&ipv4_tcp(), PacketFormat::RawIp));
+    }
+
+    #[test]
+    fn parses_native_loopback_tcp() {
+        assert_tcp_packet(&framed(&ipv4_tcp(), PacketFormat::Loopback));
+    }
+
+    #[test]
+    fn parses_loopback_recorded_in_either_byte_order() {
+        for family in [2u32.to_le_bytes(), 2u32.to_be_bytes()] {
+            let mut packet = framed(&ipv4_tcp(), PacketFormat::Loopback);
+            packet.data[..4].copy_from_slice(&family);
+            assert_tcp_packet(&packet);
+        }
+    }
+
+    #[test]
+    fn parses_network_loopback_tcp() {
+        assert_tcp_packet(&framed(&ipv4_tcp(), PacketFormat::LoopbackNetwork));
+    }
+
+    #[test]
+    fn parses_vlan_tagged_ethernet_tcp() {
+        let mut packet = framed(&ipv4_tcp(), PacketFormat::Ethernet);
+        packet
+            .data
+            .splice(12..14, [0x81, 0x00, 0x00, 0x01, 0x08, 0x00]);
+        assert_tcp_packet(&packet);
+    }
+
+    #[test]
+    fn rejects_non_ipv4_loopback_families() {
+        for packet_format in [PacketFormat::Loopback, PacketFormat::LoopbackNetwork] {
+            for family in [0u32, 24, 28, 30] {
+                let mut packet = framed(&ipv4_tcp(), packet_format);
+                packet.data[..4].copy_from_slice(&family.to_be_bytes());
+                assert!(parse_tcp_segment(&packet).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_little_endian_network_loopback_header() {
+        let mut packet = framed(&ipv4_tcp(), PacketFormat::LoopbackNetwork);
+        packet.data[..4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(parse_tcp_segment(&packet).is_none());
+    }
+
+    #[test]
+    fn rejects_udp_and_ipv6() {
+        let mut udp = Vec::new();
+        PacketBuilder::ipv4([192, 0, 2, 1], [198, 51, 100, 2], 64)
+            .udp(45678, 2050)
+            .write(&mut udp, &[1, 2, 3, 4])
+            .unwrap();
+        let mut ipv6 = Vec::new();
+        PacketBuilder::ipv6([0; 16], [1; 16], 64)
+            .tcp(45678, 2050, 123, 32768)
+            .write(&mut ipv6, &[1, 2, 3, 4])
+            .unwrap();
+
+        for packet_format in [
+            PacketFormat::Ethernet,
+            PacketFormat::RawIp,
+            PacketFormat::Loopback,
+            PacketFormat::LoopbackNetwork,
+        ] {
+            assert!(parse_tcp_segment(&framed(&udp, packet_format)).is_none());
+            assert!(parse_tcp_segment(&framed(&ipv6, packet_format)).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_frames() {
+        for packet_format in [
+            PacketFormat::Ethernet,
+            PacketFormat::RawIp,
+            PacketFormat::Loopback,
+            PacketFormat::LoopbackNetwork,
+        ] {
+            let original = framed(&ipv4_tcp(), packet_format);
+            for length in 0..original.data.len() {
+                let mut packet = original.clone();
+                packet.data.truncate(length);
+                assert!(
+                    parse_tcp_segment(&packet).is_none(),
+                    "{packet_format:?} truncated at byte {length}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn does_not_guess_packet_format() {
+        let mut raw_ip = framed(&ipv4_tcp(), PacketFormat::RawIp);
+        raw_ip.packet_format = PacketFormat::Ethernet;
+        assert!(parse_tcp_segment(&raw_ip).is_none());
+
+        let mut ethernet = framed(&ipv4_tcp(), PacketFormat::Ethernet);
+        ethernet.packet_format = PacketFormat::RawIp;
+        assert!(parse_tcp_segment(&ethernet).is_none());
+    }
 
     #[test]
     fn test_tcp_flags_from_raw() {
