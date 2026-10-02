@@ -179,6 +179,7 @@ const CURATED_BOSS_TYPES: &[i32] = &[
     29023, // DS Golden Rat -- Toxic Sewers wandering loot piñata that drops loot directly -- ENEMY,MINION,MINION_STRONG
     33018, // Oryxmas Realm Present (realm treasure crate) -- ENEMY,MINION,MINION_STRONG
     33280, // Shatters Stone Idol (secret hardmode boss) -- GOD,CONSTRUCT, 25k HP, no boss label
+    34551, // Demonic Effigy (Hero of Oryx realm set-piece) -- no labels, 9k HP (below the fallback)
     42255, // The Hemomancer (special boss) -- no labels
     42371, // Jotunn (special boss) -- no labels
     44020, // The Glitch (special boss) -- ENEMY,MINION,CUBE,GOD,MINION_STRONG

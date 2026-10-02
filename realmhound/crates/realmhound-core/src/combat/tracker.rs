@@ -6432,6 +6432,54 @@ mod tests {
     }
 
     #[test]
+    fn curated_demonic_effigy_becomes_its_own_fight() {
+        // The Hero of Oryx set-piece "Demonic Effigy" (0x86F7) is a label-less
+        // realm boss whose 9k HP sits *below* the label-less boss fallback, so it
+        // used to be dropped: its loot was attributed to it while no fight was
+        // ever recorded. The curated allow-list is what promotes it.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x86F7,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 9_000), stat(StatType::HP, 9_000)],
+            ),
+            0,
+        );
+        t.on_damage(500, 1000, 4_000, 10);
+        t.on_local_hit(500, 7, 1000, 1000, 12);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t
+            .on_object_removed(500, 24)
+            .expect("the effigy is tracked as a fight");
+        assert_eq!(done.boss_object_type, 0x86F7);
+
+        // Its Worshipper adds (0x86DA, 5.5k HP, also label-less) stay out.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            600,
+            0x86DA,
+            &status(
+                600,
+                vec![stat(StatType::MaxHP, 5_500), stat(StatType::HP, 5_500)],
+            ),
+            0,
+        );
+        t.on_damage(600, 1000, 2_000, 10);
+        t.on_local_hit(600, 7, 1000, 1000, 12);
+        t.on_object_status(600, &status(600, vec![stat(StatType::HP, 0)]), 20);
+        assert!(
+            t.on_map_change("Nexus", 0, 100).is_empty(),
+            "an effigy worshipper must not be tracked as a fight"
+        );
+    }
+
+    #[test]
     fn untagged_setpiece_without_local_engagement_is_dropped() {
         // A high-HP enemy with no boss-like labels (only the HP fallback), killed
         // by remote players while the local player never engaged: teleport-past
