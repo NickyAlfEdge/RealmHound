@@ -896,6 +896,14 @@ pub struct LiveFeedPanel {
     /// entry it belongs to shows up (see [`Self::push_dungeon`]) rather than only
     /// read when the entry already exists.
     hub_host_hint: Option<std::time::Instant>,
+    /// Whether the map the player just entered is a dungeon that names no realm
+    /// of its own, entered from a realm. A dungeon's MapInfo carries the area it
+    /// was opened in ("NexusPortal.<Realm>" from a realm portal), so a dungeon
+    /// that names none while we were in a realm is not part of that realm: it
+    /// runs under the Nexus, which is what a party call into someone else's
+    /// Nexus-popped key looks like. Set by [`Self::update_location`], read (and
+    /// spent) by [`Self::push_dungeon`].
+    nexus_parent_dungeon: bool,
     /// Countdown expiry to the castle teleport after a realm close.
     /// `None` when no realm-close countdown is active. Cleared on a fresh realm
     /// entry, hub entry, or disconnect; kept running while diving into a
@@ -1126,6 +1134,7 @@ impl LiveFeedPanel {
             map_is_hub: false,
             left_from_hub: false,
             hub_host_hint: None,
+            nexus_parent_dungeon: false,
             castle_timer_expires_at: None,
             realm_closed: false,
             // Dust status bar state
@@ -1727,7 +1736,26 @@ impl LiveFeedPanel {
 
         // Parse realm name from realm_name field (e.g., "NexusPortal.Medusa" -> "Medusa")
         // Server name comes from IP lookup, not from this field
-        if let Some(realm) = Self::parse_realm_name_for_realm(realm_name_field) {
+        let parsed_realm = Self::parse_realm_name_for_realm(realm_name_field);
+        // A dungeon reports the area it was opened in: "NexusPortal.<Realm>" for
+        // one entered through a realm portal, and nothing for one opened in a hub
+        // (a hub is not a realm, so the game has no realm name to report). Landing
+        // in a dungeon that names no realm while we were in one therefore says the
+        // instance was not opened in that realm -- it runs under the Nexus. That
+        // is what a party call into someone else's Nexus-popped key looks like, and
+        // it is the only origin signal a party call gives us (the entry never
+        // loads a hub map, and the instance's host need not be one RH can name).
+        self.nexus_parent_dungeon =
+            self.left_from_realm && !in_realm && !self.map_is_hub && parsed_realm.is_none();
+        if !in_realm && !self.map_is_hub {
+            tracing::info!(
+                "[LIVE_FEED] entering '{display_name}': realm field '{realm_name_field}' \
+                 (came from realm={}, hub={})",
+                self.left_from_realm,
+                self.left_from_hub
+            );
+        }
+        if let Some(realm) = parsed_realm {
             if in_realm {
                 // Realm entry - only cancel a pending castle teleport countdown
                 // when this is actually a *different* realm than before. If
@@ -1817,6 +1845,7 @@ impl LiveFeedPanel {
         self.map_is_hub = false;
         self.left_from_hub = false;
         self.hub_host_hint = None;
+        self.nexus_parent_dungeon = false;
         self.castle_timer_expires_at = None;
         self.realm_closed = false;
         self.crystal_pin = None;
@@ -2384,7 +2413,16 @@ impl LiveFeedPanel {
                 "[LIVE_FEED] connected to a hub host just before '{display_name}': naming it as opened in the nexus"
             );
         }
-        let entered_from_nexus = self.left_from_hub || hub_hosted;
+        // The instance's own MapInfo said it belongs to no realm although we came
+        // from one, so it was opened in the Nexus (see
+        // [`Self::nexus_parent_dungeon`]).
+        let nexus_parent = std::mem::take(&mut self.nexus_parent_dungeon);
+        if nexus_parent {
+            tracing::info!(
+                "[LIVE_FEED] '{display_name}' names no realm of its own: naming it as opened in the nexus"
+            );
+        }
+        let entered_from_nexus = self.left_from_hub || hub_hosted || nexus_parent;
         let origin_status = match realm_status {
             Some(status) => Some(status),
             None if entered_from_nexus => self.nexus_marker.text().map(str::to_string),
@@ -7173,6 +7211,52 @@ mod tests {
         panel.nexus_marker = NexusMarker::None;
         panel.recompute_dungeon_callouts();
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn opened_in_nexus_from_a_party_call_the_instance_names_no_realm() {
+        // The reported case, straight from the packets: standing in Medusa, a
+        // friend pops a key in the Nexus and calls it, and the party call lands us
+        // in an instance whose own MapInfo names no realm (a hub is not a realm,
+        // so the game has nothing to report). The entry never loads a hub map, so
+        // this realm-less instance is the origin signal.
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::Nex;
+        // No portal of ours, no host we could name: only the map itself.
+        panel.update_location("Lair of Shaitan", "", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Lair of Shaitan", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("shait nex"));
+
+        // A dungeon that names the realm we came from was opened in that realm,
+        // and stays unmarked.
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::Nex;
+        panel.update_location("Lair of Shaitan", "NexusPortal.Medusa", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Lair of Shaitan", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("shait"));
+
+        // So does one that names a different realm (we joined a stranger's realm
+        // instance): it belongs to that realm, not the Nexus.
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::Nex;
+        panel.update_location("Lair of Shaitan", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Lair of Shaitan", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("shait"));
+
+        // The signal is spent with the entry: a second dungeon entered from a
+        // realm keeps its own origin (here it names its realm).
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::Nex;
+        panel.update_location("Lair of Shaitan", "", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Lair of Shaitan", &[], None);
+        panel.update_location("Lair of Shaitan", "NexusPortal.Medusa", 0, 0);
+        panel.push_dungeon(2, "Lair of Shaitan", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("shait"));
     }
 
     #[test]
