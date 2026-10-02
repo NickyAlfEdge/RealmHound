@@ -774,12 +774,6 @@ pub struct CombatTracker {
     /// it makes the Twilight Archmage Nox the Wild Shadow and carries through to
     /// the Forgotten King, who becomes King Azamoth. Reset on map change.
     shatters_hm_late: bool,
-    /// Whether the Stone Idol (`0x8200`) has been in our object list at any point
-    /// in this instance. A regular Shatters keeps its invincible Idol alive for
-    /// the whole run, while hard mode needs it destroyed in the Derelict Village
-    /// long before the bridge, so reaching the first boss without ever having the
-    /// Idol in view says the run is in hard mode. Reset on map change.
-    shatters_idol_seen: bool,
 }
 
 impl Default for CombatTracker {
@@ -842,7 +836,6 @@ impl CombatTracker {
             spectral_hm_bosses: HashSet::new(),
             shatters_hm_bridge: false,
             shatters_hm_late: false,
-            shatters_idol_seen: false,
         }
     }
 
@@ -946,7 +939,6 @@ impl CombatTracker {
         self.spectral_hm_bosses.clear();
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
-        self.shatters_idol_seen = false;
         finished
     }
 
@@ -994,7 +986,6 @@ impl CombatTracker {
         self.spectral_hm_bosses.clear();
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
-        self.shatters_idol_seen = false;
         finished
     }
 
@@ -1369,8 +1360,9 @@ impl CombatTracker {
     ///   in view proves both stages -- no matter how far away it is, whether its
     ///   HP is ever reported, or whether its destruction is ever seen.
     ///
-    /// The Idol's *presence* is also tracked, because a run that reaches the
-    /// first boss without ever having it in view is in hard mode.
+    /// Absence is deliberately not evidence: a regular run's Idol simply sits
+    /// across the map, so the local player can easily reach the first boss
+    /// without ever having had it in view. Only what we actually witness counts.
     ///
     /// `previous_hp` is the pool before this reading (0 when it is the first we
     /// get).
@@ -1379,32 +1371,17 @@ impl CombatTracker {
             object_type,
             hp,
             max_hp,
-            last_x,
-            last_y,
             ..
         }) = self.objects.get(&object_id)
         else {
             return;
         };
-        let idol = object_type == crate::assets::SHATTERS_STONE_IDOL_TYPE;
-        if !idol {
-            if object_type == crate::assets::SHATTERS_THE_SOURCE_TYPE {
-                self.confirm_shatters_hm_bridge("The Source in view");
-                self.confirm_shatters_hm_late("The Source in view");
-            }
+        if object_type == crate::assets::SHATTERS_THE_SOURCE_TYPE {
+            self.confirm_shatters_hm_bridge("The Source in view");
+            self.confirm_shatters_hm_late("The Source in view");
             return;
         }
-        // Remember that the Idol was on the map at all: a run that reaches the
-        // first boss without ever having it in view is hard mode (see
-        // [`Self::finalize_fight`]).
-        if !self.shatters_idol_seen {
-            self.shatters_idol_seen = true;
-            tracing::info!(
-                "[SHATTERS_HM] Stone Idol in view: {hp}/{max_hp} HP, distance {:?}",
-                self.local_distance_to(last_x, last_y)
-            );
-        }
-        if self.shatters_hm_bridge {
+        if object_type != crate::assets::SHATTERS_STONE_IDOL_TYPE || self.shatters_hm_bridge {
             return;
         }
         let (max_hp, new_hp) = (max_hp as i64, hp as i64);
@@ -2888,24 +2865,16 @@ impl CombatTracker {
         }
 
         let assets = get_asset_manager();
-        // Hard mode has the group destroy the invulnerable Stone Idol in the
-        // Derelict Village, which happens before the bridge is even reachable, so
-        // a run that reaches The Bridge Sentinel without ever having the Idol in
-        // view was in hard mode: the object was already gone, possibly killed
-        // while we were elsewhere, or before we ever looked at it. Only fights the
-        // local player took part in reach this point, and a regular run keeps the
-        // Idol alive for the whole instance, so seeing it at all rules this out.
-        // A run attached to mid-instance keeps its previous map name, so it is
-        // excluded rather than misread as hard mode.
-        if fight.boss_object_type == crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE
-            && !self.shatters_idol_seen
-            && normalize_dungeon(&self.current_map).starts_with("The Shatters")
-        {
-            self.confirm_shatters_hm_bridge("no Stone Idol seen before the bridge fight");
-        }
         // The Shatters hard mode is a property of the run (see
         // [`Self::shatters_hm_revealed_name`]), not of the boss packets: the game
         // only reveals the renamed boss in dialogue, so the card carries it.
+        // Nothing about the Idol's *absence* can prove it either -- a regular
+        // run's Idol sits across the map and is easy to never see -- so the latch
+        // comes solely from the unlock objects we actually witnessed (its
+        // destruction, a damaged pool, or The Source in view). A run that never
+        // showed either stays regular, which is the honest reading at the cost of
+        // a hard-mode run whose Idol died elsewhere being called regular until
+        // its revealed boss is fought.
         let shatters_hm = self
             .shatters_hm_revealed_name(fight.boss_object_type)
             .is_some();
@@ -8829,22 +8798,15 @@ mod tests {
     }
 
     #[test]
-    fn shatters_living_stone_idol_keeps_the_bridge_regular() {
+    fn shatters_bridge_sentinel_stays_regular_without_evidence() {
+        // The Idol was never in view at all -- the common case, since a regular
+        // run's Idol sits across the map in the Derelict Village. That is not
+        // evidence of anything: the Sentinel keeps its regular name and the run
+        // is not hard mode.
         let mut t = CombatTracker::new();
         t.on_map_change("The Shatters", 777, 0);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
-        // The Idol is still on the map at full HP: nothing unlocked hard mode, so
-        // the Sentinel keeps its regular name even though we never fought it.
-        t.on_object_spawn(
-            900,
-            crate::assets::SHATTERS_STONE_IDOL_TYPE,
-            &status(
-                900,
-                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
-            ),
-            2,
-        );
 
         let bridge = finish_shatters_fight(
             &mut t,
@@ -8859,26 +8821,6 @@ mod tests {
             bridge.boss_name
         );
         assert!(!bridge.shatters_hm);
-    }
-
-    #[test]
-    fn shatters_idol_never_seen_before_the_bridge_marks_hard_mode() {
-        let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
-        t.on_player_loaded(1000, 777);
-        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
-        // Hard mode needs the Idol destroyed in the Derelict Village, which is
-        // long over by the bridge: reaching the first boss without ever having the
-        // Idol in view means it was already gone when we looked.
-        let bridge = finish_shatters_fight(
-            &mut t,
-            700,
-            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
-            250_000,
-            100,
-        );
-        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
-        assert!(bridge.shatters_hm);
     }
 
     #[test]
@@ -9204,21 +9146,12 @@ mod tests {
         );
         assert!(hard.shatters_hm);
 
-        // The next Shatters instance starts regular again: no Idol seen, but the
-        // Sentinel is fought with the Idol still alive on the map.
+        // The next Shatters instance starts regular again: nothing proved hard
+        // mode there, and the Sentinel's own evidence is what carries the mode.
         t.on_map_change("Nexus", 0, 500);
         t.on_map_change("The Shatters", 778, 600);
         t.on_player_loaded(1000, 778);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 600);
-        t.on_object_spawn(
-            905,
-            crate::assets::SHATTERS_STONE_IDOL_TYPE,
-            &status(
-                905,
-                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
-            ),
-            602,
-        );
         let regular = finish_shatters_fight(
             &mut t,
             710,
