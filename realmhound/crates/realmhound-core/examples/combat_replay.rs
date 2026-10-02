@@ -143,7 +143,12 @@ fn main() {
                 // Moonlight Village dance-concluded line are both completion
                 // signals the tracker consumes here.
                 Some(ParsedPacket::Text(t)) => {
-                    finished.extend(tracker.on_boss_text(t.object_id, &t.text, clock));
+                    finished.extend(tracker.on_boss_text(
+                        t.object_id,
+                        Some(t.name.as_str()),
+                        &t.text,
+                        clock,
+                    ));
                 }
                 // Moonlight Village's Leisurely Mode announcement.
                 Some(ParsedPacket::Notification(n))

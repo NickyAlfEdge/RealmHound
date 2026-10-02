@@ -2211,8 +2211,12 @@ impl PacketProcessor {
                 // completion and Spectral Penitentiary's hard mode off its
                 // mini-bosses' objective-cleared lines (the object id ties the
                 // taunt to the boss's fight where needed).
-                self.combat
-                    .on_boss_text(text.object_id, &text.text, now_ms());
+                self.combat.on_boss_text(
+                    text.object_id,
+                    Some(text.name.as_str()),
+                    &text.text,
+                    now_ms(),
+                );
 
                 // Keyper seasonal event: the realm-wide "#The Keyper" taunts are
                 // the authoritative spawn/tower cues. Suppress join-time replays

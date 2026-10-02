@@ -963,6 +963,30 @@ pub fn shatters_hm_boss_name(id: i32) -> Option<&'static str> {
     }
 }
 
+/// The Shatters boss whose hard-mode name `speaker` is, or `None`.
+///
+/// A renamed boss *speaks* under its new name, which is how the client learns it
+/// at all (the object type is unchanged, so the name cannot come from the XML);
+/// the line is therefore distinctive evidence that this very boss was in hard
+/// mode. The chat framing is not part of the name, so a leading `#`, surrounding
+/// brackets and case are ignored.
+pub fn shatters_hm_named_boss(speaker: &str) -> Option<i32> {
+    let name = speaker
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    [
+        SHATTERS_BRIDGE_SENTINEL_TYPE,
+        SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+        SHATTERS_KING_TYPE,
+    ]
+    .into_iter()
+    .find(|&id| shatters_hm_boss_name(id).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+}
+
 /// The name a Shatters boss fights under in its regular form, or `None` for any
 /// other object. Mirrors the bosses' display names in the game catalog so
 /// callers that must not depend on the assets (Loot History naming, the loot
@@ -5050,6 +5074,30 @@ mod tests {
             assert!(is_shatters_main_boss(id));
             assert!(shatters_hm_boss_name(id).is_some());
         }
+
+        // A hard-mode boss speaks under its revealed name, in the framing the
+        // chat uses: matching tolerates the `#` prefix, brackets and case.
+        assert_eq!(
+            shatters_hm_named_boss("#Valen the Unbreakable"),
+            Some(SHATTERS_BRIDGE_SENTINEL_TYPE)
+        );
+        assert_eq!(
+            shatters_hm_named_boss("[Valen the Unbreakable]"),
+            Some(SHATTERS_BRIDGE_SENTINEL_TYPE)
+        );
+        assert_eq!(
+            shatters_hm_named_boss("  nox the wild shadow "),
+            Some(SHATTERS_TWILIGHT_ARCHMAGE_TYPE)
+        );
+        assert_eq!(
+            shatters_hm_named_boss("King Azamoth"),
+            Some(SHATTERS_KING_TYPE)
+        );
+        // The regular names prove nothing, and neither does anything else.
+        assert_eq!(shatters_hm_named_boss("#The Bridge Sentinel"), None);
+        assert_eq!(shatters_hm_named_boss("#The Accursed King"), None);
+        assert_eq!(shatters_hm_named_boss(""), None);
+        assert_eq!(shatters_hm_named_boss("#Griefkeeper Zole"), None);
         assert!(!is_shatters_main_boss(33280)); // the Stone Idol is an unlock object
         assert!(!is_shatters_main_boss(SHATTERS_THE_SOURCE_TYPE));
     }

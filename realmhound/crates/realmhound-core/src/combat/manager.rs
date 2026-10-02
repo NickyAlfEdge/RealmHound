@@ -330,8 +330,14 @@ impl CombatManager {
     /// A boss taunt (`TextPacket` from the boss's own object id) arrived. Drives
     /// the Marble Colossus survival-phase split off its authoritative
     /// second-coming taunt, persisting the finalized pre-survival segment.
-    pub fn on_boss_text(&mut self, object_id: i32, text: &str, time_ms: i64) {
-        let finished = self.tracker.on_boss_text(object_id, text, time_ms);
+    pub fn on_boss_text(
+        &mut self,
+        object_id: i32,
+        speaker: Option<&str>,
+        text: &str,
+        time_ms: i64,
+    ) {
+        let finished = self.tracker.on_boss_text(object_id, speaker, text, time_ms);
         self.persist(finished);
     }
 

@@ -194,8 +194,11 @@ impl LootAttributionManager {
             });
         }
 
-        // Bridge Sentinel HM (Valen the Unbreakable)
-        if name == "#Valen the Unbreakable"
+        // Bridge Sentinel HM (Valen the Unbreakable). The renamed boss is the
+        // same object as the regular one, so the name it speaks under is the only
+        // signal; matching it tolerates the chat framing.
+        if crate::assets::shatters_hm_named_boss(name)
+            == Some(crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE)
             && text == "I see now... my strength could not have held against this growing power."
         {
             return Some(AttributionTrigger {
@@ -217,8 +220,9 @@ impl LootAttributionManager {
         }
 
         // Twilight Archmage HM (Nox the Wild Shadow)
-        if name == "#Nox the Wild Shadow" 
-            && text == "Unworthy as you are to know what hides beyond, I've had... an epiphany. So in case you've failed to realize..." 
+        if crate::assets::shatters_hm_named_boss(name)
+            == Some(crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE)
+            && text == "Unworthy as you are to know what hides beyond, I've had... an epiphany. So in case you've failed to realize..."
         {
             return Some(AttributionTrigger {
                 mob_id: boss_ids::TWILIGHT_ARCHMAGE,
@@ -239,7 +243,9 @@ impl LootAttributionManager {
         }
 
         // King Azamoth HM
-        if name == "#King Azamoth" && text == "This fate is mine to bear... not hers." {
+        if crate::assets::shatters_hm_named_boss(name) == Some(crate::assets::SHATTERS_KING_TYPE)
+            && text == "This fate is mine to bear... not hers."
+        {
             return Some(AttributionTrigger {
                 mob_id: boss_ids::ACCURSED_KING,
                 ticks: 2,

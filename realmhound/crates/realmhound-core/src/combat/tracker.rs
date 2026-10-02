@@ -777,6 +777,12 @@ pub struct CombatTracker {
     /// way describes the bosses after it, never the Sentinel itself. Reset on map
     /// change.
     shatters_bridge_engaged: bool,
+    /// The Shatters bosses this instance heard speak under their hard-mode name
+    /// (see [`Self::on_boss_text`]). Per boss rather than per stage, because that
+    /// is exactly what the reveal proves: the boss that spoke was renamed, and
+    /// each of the run's bosses is labelled from its own evidence. Reset on map
+    /// change.
+    shatters_hm_named: HashSet<i32>,
 }
 
 impl Default for CombatTracker {
@@ -840,6 +846,7 @@ impl CombatTracker {
             shatters_hm_bridge: false,
             shatters_hm_late: false,
             shatters_bridge_engaged: false,
+            shatters_hm_named: HashSet::new(),
         }
     }
 
@@ -944,6 +951,7 @@ impl CombatTracker {
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
         self.shatters_bridge_engaged = false;
+        self.shatters_hm_named.clear();
         finished
     }
 
@@ -992,6 +1000,7 @@ impl CombatTracker {
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
         self.shatters_bridge_engaged = false;
+        self.shatters_hm_named.clear();
         finished
     }
 
@@ -1276,9 +1285,22 @@ impl CombatTracker {
     pub fn on_boss_text(
         &mut self,
         object_id: i32,
+        speaker: Option<&str>,
         text: &str,
         time_ms: i64,
     ) -> Vec<CompletedFight> {
+        // The Shatters: a hard-mode boss *speaks* under its revealed name, which
+        // is the only way the client can learn it (the renamed boss keeps its
+        // object type), so hearing it is distinctive evidence for that boss --
+        // and it works for a player who joined after the unlock objects were
+        // destroyed. Latched per boss for the instance.
+        if let Some(name) = speaker {
+            if let Some(boss_type) = crate::assets::shatters_hm_named_boss(name) {
+                if self.shatters_hm_named.insert(boss_type) {
+                    tracing::info!("[SHATTERS_HM] {name} speaks: that boss is hard mode");
+                }
+            }
+        }
         // Spectral Penitentiary: a mini-boss shouts its hard-mode taunt only when
         // every objective of its wing was cleared, so the line itself proves that
         // boss was hard mode. Latched for the instance; Murcian's own mode is
@@ -1350,11 +1372,12 @@ impl CombatTracker {
         use crate::assets::{
             SHATTERS_BRIDGE_SENTINEL_TYPE, SHATTERS_KING_TYPE, SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
         };
-        let revealed = match boss_object_type {
-            SHATTERS_BRIDGE_SENTINEL_TYPE => self.shatters_hm_bridge,
-            SHATTERS_TWILIGHT_ARCHMAGE_TYPE | SHATTERS_KING_TYPE => self.shatters_hm_late,
-            _ => false,
-        };
+        let revealed = self.shatters_hm_named.contains(&boss_object_type)
+            || match boss_object_type {
+                SHATTERS_BRIDGE_SENTINEL_TYPE => self.shatters_hm_bridge,
+                SHATTERS_TWILIGHT_ARCHMAGE_TYPE | SHATTERS_KING_TYPE => self.shatters_hm_late,
+                _ => false,
+            };
         if revealed {
             crate::assets::shatters_hm_boss_name(boss_object_type)
         } else {
@@ -4698,7 +4721,7 @@ mod tests {
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
         // The dance concludes: the dancer is scored Completed and its record is
         // emitted. The local player is still present at that moment.
-        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 350);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 350);
         assert_eq!(done.len(), 1);
         assert!(done[0].killed, "completion scores the dancer as killed");
         let local = done[0]
@@ -5926,7 +5949,7 @@ mod tests {
 
         // Survival-exit taunt fires while still near 10% HP: split immediately,
         // before any heal-back tick is observed.
-        let split = t.on_boss_text(500, "...!", 25);
+        let split = t.on_boss_text(500, None, "...!", 25);
         assert_eq!(split.len(), 1, "taunt finalizes the pre-survival segment");
         assert!(
             split[0].boss_name.ends_with("(Pre-survival)"),
@@ -5988,7 +6011,7 @@ mod tests {
         t.on_damage(500, 1000, 5000, 10);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 40_000)]), 20);
         // Survival-exit taunt splits while still near the survival low.
-        assert_eq!(t.on_boss_text(500, "...!", 25).len(), 1);
+        assert_eq!(t.on_boss_text(500, None, "...!", 25).len(), 1);
 
         // Heal climbs while Invulnerable; max still reads the pre-rescale pool.
         t.on_object_status(
@@ -6127,9 +6150,9 @@ mod tests {
         t.on_damage(500, 1000, 5000, 10);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 40_000)]), 20);
         // A different boss line must not split.
-        assert!(t.on_boss_text(500, "Fear the halls!", 22).is_empty());
+        assert!(t.on_boss_text(500, None, "Fear the halls!", 22).is_empty());
         // The transition taunt from an unrelated object id must not split.
-        assert!(t.on_boss_text(999, "...!", 23).is_empty());
+        assert!(t.on_boss_text(999, None, "...!", 23).is_empty());
         // Still a single, un-split pre-survival fight in progress.
         assert_eq!(t.fights.len(), 1);
         assert!(!t.fights.get(&500).unwrap().split_done);
@@ -7377,7 +7400,7 @@ mod tests {
         );
         t.on_local_hit(500, 10, 1000, 1000, 120);
         // The dance concludes: the dancer is scored completed.
-        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 400);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400);
         assert_eq!(done.len(), 1);
         assert!(done[0].killed);
         assert_eq!(
@@ -8278,7 +8301,7 @@ mod tests {
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 400);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400);
         assert_eq!(done.len(), 1);
         assert!(
             done[0].killed,
@@ -8334,7 +8357,7 @@ mod tests {
         t.on_local_hit(254, 10, 1000, 1000, 210);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
         assert_eq!(
-            t.on_boss_text(500, "This concludes the Moonlight Dance.", 400)
+            t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400)
                 .len(),
             1
         );
@@ -8365,7 +8388,7 @@ mod tests {
             100,
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
-        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 300);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 300);
         assert_eq!(done.len(), 1);
         assert!(done[0].leisurely, "the clear is labelled Leisurely Mode");
 
@@ -8389,7 +8412,7 @@ mod tests {
             },
         );
         t.on_local_hit(600, 11, 1000, 1000, 1200);
-        let next = t.on_boss_text(600, "This concludes the Moonlight Dance.", 1300);
+        let next = t.on_boss_text(600, None, "This concludes the Moonlight Dance.", 1300);
         assert_eq!(next.len(), 1);
         assert!(
             !next[0].leisurely,
@@ -8426,7 +8449,7 @@ mod tests {
             100,
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
-        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 300);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 300);
         assert_eq!(done.len(), 1);
         assert!(done[0].petless, "the clear is labelled Petless");
         assert!(
@@ -8454,7 +8477,7 @@ mod tests {
             },
         );
         t.on_local_hit(600, 11, 1000, 1000, 1200);
-        let next = t.on_boss_text(600, "This concludes the Moonlight Dance.", 1300);
+        let next = t.on_boss_text(600, None, "This concludes the Moonlight Dance.", 1300);
         assert_eq!(next.len(), 1);
         assert!(!next[0].petless, "a later normal run is not Petless");
     }
@@ -8472,7 +8495,7 @@ mod tests {
         let mut t = CombatTracker::new();
         t.on_map_change("Spectral Penitentiary", 7, 0);
         t.on_player_loaded(1000, 7);
-        t.on_boss_text(500, zole.1, 100);
+        t.on_boss_text(500, None, zole.1, 100);
         let zole_fight = finish_shatters_fight(&mut t, 500, 23659, 300_000, 150);
         assert!(zole_fight.spectral_hm, "Zole taunted, so Zole is HM");
         let murcian = finish_shatters_fight(&mut t, 600, 23681, 400_000, 200);
@@ -8486,9 +8509,9 @@ mod tests {
         let mut t = CombatTracker::new();
         t.on_map_change("Spectral Penitentiary", 7, 0);
         t.on_player_loaded(1000, 7);
-        t.on_boss_text(500, zole.1, 100);
-        t.on_boss_text(600, lobotomik.1, 110);
-        t.on_boss_text(700, zole.1, 120);
+        t.on_boss_text(500, None, zole.1, 100);
+        t.on_boss_text(600, None, lobotomik.1, 110);
+        t.on_boss_text(700, None, zole.1, 120);
         let zole_fight = finish_shatters_fight(&mut t, 500, 23659, 300_000, 150);
         assert!(zole_fight.spectral_hm);
         let lobo_fight = finish_shatters_fight(&mut t, 600, 23920, 300_000, 160);
@@ -8550,7 +8573,7 @@ mod tests {
             100,
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
-        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 300);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 300);
         assert_eq!(done.len(), 1);
         assert!(!done[0].petless, "someone else's challenge is not our run");
     }
@@ -8573,7 +8596,7 @@ mod tests {
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
         assert_eq!(
-            t.on_boss_text(500, "This concludes the Moonlight Dance.", 300)
+            t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 300)
                 .len(),
             1
         );
@@ -8625,7 +8648,7 @@ mod tests {
         t.on_local_hit(500, 7, 1000, 1000, 200);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
         // The dance concludes while the fight is live.
-        let first = t.on_boss_text(500, "This concludes the Moonlight Dance.", 400);
+        let first = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400);
         assert_eq!(first.len(), 1, "one completed dancer");
         assert!(first[0].killed);
         // The invulnerable dancer object is still present; a late hit must not
@@ -8672,7 +8695,7 @@ mod tests {
             }
         }
         // The dance concludes while the last detection is live.
-        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 3000);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 3000);
         assert_eq!(
             done.len(),
             1,
@@ -8715,7 +8738,7 @@ mod tests {
             2,
             "two live same-type fights coexist",
         );
-        let done = t.on_boss_text(500, "This concludes the Moonlight Dance.", 40);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 40);
         assert_eq!(
             done.len(),
             1,
@@ -9043,6 +9066,114 @@ mod tests {
         assert!(archmage.shatters_hm);
         let king =
             finish_shatters_fight(&mut t, 702, crate::assets::SHATTERS_KING_TYPE, 500_000, 50);
+        assert_eq!(king.boss_name, "King Azamoth");
+        assert!(king.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_hm_speech_marks_the_boss_that_spoke() {
+        // A hard-mode boss speaks under its revealed name; the line is the only
+        // place the client can learn it from, so it is per-boss evidence.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        // The Sentinel speaks as Valen, so the Sentinel is hard mode...
+        let spoken = t.on_boss_text(
+            700,
+            Some("#Valen the Unbreakable"),
+            "I see now... my strength could not have held against this growing power.",
+            50,
+        );
+        assert!(spoken.is_empty(), "speech alone finalizes nothing");
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(
+            t.shatters_hm_revealed_name(crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE),
+            Some("Valen the Unbreakable")
+        );
+        assert!(bridge.shatters_hm);
+        // ...and the archmage, whose own line never arrived, stays regular: each
+        // boss is labelled from its own evidence, not from the run's.
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            300,
+        );
+        assert!(!archmage.shatters_hm);
+        assert!(
+            !archmage.boss_name.contains("Nox"),
+            "got {}",
+            archmage.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_regular_speech_is_not_hard_mode() {
+        // The regular Sentinel speaks under its regular name, which is no
+        // evidence of hard mode however the line is framed.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_boss_text(
+            700,
+            Some("#The Bridge Sentinel"),
+            "I tried to protect you... I have failed.",
+            50,
+        );
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(!bridge.shatters_hm);
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_late_join_reads_hard_mode_from_the_speech_it_hears() {
+        // A player who joined after the Idol and The Source were destroyed has no
+        // unlock evidence, but the archmage and the King speak under their
+        // hard-mode names, which is what labels them.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_boss_text(
+            701,
+            Some("[Nox the Wild Shadow]"),
+            "Unworthy as you are to know what hides beyond, I've had... an epiphany.",
+            20,
+        );
+        t.on_boss_text(
+            702,
+            Some("King Azamoth"),
+            "This fate is mine to bear... not hers.",
+            30,
+        );
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            40,
+        );
+        assert_eq!(archmage.boss_name, "Nox the Wild Shadow");
+        assert!(archmage.shatters_hm);
+        let king =
+            finish_shatters_fight(&mut t, 702, crate::assets::SHATTERS_KING_TYPE, 500_000, 60);
         assert_eq!(king.boss_name, "King Azamoth");
         assert!(king.shatters_hm);
     }
