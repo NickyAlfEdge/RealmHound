@@ -194,14 +194,6 @@ const PET_ASSOC_MAX_DIST: f32 = 8.0;
 /// regular.
 const SPECTRAL_HM_BOSSES_REQUIRED: usize = 2;
 
-/// Max distance (tiles) between the local player and The Shatters' Stone Idol
-/// for its removal to count as a destruction rather than a view cull. The
-/// server drops an object from our world only once it leaves the view, which is
-/// far more than this, so a removal this close can only be the Idol being
-/// destroyed -- the hard-mode unlock that happens when it absorbs the Void
-/// Phantasm and the group kills it.
-const SHATTERS_IDOL_NEAR_DIST: f32 = 4.0;
-
 /// Soft cap on buffered enemy projectiles awaiting a local `PlayerHit`. Enemy
 /// bullets that never hit the local player are only freed on map change, so the
 /// buffer is cleared once it grows past this (a damage-taken estimate tolerates
@@ -294,6 +286,10 @@ struct TrackedObject {
     /// Whether an Attack stat has been observed for this object (so the local
     /// player's damage multiplier is not computed from a zero default).
     attack_seen: bool,
+    /// Whether an HP stat has been observed for this object. An object whose
+    /// pool the server never reports keeps the zero default, which must not be
+    /// read as a destroyed (or damaged) one.
+    hp_seen: bool,
     /// Whether a Defense stat has been observed (so the local player's damage
     /// taken is not estimated from a zero default).
     defense_seen: bool,
@@ -336,6 +332,7 @@ impl Default for TrackedObject {
             dexterity: 0,
             wisdom_seen: false,
             attack_seen: false,
+            hp_seen: false,
             defense_seen: false,
             last_seen: 0,
             last_x: 0.0,
@@ -1349,20 +1346,25 @@ impl CombatTracker {
     /// The two unlock objects prove hard mode in different ways:
     ///
     /// - The Stone Idol is invulnerable outside hard mode -- it only becomes
-    ///   damageable once the Void Phantasm was absorbed next to it -- so any
-    ///   damage it shows means hard mode, including a pool it had already lost
-    ///   before we arrived (a fight we joined late). That is why a reading below
-    ///   max counts, not just a drop since the previous tick. Readings only count
-    ///   while the pool is known, so an object whose HP the server never reports
-    ///   is never mistaken for one that is at zero.
+    ///   damageable once the Void Phantasm was absorbed next to it -- so *any*
+    ///   pool below its maximum proves hard mode, including one that had already
+    ///   lost HP before we arrived (a fight we joined late) and one that is now
+    ///   empty (the group destroyed it while we watched, or just before we read
+    ///   it). Its pool has to have been reported for a reading to mean anything:
+    ///   an object whose HP the server never sends keeps the zero default and is
+    ///   never mistaken for a damaged or destroyed one.
     /// - The Source is spawned only in hard mode at all, and it sits in the
     ///   secret wing the group only reaches past the bridge, so merely having it
     ///   in view proves both stages -- no matter how far away it is, whether its
     ///   HP is ever reported, or whether its destruction is ever seen.
     ///
-    /// Absence is deliberately not evidence: a regular run's Idol simply sits
-    /// across the map, so the local player can easily reach the first boss
-    /// without ever having had it in view. Only what we actually witness counts.
+    /// Seeing the Idol *leave* proves nothing on its own: in a regular Shatters
+    /// it patrols, chases whoever comes close and then wanders off, so a removal
+    /// -- however close to the local player it happens -- can be nothing but a
+    /// view cull. Only the pool it left behind can tell a destroyed Idol from one
+    /// that walked away. That leaves a deliberate gap: a hard-mode Idol killed
+    /// out of view, whose pool we therefore never read, is called regular until a
+    /// revealed boss proves the run's mode later.
     ///
     /// `previous_hp` is the pool before this reading (0 when it is the first we
     /// get).
@@ -1371,6 +1373,7 @@ impl CombatTracker {
             object_type,
             hp,
             max_hp,
+            hp_seen,
             ..
         }) = self.objects.get(&object_id)
         else {
@@ -1381,17 +1384,21 @@ impl CombatTracker {
             self.confirm_shatters_hm_late("The Source in view");
             return;
         }
-        if object_type != crate::assets::SHATTERS_STONE_IDOL_TYPE || self.shatters_hm_bridge {
+        if object_type != crate::assets::SHATTERS_STONE_IDOL_TYPE
+            || self.shatters_hm_bridge
+            || !hp_seen
+            || max_hp <= 0
+        {
             return;
         }
-        let (max_hp, new_hp) = (max_hp as i64, hp as i64);
-        if max_hp <= 0 {
-            return;
-        }
-        let damaged = new_hp > 0 && new_hp < max_hp;
-        let lethal = previous_hp > 0 && new_hp * 10 <= max_hp;
-        if damaged || lethal {
-            self.confirm_shatters_hm_bridge(&format!("Stone Idol at {new_hp}/{max_hp} HP"));
+        let (max_hp, hp) = (max_hp as i64, hp as i64);
+        // Damage we can see, including a pool the group had already taken down
+        // before we looked.
+        let damaged = hp > 0 && hp < max_hp;
+        // A pool we had seen alive is now empty.
+        let destroyed = hp <= 0 && previous_hp > 0;
+        if damaged || destroyed {
+            self.confirm_shatters_hm_bridge(&format!("Stone Idol at {hp}/{max_hp} HP"));
         }
     }
 
@@ -1412,13 +1419,6 @@ impl CombatTracker {
             tracing::info!("[SHATTERS_HM] hard mode at the late stage: {evidence}");
             self.shatters_hm_late = true;
         }
-    }
-
-    /// Distance in tiles from the local player to `(x, y)`, or `None` when the
-    /// local player's position isn't known.
-    fn local_distance_to(&self, x: f32, y: f32) -> Option<f32> {
-        let me = self.objects.get(&self.local_object_id)?;
-        Some(((me.last_x - x).powi(2) + (me.last_y - y).powi(2)).sqrt())
     }
 
     /// A loot bag was recorded in the current instance. Moonlight Village's
@@ -1520,35 +1520,14 @@ impl CombatTracker {
         self.pending_summon_shots
             .retain(|&(owner, _), _| owner != object_id);
         let last = self.objects.remove(&object_id);
-        // The Shatters' Stone Idol never disappears on its own: it is either
-        // destroyed (hard mode) or simply leaves our view, and the server sends
-        // the same removal for both. Two cases can only be a destruction: a
-        // removal at lethal HP, and one that happens right next to the local
-        // player -- far inside the view radius, where a view cull cannot fire.
-        // Both latch hard mode, so a group that killed the Idol while we were
-        // elsewhere or before we ever read its HP is still recognised.
-        if let Some(obj) = &last {
-            if obj.object_type == crate::assets::SHATTERS_STONE_IDOL_TYPE
-                && !self.shatters_hm_bridge
-            {
-                let max_hp = obj.max_hp as i64;
-                let hp = obj.hp as i64;
-                let lethal = max_hp > 0 && hp > 0 && hp * 10 <= max_hp;
-                let distance = self.local_distance_to(obj.last_x, obj.last_y);
-                let near = distance.is_some_and(|d| d <= SHATTERS_IDOL_NEAR_DIST);
-                tracing::info!(
-                    "[SHATTERS_HM] Stone Idol removed: hp={hp}/{max_hp} \
-                     distance={distance:?} lethal={lethal} near={near}"
-                );
-                if lethal || near {
-                    self.confirm_shatters_hm_bridge(&format!(
-                        "Stone Idol destroyed (hp {hp}/{max_hp}, distance {distance:?})"
-                    ));
-                }
-            }
-        }
-        // The Source needs no removal handling: it only ever exists in hard mode,
-        // so having it in view latched the route already.
+        // The Shatters' Stone Idol needs no removal handling: it patrols, chases
+        // and wanders out of view in a regular run just as it does in hard mode,
+        // so a removal -- however close to the local player it happens -- proves
+        // nothing on its own. The pool it left behind is the evidence, and that
+        // is read where its stats arrive (see
+        // [`Self::note_shatters_hm_unlock_object`]).
+        // The Source needs no removal handling either: it only ever exists in
+        // hard mode, so having it in view latched the route already.
         // Record a participant departure for death/nexus detection:
         // an object that is currently an attacker in some active fight is leaving
         // view. Snapshot its last-seen position BEFORE it is dropped so a
@@ -3625,7 +3604,10 @@ fn apply_stats(obj: &mut TrackedObject, status: &ObjectStatusData, time_ms: i64)
     for stat in &status.stats {
         match stat.stat_type_id {
             x if x == StatType::MaxHP as u8 => obj.max_hp = stat.stat_value,
-            x if x == StatType::HP as u8 => obj.hp = stat.stat_value,
+            x if x == StatType::HP as u8 => {
+                obj.hp = stat.stat_value;
+                obj.hp_seen = true;
+            }
             x if x == StatType::Name as u8 => {
                 if let Some(ref n) = stat.string_stat_value {
                     if !n.is_empty() {
@@ -9029,7 +9011,11 @@ mod tests {
     }
 
     #[test]
-    fn shatters_stone_idol_destroyed_beside_the_player_marks_hard_mode() {
+    fn shatters_stone_idol_removed_without_hp_evidence_stays_regular() {
+        // The Idol is removed right beside the local player, but the server never
+        // reported its pool, so nothing shows it was ever damageable. A regular
+        // Idol that simply wandered out of view looks exactly like this, so the
+        // removal must not be read as a destruction.
         let mut t = CombatTracker::new();
         t.on_map_change("The Shatters", 777, 0);
         t.on_player_loaded(1000, 777);
@@ -9039,8 +9025,6 @@ mod tests {
             &status_at(1000, 10.0, 10.0, vec![name_stat("Bob")]),
             1,
         );
-        // The server never reports the Idol's HP (unknown pool), so only its
-        // removal tells us anything: one that close can't be a view cull.
         t.on_object_spawn(
             900,
             crate::assets::SHATTERS_STONE_IDOL_TYPE,
@@ -9056,8 +9040,61 @@ mod tests {
             250_000,
             100,
         );
-        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
-        assert!(bridge.shatters_hm);
+        assert!(
+            !bridge.shatters_hm,
+            "a removal with no pool to read proves nothing"
+        );
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_wandering_stone_idol_leaving_view_stays_regular() {
+        // The regular Idol patrols, chases whoever comes close and then wanders
+        // off -- it shoots the local player and is last seen two tiles away at
+        // full HP before leaving view. Its own movement caused the removal, so
+        // the run stays regular.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(
+            1000,
+            0x0321,
+            &status_at(1000, 10.0, 10.0, vec![name_stat("Bob")]),
+            1,
+        );
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status_at(
+                900,
+                10.0,
+                12.0,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            2,
+        );
+        t.on_object_removed(900, 6);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(
+            !bridge.shatters_hm,
+            "an untouched Idol that patrolled away is not a kill"
+        );
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
     }
 
     #[test]
@@ -9104,13 +9141,14 @@ mod tests {
     }
 
     #[test]
-    fn shatters_stone_idol_removed_at_lethal_hp_marks_hard_mode() {
+    fn shatters_stone_idol_at_lethal_hp_marks_hard_mode() {
         let mut t = CombatTracker::new();
         t.on_map_change("The Shatters", 777, 0);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
-        // Killed out of our view after we saw it at lethal HP: the group
-        // destroyed it, so the run was hard mode.
+        // The group takes the Idol down to lethal HP in our view (the kill itself
+        // happens out of view, so it is never removed for us): the pool we read
+        // proves it was damageable, which is hard mode.
         t.on_object_spawn(
             900,
             crate::assets::SHATTERS_STONE_IDOL_TYPE,
