@@ -771,6 +771,12 @@ pub struct CombatTracker {
     /// it makes the Twilight Archmage Nox the Wild Shadow and carries through to
     /// the Forgotten King, who becomes King Azamoth. Reset on map change.
     shatters_hm_late: bool,
+    /// Whether the local player has reached The Bridge Sentinel at all this
+    /// instance. Hard mode can be "wasted" by pulling the first boss before the
+    /// Stone Idol is destroyed, so evidence read once the bridge fight is under
+    /// way describes the bosses after it, never the Sentinel itself. Reset on map
+    /// change.
+    shatters_bridge_engaged: bool,
 }
 
 impl Default for CombatTracker {
@@ -833,6 +839,7 @@ impl CombatTracker {
             spectral_hm_bosses: HashSet::new(),
             shatters_hm_bridge: false,
             shatters_hm_late: false,
+            shatters_bridge_engaged: false,
         }
     }
 
@@ -936,6 +943,7 @@ impl CombatTracker {
         self.spectral_hm_bosses.clear();
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
+        self.shatters_bridge_engaged = false;
         finished
     }
 
@@ -983,6 +991,7 @@ impl CombatTracker {
         self.spectral_hm_bosses.clear();
         self.shatters_hm_bridge = false;
         self.shatters_hm_late = false;
+        self.shatters_bridge_engaged = false;
         finished
     }
 
@@ -1041,6 +1050,18 @@ impl CombatTracker {
         }
         let spawn_max_hp = self.objects.get(&object_id).map(|o| o.max_hp).unwrap_or(0);
         self.note_aux_instance(object_id, object_type, spawn_max_hp);
+        // The Bridge Sentinel coming into view means the local player reached the
+        // bridge arena, so any hard-mode evidence read from here on describes the
+        // *next* bosses, not this one (see `note_shatters_hm_unlock_object`).
+        if object_type == crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE {
+            self.shatters_bridge_engaged = true;
+        }
+        // Tempest, the phoenix the hard-mode Twilight Archmage summons. It is the
+        // only evidence for the late stage that does not depend on us having
+        // caught The Source before it was destroyed.
+        if object_type == crate::assets::SHATTERS_TEMPEST_TYPE {
+            self.confirm_shatters_hm_late("Tempest in view");
+        }
         // The Idol's pool may already be damaged when we first see it (a run we
         // arrived late to), and The Source needs no HP reading at all: the object
         // itself proves hard mode.
@@ -1380,7 +1401,13 @@ impl CombatTracker {
             return;
         };
         if object_type == crate::assets::SHATTERS_THE_SOURCE_TYPE {
-            self.confirm_shatters_hm_bridge("The Source in view");
+            // The Source sits in the Alchemy Lab, past the archmage, so by the
+            // time it is destroyed the bridge fight is long over: its presence
+            // proves the late stage, and only proves the bridge stage for a run
+            // that has not reached the bridge yet.
+            if !self.shatters_bridge_engaged {
+                self.confirm_shatters_hm_bridge("The Source in view");
+            }
             self.confirm_shatters_hm_late("The Source in view");
             return;
         }
@@ -1389,6 +1416,18 @@ impl CombatTracker {
             || !hp_seen
             || max_hp <= 0
         {
+            return;
+        }
+        // A group can pull the first boss *before* destroying the Idol, so hard
+        // mode can be "wasted" on a fight already under way: evidence that only
+        // turns up while the bridge fight is running describes the bosses after
+        // it, and the Sentinel stays regular. This is the accepted gap -- an Idol
+        // killed out of view reads the same way.
+        if self.shatters_bridge_engaged {
+            tracing::info!(
+                "[SHATTERS_HM] Stone Idol at {hp}/{max_hp} HP read after the bridge \
+                 fight started: not proof of hard mode for the bridge"
+            );
             return;
         }
         let (max_hp, hp) = (max_hp as i64, hp as i64);
@@ -8907,6 +8946,105 @@ mod tests {
             "got {}",
             archmage.boss_name
         );
+    }
+
+    #[test]
+    fn shatters_idol_evidence_after_the_bridge_started_stays_regular() {
+        // Hard mode can be wasted by pulling the first boss before the Idol is
+        // destroyed: the group reaches the bridge, fights the Sentinel in regular
+        // mode, and only then takes the Idol down. The evidence belongs to the
+        // bosses after the bridge, so the Sentinel stays regular -- while the late
+        // stage (proved by The Source) still latches.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        // The Sentinel is in view: the bridge fight is under way.
+        t.on_object_spawn(
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            &status(
+                700,
+                vec![stat(StatType::MaxHP, 250_000), stat(StatType::HP, 250_000)],
+            ),
+            5,
+        );
+        // Only now does the Idol become damageable.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            8,
+        );
+        t.on_object_status(900, &status(900, vec![stat(StatType::HP, 20_000)]), 10);
+        // The Source (past the archmage) still proves the late stage.
+        t.on_object_spawn(
+            901,
+            crate::assets::SHATTERS_THE_SOURCE_TYPE,
+            &status_at(901, 200.0, 200.0, vec![]),
+            12,
+        );
+
+        t.on_damage(700, 1000, 100_000, 20);
+        t.on_local_hit(700, 7, 1000, 1000, 22);
+        t.on_object_status(700, &status(700, vec![stat(StatType::HP, 0)]), 26);
+        let bridge = t.on_object_removed(700, 30).expect("sentinel fight");
+        assert!(
+            !bridge.shatters_hm,
+            "evidence that arrived mid-fight does not make the Sentinel hard mode"
+        );
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+        assert!(
+            t.shatters_hm_revealed_name(crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE)
+                .is_some(),
+            "the late stage is still hard mode"
+        );
+    }
+
+    #[test]
+    fn shatters_tempest_marks_the_late_stage_only() {
+        // Tempest, the phoenix the hard-mode archmage summons, is the late
+        // stage's own evidence: the bridge stays regular when nothing proved hard
+        // mode before it, but the archmage and the King are renamed.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            10,
+        );
+        assert!(!bridge.shatters_hm, "no evidence before the bridge");
+
+        t.on_object_spawn(
+            902,
+            crate::assets::SHATTERS_TEMPEST_TYPE,
+            &status_at(902, 30.0, 30.0, vec![]),
+            20,
+        );
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            30,
+        );
+        assert_eq!(archmage.boss_name, "Nox the Wild Shadow");
+        assert!(archmage.shatters_hm);
+        let king =
+            finish_shatters_fight(&mut t, 702, crate::assets::SHATTERS_KING_TYPE, 500_000, 50);
+        assert_eq!(king.boss_name, "King Azamoth");
+        assert!(king.shatters_hm);
     }
 
     #[test]

@@ -924,6 +924,18 @@ pub const SHATTERS_THE_SOURCE_TYPE: i32 = 0x8242;
 /// "Shatters A22" -- so her name comes from [`OBJECT_NAME_OVERRIDES`].
 pub const SHATTERS_QUEEN_TYPE: i32 = 0x4456;
 
+/// Tempest, the phoenix the hard-mode Twilight Archmage summons (internal id
+/// "Shatters A17"). It is the late stage's own hard-mode evidence, for a run
+/// whose Source was destroyed before we ever saw it.
+///
+/// The type comes from the game files: Tempest is the only member of the
+/// `Archmage Phoenixes` group without a display name -- the other two are the
+/// named `shtrs Blizzard` (0x729e) and `shtrs Inferno` (0x729d) -- and its 15k
+/// pool matches the 135k/9 the fight card sums for it. Its "hard mode only"
+/// nature is from the game's own behaviour rather than captured traffic: no
+/// hard-mode run has been recorded with us attached yet.
+pub const SHATTERS_TEMPEST_TYPE: i32 = 0x4452;
+
 /// The name the UI shows for object types the catalog names internally or not at
 /// all, overriding the catalog name. The Shattered Queen is the only one so far:
 /// she has no `DisplayId` in the game files (deliberate on Deca's part -- her
@@ -1275,11 +1287,11 @@ const ENCOUNTERS: &[Encounter] = &[
         // The Archmage plus his three "Archmage Phoenix" bird spawns and the
         // arena generators, so their aggregated summaries group into this card.
         member_types: &[
-            29021, // Twilight Archmage (anchor)
-            29341, // Inferno (bird, summary representative)
-            29342, // Blizzard (bird, summary representative)
-            17490, // Tempest (bird, hardmode; summary representative)
-            33054, // Generator (summary representative)
+            29021,                 // Twilight Archmage (anchor)
+            29341,                 // Inferno (bird, summary representative)
+            29342,                 // Blizzard (bird, summary representative)
+            SHATTERS_TEMPEST_TYPE, // Tempest (bird, hard mode; summary representative)
+            33054,                 // Generator (summary representative)
         ],
     },
     // Legacy The Shatters: the Twilight Archmage plus his two "Retro Archmage
@@ -1808,11 +1820,11 @@ const AUX_TARGETS: &[(&[i32], AuxTarget)] = &[
         },
     ),
     (
-        &[17490],
+        &[SHATTERS_TEMPEST_TYPE],
         AuxTarget {
             category: "archmage_tempest",
             display_name: "Tempest",
-            repr_type: 17490,
+            repr_type: SHATTERS_TEMPEST_TYPE,
         },
     ),
     (
@@ -4909,7 +4921,7 @@ mod tests {
         let cases: &[(i32, &str, &str)] = &[
             (29341, "archmage_inferno", "Inferno"),
             (29342, "archmage_blizzard", "Blizzard"),
-            (17490, "archmage_tempest", "Tempest"),
+            (SHATTERS_TEMPEST_TYPE, "archmage_tempest", "Tempest"),
             (33054, "archmage_generators", "Twilight Archmage Generators"),
             (33072, "archmage_generators", "Twilight Archmage Generators"),
         ];
