@@ -6369,14 +6369,16 @@ mod tests {
 
     #[test]
     fn curated_event_adds_never_become_their_own_fight() {
-        // Goblin Fire (34557), the Goblin Shaman (34555), the Goblin Outpost
-        // (34554) and Legion Soldier (53007) are label-less event entries whose HP
-        // sits past the boss fallback, so the curated deny-list is the only thing
-        // keeping them out of combat history -- even when the local player lands
-        // hits on them.
+        // The Goblin Patriarch Adept Encounter entries -- Outpost (34554), Shaman
+        // (34555, shown as "Goblin Priest"), Villager (34556) and Fire (34557) --
+        // plus the Legion Soldier (53007) are label-less event entries that the
+        // realm event scales past the boss fallback, so the curated deny-list is
+        // the only thing keeping them out of combat history, even when the local
+        // player lands hits on them.
         for (object_type, name) in [
             (34554, "Goblin Outpost"),
             (34555, "Goblin Priest"),
+            (34556, "Goblin Villager"),
             (34557, "Goblin Fire"),
             (53007, "Legion Soldier"),
         ] {

@@ -4552,6 +4552,7 @@ mod tests {
         assert!(is_curated_non_boss_type(34547)); // World's Oyster Coral (add)
         assert!(is_curated_non_boss_type(34557)); // Goblin Fire (Goblin Patriarch event add)
         assert!(is_curated_non_boss_type(34555)); // Goblin Priest (Goblin Patriarch event add)
+        assert!(is_curated_non_boss_type(34556)); // Goblin Villager (Goblin Patriarch event add)
         assert!(is_curated_non_boss_type(34554)); // Goblin Outpost (Goblin Patriarch event set-piece)
         assert!(is_curated_non_boss_type(53007)); // Legion Soldier (Beacon Guardian add)
         assert!(is_curated_non_boss_type(34583)); // White Blood Cell (Bloodroot Heart add)
