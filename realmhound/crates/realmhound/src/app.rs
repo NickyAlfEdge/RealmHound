@@ -3589,7 +3589,8 @@ impl RealmHoundApp {
     /// Render the Live Feed settings panel.
     fn render_live_feed_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
         use realmhound_core::settings::{
-            DungeonNameStyle, DustLabel, JoinPosition, LootLabel, RealmStatusMode, XpLabel,
+            DungeonNameStyle, DustLabel, JoinPosition, LootLabel, NexusMarker, RealmStatusMode,
+            XpLabel,
         };
 
         ui.add_space(10.0);
@@ -4043,6 +4044,20 @@ impl RealmHoundApp {
 
                 ui.add_space(6.0);
 
+                settings_changed |= shadcn
+                    .switch(
+                        ui,
+                        &mut current.callout_percent,
+                        "Include % sign in loot/dust/xp values",
+                    )
+                    .hover_tip(
+                        "When on, reward bonuses include the percent sign (e.g. \"15% lb\"). \
+                     Off by default (e.g. \"15 lb\").",
+                    )
+                    .changed();
+
+                ui.add_space(6.0);
+
                 shadcn.field_row(ui, |ui| {
                     fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
                         ui.label("Realm status:");
@@ -4094,30 +4109,38 @@ impl RealmHoundApp {
 
                 ui.add_space(6.0);
 
-                settings_changed |= shadcn
-                    .switch(ui, &mut current.opened_in_nexus, "Opened in Nexus")
-                    .hover_tip(
-                        "Append \"in nex\" to calls for dungeons opened in the Nexus: entered \
-                         through a portal there (a key, or one already spawned), or joined into \
-                         an instance that runs on the Nexus server (a party call from a realm). \
-                         The Vault, Guild Hall and Bazaar count as the Nexus. Realms entered \
-                         from a hub (Meridian, Hearth, ...) are never Nexus entries.",
-                    )
-                    .changed();
-
-                ui.add_space(6.0);
-
-                settings_changed |= shadcn
-                    .switch(
-                        ui,
-                        &mut current.callout_percent,
-                        "Include % sign in loot/dust/xp values",
-                    )
-                    .hover_tip(
-                        "When on, reward bonuses include the percent sign (e.g. \"15% lb\"). \
-                     Off by default (e.g. \"15 lb\").",
-                    )
-                    .changed();
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Opened in Nexus:");
+                    });
+                    let cur = match current.nexus_marker {
+                        NexusMarker::None => "none",
+                        NexusMarker::Nex => "nex",
+                        NexusMarker::InNexus => "in nexus",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
+                        .select(
+                            ui,
+                            "nexus_marker",
+                            &mut sel,
+                            140.0,
+                            &[("none", "none"), ("nex", "nex"), ("in nexus", "in nexus")],
+                        )
+                        .hover_tip(
+                            "Adds a Nexus marker to the call for the dungeons opened via keys in \
+                             Nexus/Vault/Guild Hall/Bazaar.",
+                        )
+                        .changed()
+                    {
+                        current.nexus_marker = match sel.as_deref() {
+                            Some("nex") => NexusMarker::Nex,
+                            Some("in nexus") => NexusMarker::InNexus,
+                            _ => NexusMarker::None,
+                        };
+                        settings_changed = true;
+                    }
+                });
             });
 
             ui.add_space(12.0);

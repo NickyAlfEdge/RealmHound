@@ -626,7 +626,7 @@ fn same_modifier(a: &str, b: &str) -> bool {
 ///
 /// Realm entries reached from a hub are not hub maps: they report their own
 /// names (Meridian, Hearth, ...) plus a realm score, so a realm portal used in
-/// the Nexus never produces the `in nex` tag.
+/// the Nexus never produces a Nexus marker.
 fn is_hub_map(display_name: &str) -> bool {
     const HUB_MARKERS: &[&str] = &["nexus", "vault", "guildhall", "guild hall", "bazaar"];
     let name = display_name.trim().to_ascii_lowercase();
@@ -984,9 +984,10 @@ pub struct LiveFeedPanel {
     /// Minimum realm score (%) for the `in <n>% realm` tag. Mirrors
     /// `Settings.live_feed.realm_status_threshold`.
     realm_status_threshold: i32,
-    /// Whether a dungeon opened in the Nexus gets `in nex` appended. Mirrors
-    /// `Settings.live_feed.opened_in_nexus`.
-    opened_in_nexus: bool,
+    /// The Nexus marker a dungeon opened in a hub space gets appended (`nex` or
+    /// `in nexus`; nothing when unset). Mirrors
+    /// `Settings.live_feed.nexus_marker`.
+    nexus_marker: realmhound_core::settings::NexusMarker,
     /// Whether callout reward values include a `%` sign.
     /// Mirrors `Settings.live_feed.callout_percent`.
     callout_percent: bool,
@@ -1153,7 +1154,7 @@ impl LiveFeedPanel {
             dungeon_mod_sets: HashMap::new(),
             realm_status: realmhound_core::settings::RealmStatusMode::default(),
             realm_status_threshold: 33,
-            opened_in_nexus: false,
+            nexus_marker: realmhound_core::settings::NexusMarker::None,
             callout_percent: false,
             auto_clipboard_calls: false,
             auto_clipboard_seed: None,
@@ -1214,7 +1215,7 @@ impl LiveFeedPanel {
             || self.learn_event_mods_runs != settings.learn_event_mods_runs
             || self.realm_status != settings.realm_status
             || self.realm_status_threshold != settings.realm_status_threshold
-            || self.opened_in_nexus != settings.opened_in_nexus
+            || self.nexus_marker != settings.nexus_marker
             || self.callout_percent != settings.callout_percent
             || self.reward_mods != settings.reward_mods
             || self.dungeon_name_overrides != settings.dungeon_name_overrides;
@@ -1241,7 +1242,7 @@ impl LiveFeedPanel {
         );
         self.realm_status = settings.realm_status;
         self.realm_status_threshold = settings.realm_status_threshold;
-        self.opened_in_nexus = settings.opened_in_nexus;
+        self.nexus_marker = settings.nexus_marker;
         self.callout_percent = settings.callout_percent;
         self.auto_clipboard_calls = settings.auto_clipboard_dungeon_calls;
         // Turning the feature off releases any callout it is holding.
@@ -1424,7 +1425,7 @@ impl LiveFeedPanel {
         };
         let realm_mode = self.realm_status;
         let realm_threshold = self.realm_status_threshold;
-        let nexus_opened = self.opened_in_nexus;
+        let nexus_marker = self.nexus_marker;
         for entry in &mut self.entries {
             if let FeedEntry::Dungeon(d) = entry {
                 // The realm status is only named while the realm the dungeon was
@@ -1442,7 +1443,7 @@ impl LiveFeedPanel {
                 // an entry originates in one place only).
                 let origin_status = match realm_status {
                     Some(status) => Some(status),
-                    None if d.entered_from_nexus && nexus_opened => Some("in nex".to_string()),
+                    None if d.entered_from_nexus => nexus_marker.text().map(str::to_string),
                     None => None,
                 };
                 let learned = learned_event_mods.get(&d.dungeon_name);
@@ -2386,7 +2387,7 @@ impl LiveFeedPanel {
         let entered_from_nexus = self.left_from_hub || hub_hosted;
         let origin_status = match realm_status {
             Some(status) => Some(status),
-            None if entered_from_nexus && self.opened_in_nexus => Some("in nex".to_string()),
+            None if entered_from_nexus => self.nexus_marker.text().map(str::to_string),
             None => None,
         };
         // Recognize (and remember) the mods this event applies to every instance
@@ -6097,6 +6098,7 @@ fn draw_chain_link(ui: &mut Ui, dim: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use realmhound_core::settings::NexusMarker;
 
     fn combined_variant(
         mark_id: i32,
@@ -7075,25 +7077,25 @@ mod tests {
         // Setting on: the Nexus is named.
         let mut panel = LiveFeedPanel::new();
         panel.update_location("Nexus", "Nexus", 0, 0);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.pending_portal_spawn = Some(std::time::Instant::now());
         enter_dungeon(&mut panel, 1, "Snake Pit");
-        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nex"));
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
 
         // Party call join while in the Nexus (no portal of ours, no realm in
         // play) is the same origin: the dungeon's MapInfo follows the Nexus with
         // no observed portal spawn, so only the estimated window applies.
         let mut panel = LiveFeedPanel::new();
         panel.update_location("Nexus", "Nexus", 0, 0);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.update_location("Snake Pit", "NexusPortal.", 0, 0);
         panel.push_dungeon(2, "Snake Pit", &[], None);
-        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nex"));
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
 
         // A dungeon entered from a realm is never a Nexus entry, even with the
         // realm-status suffix off.
         let mut panel = panel_in_realm("Medusa", 20, 100);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.pending_portal_spawn = Some(std::time::Instant::now());
         enter_dungeon(&mut panel, 1, "Snake Pit");
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
@@ -7104,12 +7106,12 @@ mod tests {
         for hub in ["{s.vault}", "{s.guildhall}", "Bazaar"] {
             let mut panel = LiveFeedPanel::new();
             panel.update_location(hub, hub, 0, 0);
-            panel.opened_in_nexus = true;
+            panel.nexus_marker = NexusMarker::InNexus;
             panel.pending_portal_spawn = Some(std::time::Instant::now());
             enter_dungeon(&mut panel, 1, "Snake Pit");
             assert_eq!(
                 newest_callout(&panel).as_deref(),
-                Some("snake in nex"),
+                Some("snake in nexus"),
                 "{hub} counts as the nexus"
             );
         }
@@ -7119,7 +7121,7 @@ mod tests {
         for oryx in ["{s.oryx_s_castle}", "{s.wine_cellar}"] {
             let mut panel = LiveFeedPanel::new();
             panel.update_location(oryx, oryx, 0, 0);
-            panel.opened_in_nexus = true;
+            panel.nexus_marker = NexusMarker::InNexus;
             panel.pending_portal_spawn = Some(std::time::Instant::now());
             enter_dungeon(&mut panel, 1, "Snake Pit");
             assert_eq!(newest_callout(&panel).as_deref(), Some("snake"), "{oryx}");
@@ -7130,7 +7132,7 @@ mod tests {
         // realm then gets the realm treatment, not `in nex`.
         let mut panel = LiveFeedPanel::new();
         panel.update_location("Nexus", "Nexus", 0, 0);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.update_location("Meridian", "NexusPortal.Meridian", 10, 100);
         panel.pending_portal_spawn = Some(std::time::Instant::now());
         enter_dungeon(&mut panel, 1, "Snake Pit");
@@ -7139,11 +7141,19 @@ mod tests {
         // A dungeon keyed open inside another dungeon names neither origin.
         let mut panel = LiveFeedPanel::new();
         panel.update_location("Nexus", "Nexus", 0, 0);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.update_location("Spider Den", "Spider Den", 0, 0);
         panel.pending_portal_spawn = Some(std::time::Instant::now());
         enter_dungeon(&mut panel, 1, "Snake Pit");
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // The shorter marker option appends just its own text.
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.nexus_marker = NexusMarker::Nex;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake nex"));
     }
 
     #[test]
@@ -7156,11 +7166,11 @@ mod tests {
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
 
         // Turning the setting on rewrites the entries already in the feed.
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.recompute_dungeon_callouts();
-        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nex"));
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
 
-        panel.opened_in_nexus = false;
+        panel.nexus_marker = NexusMarker::None;
         panel.recompute_dungeon_callouts();
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
     }
@@ -7174,20 +7184,20 @@ mod tests {
         // until the entry it belongs to shows up.
         let _assets = crate::test_support::modifier_assets();
         let mut panel = panel_in_realm("Zephyr", 20, 100);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         // The hub host is named as the client reconnects...
         panel.set_server_name("USMidWest".to_string());
         // ...and the instance's MapInfo follows it.
         panel.update_location("Davy Jones' Locker", "NexusPortal.Zephyr", 0, 0);
         panel.currently_in_dungeon = true;
         panel.push_dungeon(1, "Snake Pit", &[], None);
-        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nex"));
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
 
         // The hint is spent: the next dungeon entered from a realm keeps its own
         // origin, and a hint that was used up by reaching the Nexus cannot leak
         // into it either.
         let mut panel = panel_in_realm("Zephyr", 20, 100);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.set_server_name("USMidWest".to_string());
         panel.update_location("Nexus", "Nexus", 0, 0);
         panel.update_location("Realm of the Mad God", "NexusPortal.Zephyr", 0, 0);
@@ -7206,7 +7216,7 @@ mod tests {
         // end up on: the hub is the one host RH can name, realm and dungeon
         // backends are unmapped.
         let mut panel = panel_in_realm("Zephyr", 20, 100);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         // The dungeon's MapInfo follows the realm's directly (no portal of ours).
         panel.update_location("Davy Jones' Locker", "NexusPortal.Zephyr", 0, 0);
         panel.currently_in_dungeon = true;
@@ -7219,7 +7229,7 @@ mod tests {
 
         // The instance turns out to live on the USMidWest hub (18.221.120.59).
         panel.set_server_name("USMidWest".to_string());
-        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nex"));
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
 
         // Off by default: the same sequence names nothing.
         let mut panel = panel_in_realm("Zephyr", 20, 100);
@@ -7232,7 +7242,7 @@ mod tests {
         // A named host that arrives outside a dungeon (the Nexus itself, or a
         // later reconnect) never rewrites an entry.
         let mut panel = panel_in_realm("Zephyr", 20, 100);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.update_location("Sprite World", "NexusPortal.Zephyr", 0, 0);
         panel.currently_in_dungeon = true;
         panel.push_dungeon(1, "Snake Pit", &[], None);
@@ -7244,7 +7254,7 @@ mod tests {
         // host, which for a hub-opened parent is the hub: the host hint must not
         // call the child a Nexus entry.
         let mut panel = panel_in_realm("Zephyr", 20, 100);
-        panel.opened_in_nexus = true;
+        panel.nexus_marker = NexusMarker::InNexus;
         panel.update_location("Sprite World", "NexusPortal.Zephyr", 0, 0);
         panel.left_from_dungeon = true;
         panel.currently_in_dungeon = true;

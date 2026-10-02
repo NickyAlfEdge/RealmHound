@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Current settings file version for migration support.
-const SETTINGS_VERSION: u32 = 7;
+const SETTINGS_VERSION: u32 = 8;
 
 /// Rename an unparseable data file to a timestamped `.corrupt-<ts>.bak` sibling
 /// so a single bad field can't silently wipe the user's data on the next save.
@@ -361,15 +361,23 @@ pub struct LiveFeedSettings {
     #[serde(default = "default_realm_status_threshold")]
     pub realm_status_threshold: i32,
 
-    /// Whether a dungeon *opened in the Nexus* -- entered through a dungeon
-    /// portal there (a key, or one that had already spawned) or joined into an
-    /// instance running on the region's hub server (a party call from a realm) --
-    /// gets `in nex` appended to its callout. The Vault, Guild Hall and Bazaar
-    /// count as the Nexus, since the game treats dungeons opened in them the same
-    /// way. Independent of [`Self::realm_status`], which covers portals used in a
+    /// What marks a dungeon call as opened in the Nexus (a key popped in the
+    /// Nexus, Vault, Guild Hall or Bazaar, or an instance joined into that runs on
+    /// the Nexus server). Defaults to [`NexusMarker::None`].
+    ///
+    /// Independent of [`Self::realm_status`], which covers portals used in a
     /// realm; realm entries reached from a hub keep their own map names and are
-    /// never Nexus entries. Defaults to `false`.
+    /// never Nexus entries.
+    ///
+    /// Older files store this as the boolean `opened_in_nexus`, which the load
+    /// migration reads as `true` = [`NexusMarker::InNexus`].
     #[serde(default)]
+    pub nexus_marker: NexusMarker,
+
+    /// Deprecated: superseded by [`Self::nexus_marker`], whose dropdown replaced
+    /// this boolean (on meant `in nex`). Read so an existing file keeps its
+    /// choice; never written again.
+    #[serde(default, skip_serializing)]
     pub opened_in_nexus: bool,
 
     /// Whether loot/dust/xp callout values include the `%` sign. Defaults to
@@ -728,6 +736,29 @@ pub enum RealmStatusMode {
     Score,
 }
 
+/// The Nexus marker a dungeon call carries when it was opened in a hub space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NexusMarker {
+    /// Never mention the Nexus (the default).
+    #[default]
+    None,
+    /// Append `nex`.
+    Nex,
+    /// Append `in nexus`.
+    InNexus,
+}
+
+impl NexusMarker {
+    /// The text appended to the callout, or `None` when no marker is wanted.
+    pub fn text(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Nex => Some("nex"),
+            Self::InNexus => Some("in nexus"),
+        }
+    }
+}
+
 /// Realm completion (percent) from which a realm counts as closing.
 ///
 /// Above this the realm can no longer be joined from the outside, which is what
@@ -971,6 +1002,7 @@ impl Default for LiveFeedSettings {
             learn_event_mods_runs: default_learn_event_mods_runs(),
             realm_status: RealmStatusMode::default(),
             realm_status_threshold: default_realm_status_threshold(),
+            nexus_marker: NexusMarker::None,
             opened_in_nexus: false,
             callout_percent: false,
             auto_clipboard_dungeon_calls: false,
@@ -2553,6 +2585,13 @@ impl Settings {
             self.taskbar.mission_overrides.clear();
             self.taskbar.quest_overrides.clear();
         }
+        if self.version < 8 {
+            // The Nexus switch became a dropdown whose default is no marker at
+            // all: carry the old boolean across as the `in nexus` text it appended.
+            if self.live_feed.opened_in_nexus {
+                self.live_feed.nexus_marker = NexusMarker::InNexus;
+            }
+        }
         self.version = SETTINGS_VERSION;
     }
 
@@ -2875,8 +2914,8 @@ mod tests {
         assert_eq!(lf.realm_status, RealmStatusMode::None);
         assert_eq!(lf.realm_status_threshold, 33);
         assert!(
-            !lf.opened_in_nexus,
-            "dungeons opened in the nexus are not named by default"
+            lf.nexus_marker == NexusMarker::None,
+            "dungeons opened in the nexus carry no marker by default"
         );
         assert!(
             !lf.auto_clipboard_dungeon_calls,
@@ -2977,6 +3016,37 @@ mod tests {
             s.taskbar.quest_tracked("qX"),
             "override cleared, inherits on"
         );
+    }
+
+    #[test]
+    fn v8_migration_carries_the_nexus_switch_into_the_dropdown() {
+        // Files written before the dropdown store a boolean, where "on" meant the
+        // `in nex` text. Loading one keeps that choice as `in nexus`, and the next
+        // save writes only the new field.
+        let legacy = r#"{ "version": 7, "live_feed": { "opened_in_nexus": true } }"#;
+        let loaded = Settings::from_json(legacy).expect("legacy settings parse");
+        assert_eq!(loaded.live_feed.nexus_marker, NexusMarker::InNexus);
+        assert_eq!(loaded.version, SETTINGS_VERSION);
+
+        let off = r#"{ "version": 7, "live_feed": { "opened_in_nexus": false } }"#;
+        assert_eq!(
+            Settings::from_json(off).unwrap().live_feed.nexus_marker,
+            NexusMarker::None
+        );
+
+        let saved = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            !saved.contains("opened_in_nexus"),
+            "the deprecated boolean must not be written back: {saved}"
+        );
+        assert!(saved.contains("\"nexus_marker\":\"InNexus\""), "{saved}");
+    }
+
+    #[test]
+    fn nexus_marker_options_name_the_nexus() {
+        assert_eq!(NexusMarker::None.text(), None);
+        assert_eq!(NexusMarker::Nex.text(), Some("nex"));
+        assert_eq!(NexusMarker::InNexus.text(), Some("in nexus"));
     }
 
     #[test]
