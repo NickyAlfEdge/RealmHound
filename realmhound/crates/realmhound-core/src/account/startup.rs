@@ -15,7 +15,7 @@
 //! There is never a fallback to legacy flat paths: a blocked or failed migration
 //! resolves to recovery, and a corrupt or missing profile never becomes empty
 //! replacement state. The resolver itself legitimately reads the registry and
-//! manifests, and migration may use credentials for a known migration; the
+//! manifests, and startup deletes legacy saved credentials; the
 //! zero-open guarantee applies to the resolved discovery/recovery outcomes.
 
 use std::io;
@@ -28,10 +28,9 @@ use super::migration::journal::RecoveryStatus;
 use super::migration::{FlatLayoutMigration, MigrationError, MigrationOutcome};
 use super::paths::PROFILE_VERSION;
 use super::{
-    credential_target, AccountError, AccountId, AccountKey, AccountPaths, AccountPersistencePaths,
-    AccountRegistry, AccountRegistryEntry, AccountRegistryStore, CredentialStore, ProfileLock,
-    ProfileLockError, ProfileManifest, ProfileSchemas, ReconciliationReport, RegistryMode,
-    SavedCredential,
+    AccountError, AccountId, AccountKey, AccountPaths, AccountPersistencePaths, AccountRegistry,
+    AccountRegistryEntry, AccountRegistryStore, CredentialStore, ProfileLock, ProfileLockError,
+    ProfileManifest, ProfileSchemas, ReconciliationReport, RegistryMode,
 };
 use crate::settings::{Settings, SettingsLoadError};
 use crate::storage::{load_json, LoadOutcome, StorageError, StorageRoot};
@@ -52,6 +51,8 @@ pub struct StartupOutcome {
     pub settings: Settings,
     /// The resolved startup mode.
     pub resolution: StartupResolution,
+    /// Legacy credential cleanup failures, displayed without blocking capture.
+    pub cleanup_warnings: Vec<String>,
 }
 
 /// The three mutually exclusive ways RealmHound can start.
@@ -254,7 +255,6 @@ impl std::fmt::Display for StartupError {
 fn redact_migration(error: &MigrationError) -> String {
     match error {
         MigrationError::LockContended { .. } => "another instance owns migration".to_string(),
-        MigrationError::TokenMalformed => "the saved sign-in token is malformed".to_string(),
         MigrationError::JournalVersionUnsupported { .. } => {
             "the migration record is a newer version".to_string()
         }
@@ -280,7 +280,6 @@ pub struct AccountContext {
     account_key: AccountKey,
     account_id: AccountId,
     display_name: Option<String>,
-    credential_target: String,
     paths: AccountPaths,
     persistence: AccountPersistencePaths,
     credentials: Arc<dyn CredentialStore>,
@@ -314,11 +313,6 @@ impl AccountContext {
         self.display_name.as_deref()
     }
 
-    /// The deterministic credential-store target for the selected profile.
-    pub fn credential_target(&self) -> &str {
-        &self.credential_target
-    }
-
     /// The account-scoped persistence paths for every profile resource.
     pub fn persistence(&self) -> &AccountPersistencePaths {
         &self.persistence
@@ -340,22 +334,6 @@ impl AccountContext {
     /// legitimately missing snapshot (opened after the lock) initializes empty.
     pub fn load_account_data_strict(&self) -> io::Result<AccountData> {
         self.persistence.account_data_repository().load_strict()
-    }
-
-    /// Read the selected profile credential through the credential store.
-    ///
-    /// Never blocks startup: a store error is a redacted warning and means "no
-    /// token", and the plaintext `access_token.txt` is never consulted.
-    pub fn read_credential(&self) -> Option<SavedCredential> {
-        match self.credentials.read(&self.credential_target) {
-            Ok(credential) => credential,
-            Err(error) => {
-                tracing::warn!(
-                    "[ACCOUNT] Credential read unavailable ({error}); continuing without a token"
-                );
-                None
-            }
-        }
     }
 
     /// The shared credential store bound to this process.
@@ -440,16 +418,67 @@ impl StartupResolver {
 
     /// [`Self::resolve_startup`] at an explicit time (for tests).
     pub fn resolve_startup_at(&self, now: DateTime<Utc>) -> StartupOutcome {
-        match self.load_settings() {
+        let mut outcome = match self.load_settings() {
             Ok(settings) => StartupOutcome {
                 settings,
                 resolution: self.resolve_at(now),
+                cleanup_warnings: Vec::new(),
             },
             Err(error) => StartupOutcome {
                 settings: Settings::default(),
                 resolution: recovery(error),
+                cleanup_warnings: Vec::new(),
             },
+        };
+        outcome.cleanup_warnings = self.cleanup_credentials();
+        outcome
+    }
+
+    /// Retry legacy cleanup on every launch, even if an earlier attempt failed.
+    /// Never reads token contents or touches diagnostic logs and recordings.
+    fn cleanup_credentials(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        match self.credentials.purge_accounts() {
+            Ok(()) => {
+                match self.registry_store.reconcile() {
+                    Ok(reconciled) => {
+                        for entry in reconciled.registry.accounts() {
+                            if entry.credential_target().is_some() {
+                                if let Err(error) = self.registry_store.set_credential_target(entry.key(), None) {
+                                    warnings.push(format!("Could not clear an obsolete credential reference: {error}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => warnings.push(format!("Could not check obsolete credential references: {error}")),
+                }
+            }
+            Err(error) => warnings.push(format!(
+                "Could not remove old RealmHound/account/<account key> credentials from Windows Credential Manager: {error}. \
+                 Remove those RealmHound entries manually or restart RealmHound to retry."
+            )),
         }
+        for filename in ["access_token.txt", "access_token.txt.tmp"] {
+            let removal = self
+                .local
+                .ensure_no_links(filename)
+                .map_err(|error| error.to_string())
+                .and_then(|path| match std::fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                });
+            if let Err(error) = removal {
+                warnings.push(format!(
+                    "Could not remove the old {filename} in the RealmHound data folder: {error}. \
+                 It will not be used. Restart RealmHound to retry cleanup."
+                ));
+            }
+        }
+        for warning in &warnings {
+            tracing::warn!("[TOKEN] {warning}");
+        }
+        warnings
     }
 
     /// Load global settings from the explicit root without relocating a corrupt
@@ -609,7 +638,6 @@ impl StartupResolver {
             account_key: key,
             account_id: manifest.account_id().clone(),
             display_name: entry.display_name().map(str::to_string),
-            credential_target: credential_target(key),
             paths,
             persistence,
             credentials: self.credentials.clone(),

@@ -36,8 +36,8 @@ use lock::MigrationLock;
 use settings_view::read_legacy_account_settings;
 
 use crate::account::{
-    AccountError, AccountId, AccountKey, AccountPaths, AccountRegistryStore, CredentialError,
-    CredentialStore, MigrationKnownBinding, ProfileManifest, SavedCredential,
+    AccountError, AccountId, AccountKey, AccountPaths, AccountRegistryStore, CredentialStore,
+    MigrationKnownBinding, ProfileManifest,
 };
 use crate::storage::{
     load_json, write_json_atomic_at, BackupPolicy, LoadOutcome, StorageError, StorageRoot,
@@ -234,12 +234,6 @@ pub enum MigrationError {
     /// Backup deletion was requested before the retention threshold.
     #[error("migration backup is not yet eligible for deletion")]
     DeletionNotEligible,
-    /// The legacy plaintext access token file could not be parsed.
-    ///
-    /// The malformed file is left in place and the phase does not advance so the
-    /// import can be retried. No variant ever carries token contents.
-    #[error("legacy access token file is malformed")]
-    TokenMalformed,
     /// A filesystem existence probe failed for a reason other than absence
     /// (for example a permission or metadata error), so absence cannot be
     /// assumed.
@@ -622,10 +616,6 @@ impl FlatLayoutMigration {
             }
         }
 
-        // Credential import happens before registry commit so the credential
-        // target can be recorded atomically with the selection.
-        let credential_target = self.import_known_token(journal)?;
-
         if phase_before(journal.phase, MigrationPhase::RegistryCommitted) {
             let binding = MigrationKnownBinding {
                 account_key,
@@ -634,7 +624,7 @@ impl FlatLayoutMigration {
                 verified_at: now,
                 last_client_seen_unix: settings.last_client_seen_unix,
                 last_client_launch_unix: settings.last_client_launch_unix,
-                credential_target: credential_target.clone(),
+                credential_target: None,
             };
             tracing::info!("[MIGRATION] Committing account selection to the registry");
             self.registry.commit_migration_known(&binding)?;
@@ -659,7 +649,11 @@ impl FlatLayoutMigration {
         if phase_before(journal.phase, MigrationPhase::OriginalsBackedUp) {
             tracing::info!("[MIGRATION] Backing up and removing legacy originals");
             self.back_up_originals(journal, items)?;
-            self.remove_plaintext_token(journal)?;
+            if let Err(error) = self.remove_plaintext_token(journal) {
+                // Startup retries cleanup and surfaces a warning, independently
+                // of migrating account data.
+                tracing::warn!("[MIGRATION] Legacy credential cleanup pending: {error}");
+            }
             journal.phase = MigrationPhase::OriginalsBackedUp;
             save_journal(&self.local, journal)?;
             self.check_failpoint("originals-backed-up")?;
@@ -1284,82 +1278,17 @@ impl FlatLayoutMigration {
         Ok(())
     }
 
-    fn import_known_token(
-        &self,
-        journal: &mut MigrationJournal,
-    ) -> Result<Option<String>, MigrationError> {
-        let key = journal
-            .target_account_key
-            .ok_or_else(|| MigrationError::Invariant {
-                detail: "known token import has no target key".to_string(),
-            })?;
-
-        if !matches!(journal.credential_outcome, CredentialOutcome::NotApplicable) {
-            // Already attempted; re-deriving the recorded target from the key is
-            // sufficient because commit is idempotent and re-imports.
-            return Ok(match journal.credential_outcome {
-                CredentialOutcome::Imported | CredentialOutcome::Removed => {
-                    Some(crate::account::credential_target(key))
-                }
-                _ => None,
-            });
-        }
-
-        let token_path = self.local.ensure_no_links("access_token.txt")?;
-        let raw = match std::fs::read_to_string(&token_path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                journal.credential_outcome = CredentialOutcome::NotApplicable;
-                save_journal(&self.local, journal)?;
-                return Ok(None);
-            }
-            Err(source) => {
-                return Err(MigrationError::CopyIo {
-                    path: token_path,
-                    source,
-                })
-            }
-        };
-
-        // Strict, reusable parse seam: preserve the captured time, accept a
-        // legacy bare token, and treat malformed JSON as a retryable error that
-        // leaves the file in place. The token contents are never logged.
-        let saved = match crate::api::parse_saved_token_strict(&raw) {
-            crate::api::TokenParse::Valid(saved) => saved,
-            crate::api::TokenParse::Empty => {
-                journal.credential_outcome = CredentialOutcome::NotApplicable;
-                save_journal(&self.local, journal)?;
-                return Ok(None);
-            }
-            crate::api::TokenParse::Malformed => return Err(MigrationError::TokenMalformed),
-        };
-
-        let target = crate::account::credential_target(key);
-        let credential = SavedCredential::new(saved.token, saved.captured_at);
-        match self.credentials.write(&target, &credential) {
-            Ok(()) => {
-                journal.credential_outcome = CredentialOutcome::Imported;
-                save_journal(&self.local, journal)?;
-                Ok(Some(target))
-            }
-            Err(CredentialError::Unavailable)
-            | Err(CredentialError::Backend { .. })
-            | Err(CredentialError::MalformedPayload)
-            | Err(CredentialError::InvalidTarget) => {
-                // Secure-store failure degrades to a missing token; migration
-                // continues and the token file is still removed after commit.
-                journal.credential_outcome = CredentialOutcome::ImportFailed;
-                save_journal(&self.local, journal)?;
-                Ok(None)
-            }
-        }
-    }
-
     fn remove_plaintext_token(&self, journal: &mut MigrationJournal) -> Result<(), MigrationError> {
+        if let Some(key) = journal.target_account_key {
+            self.credentials
+                .delete(&crate::account::credential_target(key))
+                .map_err(|error| MigrationError::Invariant {
+                    detail: format!("legacy credential deletion failed: {error}"),
+                })?;
+        }
         let token_path = self.local.ensure_no_links("access_token.txt")?;
-        // Only an already-absent token is ignored. Any other failure (for
-        // example a permission or metadata error) is retryable and must not
-        // advance the phase, so the plaintext is never silently left behind.
+        // Only absence counts as successful cleanup. Other failures are logged
+        // by the caller and retried by startup independently of data migration.
         match std::fs::remove_file(&token_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

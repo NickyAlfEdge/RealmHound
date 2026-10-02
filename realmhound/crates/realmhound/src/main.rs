@@ -155,7 +155,14 @@ fn main() -> Result<()> {
             eframe::run_native(
                 "RealmHound",
                 options,
-                Box::new(move |cc| Ok(RootApp::build(&cc.egui_ctx, outcome.settings, launch))),
+                Box::new(move |cc| {
+                    Ok(Box::new(RootApp::build(
+                        &cc.egui_ctx,
+                        outcome.settings,
+                        launch,
+                        outcome.cleanup_warnings,
+                    )))
+                }),
             )
             .map_err(|e| anyhow::anyhow!("Failed to run application: {}", e))?;
         }
@@ -463,7 +470,7 @@ enum StartupMessage {
     /// Migration work is actually pending; show the migration screen.
     Migrating,
     /// Startup resolved; build the application.
-    Done(Settings, StartupLaunch),
+    Done(Settings, StartupLaunch, Vec<String>),
 }
 
 /// Top-level application shown from launch. It starts in a neutral resource-free
@@ -474,6 +481,7 @@ struct RootApp {
     state: RootState,
     resolved: mpsc::Receiver<StartupMessage>,
     started: Instant,
+    cleanup_warnings: Vec<String>,
 }
 
 enum RootState {
@@ -491,6 +499,7 @@ impl RootApp {
             state: RootState::Starting,
             resolved,
             started: Instant::now(),
+            cleanup_warnings: Vec::new(),
         }
     }
 
@@ -499,8 +508,9 @@ impl RootApp {
         egui_ctx: &egui::Context,
         settings: Settings,
         launch: StartupLaunch,
-    ) -> Box<dyn eframe::App> {
-        match launch {
+        cleanup_warnings: Vec<String>,
+    ) -> Self {
+        let app: Box<dyn eframe::App> = match launch {
             StartupLaunch::Selected(account) => {
                 let settings = Arc::new(RwLock::new(settings));
                 match RealmHoundApp::new(egui_ctx, settings, account) {
@@ -524,6 +534,12 @@ impl RootApp {
                 info!("[STARTUP] Recovery: {message}");
                 Box::new(BoundedApp::recovery(message))
             }
+        };
+        Self {
+            state: RootState::Active(app),
+            resolved: mpsc::channel().1,
+            started: Instant::now(),
+            cleanup_warnings,
         }
     }
 
@@ -561,6 +577,12 @@ impl RootApp {
 }
 
 impl eframe::App for RootApp {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let RootState::Active(app) = &mut self.state {
+            app.on_exit(gl);
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(windows)]
         crate::apply_window_chrome(&*frame);
@@ -569,8 +591,8 @@ impl eframe::App for RootApp {
                 Ok(StartupMessage::Migrating) => {
                     self.state = RootState::Migrating;
                 }
-                Ok(StartupMessage::Done(settings, launch)) => {
-                    self.state = RootState::Active(Self::build(ctx, settings, launch));
+                Ok(StartupMessage::Done(settings, launch, warnings)) => {
+                    *self = Self::build(ctx, settings, launch, warnings);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -597,6 +619,45 @@ impl eframe::App for RootApp {
         if let RootState::Active(app) = &mut self.state {
             app.update(ctx, frame);
         }
+        if !self.cleanup_warnings.is_empty() {
+            let mut dismiss = false;
+            egui::Window::new("Old credential cleanup needs attention")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("New access tokens are memory-only, but some old stored data could not be cleaned up.");
+                    for warning in &self.cleanup_warnings {
+                        ui.label(warning);
+                    }
+                    dismiss = ui.button("Dismiss for this session").clicked();
+                });
+            if dismiss {
+                self.cleanup_warnings.clear();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod root_app_tests {
+    use super::*;
+    use eframe::App;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn root_app_forwards_shutdown_to_active_app() {
+        struct ExitApp(Arc<AtomicBool>);
+        impl eframe::App for ExitApp {
+            fn update(&mut self, _: &egui::Context, _: &mut eframe::Frame) {}
+            fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let exited = Arc::new(AtomicBool::new(false));
+        let mut root = RootApp::new(mpsc::channel().1);
+        root.state = RootState::Active(Box::new(ExitApp(exited.clone())));
+        root.on_exit(None);
+        assert!(exited.load(Ordering::SeqCst));
     }
 }
 
@@ -634,6 +695,7 @@ fn resolve_startup(progress: &mpsc::Sender<StartupMessage>) {
             let _ = progress.send(StartupMessage::Done(
                 Settings::default(),
                 StartupLaunch::Recovery("Failed to initialize storage".to_string()),
+                Vec::new(),
             ));
             return;
         }
@@ -643,7 +705,11 @@ fn resolve_startup(progress: &mpsc::Sender<StartupMessage>) {
     }
     let outcome = resolver.resolve_startup();
     let launch = into_launch(outcome.resolution);
-    let _ = progress.send(StartupMessage::Done(outcome.settings, launch));
+    let _ = progress.send(StartupMessage::Done(
+        outcome.settings,
+        launch,
+        outcome.cleanup_warnings,
+    ));
 }
 
 /// Build the platform credential store. Windows uses Credential Manager; other
@@ -665,7 +731,6 @@ struct BoundedApp {
     heading: &'static str,
     message: String,
     discovery: Option<DiscoveryStartup>,
-    credential_store: Option<Arc<dyn CredentialStore>>,
     capture_handle: Option<discovery::DiscoveryCaptureHandle>,
     candidate_rx: Option<std::sync::mpsc::Receiver<discovery::DiscoveredCandidate>>,
     candidates: Vec<discovery::DiscoveredCandidate>,
@@ -681,7 +746,6 @@ impl BoundedApp {
             heading: "Startup recovery",
             message,
             discovery: None,
-            credential_store: None,
             capture_handle: None,
             candidate_rx: None,
             candidates: Vec::new(),
@@ -692,8 +756,6 @@ impl BoundedApp {
     }
 
     fn discovery(discovery: DiscoveryStartup) -> Self {
-        let credential_store: Arc<dyn CredentialStore> = make_credential_store();
-
         let interfaces = realmhound_core::capture::NetworkInterface::list_all();
         let (capture_handle, candidate_rx) = match interfaces {
             Ok(ref ifaces) if !ifaces.is_empty() => {
@@ -718,10 +780,11 @@ impl BoundedApp {
         Self {
             heading: "Account discovery",
             message: "Connect to a game server with the account you want to add. \
-                      RealmHound is listening for connections..."
+                      RealmHound is listening for connections. After selecting an account, \
+                      reconnect in-game after RealmHound restarts to enable API refresh. \
+                      Access tokens are kept in memory only."
                 .to_string(),
             discovery: Some(discovery),
-            credential_store: Some(credential_store),
             capture_handle,
             candidate_rx,
             candidates: Vec::new(),
@@ -751,7 +814,7 @@ impl BoundedApp {
         }
     }
 
-    /// Commit the selected candidate: register, store credential, select, relaunch.
+    /// Commit the selected candidate: register, select, relaunch without a token.
     fn commit_selected(&mut self, ctx: &egui::Context) {
         let Some(idx) = self.selected_idx else { return };
         let Some(candidate) = self.candidates.get(idx).cloned() else {
@@ -766,24 +829,15 @@ impl BoundedApp {
 
         let now = chrono::Utc::now();
 
-        let account_key = match discovery.register_and_select(
+        match discovery.register_and_select(
             candidate.account_id,
             candidate.display_name.as_deref(),
             now,
         ) {
-            Ok(key) => key,
+            Ok(_) => {}
             Err(e) => {
                 self.action_error = Some(format!("Failed to register account: {e}"));
                 return;
-            }
-        };
-
-        // Non-fatal: next HELLO will recapture the token.
-        if let Some(cred_store) = &self.credential_store {
-            let target = realmhound_core::account::credential_target(account_key);
-            let cred = realmhound_core::account::SavedCredential::new(candidate.token, Some(now));
-            if let Err(e) = cred_store.write(&target, &cred) {
-                tracing::warn!("[DISCOVERY] Credential store failed: {e}");
             }
         }
 

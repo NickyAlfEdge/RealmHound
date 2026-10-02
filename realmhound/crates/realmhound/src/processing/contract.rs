@@ -40,7 +40,6 @@ use std::time::Instant;
 /// order over the stream. In Session 1 the updates are returned (and applied)
 /// in order, so `seq` is informational; Session 2's threaded channel relies on
 /// it for ordering.
-#[derive(Debug)]
 pub struct UiUpdate {
     /// Monotonic sequence number.
     pub seq: u64,
@@ -52,7 +51,6 @@ pub struct UiUpdate {
 }
 
 /// The payload of a [`UiUpdate`].
-#[derive(Debug)]
 pub enum UiPayload {
     /// Re-broadcast a domain event to the session-independent transient panels
     /// (quest / party / live feed / vault). The processor has already applied

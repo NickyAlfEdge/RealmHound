@@ -94,7 +94,7 @@ fn migration(
 }
 
 #[test]
-fn known_complete_migration_selects_profile_and_imports_token() {
+fn known_complete_migration_selects_profile_and_discards_token() {
     let (_temp, root) = root();
     seed_known_flat_layout(&root, "ACCT-1");
     let credentials = Arc::new(InMemoryCredentialStore::new());
@@ -117,12 +117,9 @@ fn known_complete_migration_selects_profile_and_imports_token() {
     assert_eq!(entry.last_client_seen_unix(), 100);
     assert_eq!(entry.last_client_launch_unix(), 200);
 
-    // Token imported into secure storage; plaintext removed.
+    // Token discarded, never imported into secure storage.
     let target = crate::account::credential_target(account_key);
-    assert_eq!(
-        credentials.read(&target).unwrap().unwrap().token(),
-        "secret-token-value"
-    );
+    assert!(credentials.read(&target).unwrap().is_none());
     assert!(!root.path().join("access_token.txt").exists());
 
     // Profile files exist.
@@ -190,8 +187,7 @@ fn contains_token(dir: &Path, token: &str) -> bool {
     false
 }
 
-/// A credential store whose writes always fail, to prove secure-store failure
-/// degrades to a missing token without invalidating the migration.
+/// Migration must never read or write credentials, even on legacy layouts.
 #[derive(Debug, Default)]
 struct FailingCredentialStore;
 
@@ -200,16 +196,19 @@ impl crate::account::CredentialStore for FailingCredentialStore {
         &self,
         _target: &str,
     ) -> Result<Option<crate::account::SavedCredential>, crate::account::CredentialError> {
-        Ok(None)
+        panic!("migration must not read credentials")
     }
     fn write(
         &self,
         _target: &str,
         _credential: &crate::account::SavedCredential,
     ) -> Result<(), crate::account::CredentialError> {
-        Err(crate::account::CredentialError::Unavailable)
+        panic!("migration must not write credentials")
     }
     fn delete(&self, _target: &str) -> Result<(), crate::account::CredentialError> {
+        Ok(())
+    }
+    fn purge_accounts(&self) -> Result<(), crate::account::CredentialError> {
         Ok(())
     }
 }
@@ -605,6 +604,35 @@ fn profile_dir(root: &StorageRoot, key: AccountKey) -> std::path::PathBuf {
     root.path().join("accounts").join(key.to_string())
 }
 
+#[test]
+fn resumes_old_imported_journal_without_retaining_or_reimporting_token() {
+    use super::journal::{save_journal, CredentialOutcome};
+    let (_temp, root) = root();
+    seed_known_flat_layout(&root, "ACCT-1");
+    let credentials = Arc::new(InMemoryCredentialStore::new());
+    run_until(&root, credentials.clone(), "registry-committed");
+    let mut journal = read_journal(&root);
+    let key = journal.target_account_key.unwrap();
+    let target = crate::account::credential_target(key);
+    credentials
+        .write(
+            &target,
+            &crate::account::SavedCredential::new("old-secret", None),
+        )
+        .unwrap();
+    journal.credential_outcome = CredentialOutcome::Imported;
+    save_journal(&root, &journal).unwrap();
+    migration(&root, credentials.clone())
+        .run_at(Utc::now())
+        .unwrap();
+    assert!(credentials.read(&target).unwrap().is_none());
+    assert!(!root.path().join("access_token.txt").exists());
+    assert_eq!(
+        read_journal(&root).credential_outcome,
+        CredentialOutcome::Removed
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Requirement 15/10: genuine interruption at each persisted boundary.
 // ---------------------------------------------------------------------------
@@ -741,11 +769,11 @@ fn backup_only_interruption_between_copy_and_delete_is_recoverable() {
 }
 
 // ---------------------------------------------------------------------------
-// Requirement 4: strict token parsing.
+// Legacy token contents are discarded without parsing.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn json_token_import_preserves_captured_at() {
+fn json_token_is_discarded_without_import() {
     let (_temp, root) = root();
     seed_known_flat_layout(&root, "ACCT-1");
     let ts = "2026-08-07T10:00:00Z";
@@ -762,17 +790,12 @@ fn json_token_import_preserves_captured_at() {
         other => panic!("expected ReadyKnown, got {other:?}"),
     };
     let target = crate::account::credential_target(key);
-    let saved = creds.read(&target).unwrap().unwrap();
-    assert_eq!(saved.token(), "json-secret");
-    assert_eq!(
-        saved.captured_at(),
-        Some(ts.parse::<chrono::DateTime<Utc>>().unwrap()),
-        "captured_at must be preserved, not replaced with now"
-    );
+    assert!(creds.read(&target).unwrap().is_none());
+    assert!(!root.path().join("access_token.txt").exists());
 }
 
 #[test]
-fn bare_token_import_has_unknown_captured_at() {
+fn bare_token_is_discarded_without_import() {
     let (_temp, root) = root();
     seed_known_flat_layout(&root, "ACCT-1");
     write(&root, "access_token.txt", b"legacy-bare-token\n");
@@ -784,28 +807,26 @@ fn bare_token_import_has_unknown_captured_at() {
         other => panic!("expected ReadyKnown, got {other:?}"),
     };
     let target = crate::account::credential_target(key);
-    let saved = creds.read(&target).unwrap().unwrap();
-    assert_eq!(saved.token(), "legacy-bare-token");
-    assert!(saved.captured_at().is_none());
+    assert!(creds.read(&target).unwrap().is_none());
+    assert!(!root.path().join("access_token.txt").exists());
 }
 
 #[test]
-fn malformed_token_blocks_and_remains() {
+fn malformed_token_is_removed_without_blocking_migration() {
     let (_temp, root) = root();
     seed_known_flat_layout(&root, "ACCT-1");
     write(&root, "access_token.txt", br#"{"token":"trunc"#);
 
-    let error = migration(&root, Arc::new(InMemoryCredentialStore::new()))
+    let outcome = migration(&root, Arc::new(InMemoryCredentialStore::new()))
         .run_at(Utc::now())
-        .unwrap_err();
-    assert!(matches!(error, MigrationError::TokenMalformed));
-    // The malformed token file remains and the registry is not committed.
-    assert!(root.path().join("access_token.txt").exists());
+        .unwrap();
+    assert!(matches!(outcome, MigrationOutcome::ReadyKnown { .. }));
+    assert!(!root.path().join("access_token.txt").exists());
     let registry = AccountRegistryStore::new(root.clone())
         .reconcile()
         .unwrap()
         .registry;
-    assert_eq!(registry.mode(), RegistryMode::Discovering);
+    assert_eq!(registry.mode(), RegistryMode::Selected);
 }
 
 // ---------------------------------------------------------------------------

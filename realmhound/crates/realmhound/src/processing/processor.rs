@@ -360,7 +360,6 @@ struct SelectedScope {
 
 /// An access token bound to the connection that presented it, pending
 /// identity verification of that connection.
-#[derive(Debug, Clone)]
 struct PendingCredential {
     connection: ConnectionKey,
     token: String,
@@ -2338,11 +2337,6 @@ impl PacketProcessor {
                 if play {
                     self.emit(UiPayload::Audio(AudioCommand::Play(SoundType::Trade)));
                 }
-            }
-            GameEvent::HelloReceived { .. } => {
-                // The access token is bound to its connection candidate at the
-                // pre-routing HELLO gate and released only after verification;
-                // there is nothing to emit here.
             }
             GameEvent::UpdateReceived(ref update, time_ms) => {
                 // Player stats + loot tracker

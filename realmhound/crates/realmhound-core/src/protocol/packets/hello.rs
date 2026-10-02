@@ -13,7 +13,7 @@ use std::io;
 /// This packet initiates a connection and contains authentication
 /// information. The `access_token` field is particularly important
 /// as it can be used to call RotMG's web API (char/list, etc.).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HelloPacket {
     /// The id of the map to connect to
     pub game_id: i32,
@@ -36,6 +36,15 @@ pub struct HelloPacket {
     pub client_token: String,
     /// Hardcoded token string
     pub user_token: String,
+}
+
+impl std::fmt::Debug for HelloPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelloPacket")
+            .field("game_id", &self.game_id)
+            .field("key_time", &self.key_time)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RotmgPacket for HelloPacket {
@@ -63,14 +72,6 @@ impl RotmgPacket for HelloPacket {
 }
 
 impl HelloPacket {
-    /// Get the access token for API calls.
-    ///
-    /// This token can be used to authenticate with RotMG's web API
-    /// endpoints like `char/list` and `account/listPowerUpStats`.
-    pub fn access_token(&self) -> &str {
-        &self.access_token
-    }
-
     /// Check if this is connecting to the Nexus (gameId = -2).
     pub fn is_nexus(&self) -> bool {
         self.game_id == -2
@@ -202,6 +203,29 @@ mod tests {
         assert_eq!(packet.game_id, 123);
         assert_eq!(packet.key_time, 12345678);
         assert_eq!(packet.key, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn debug_omits_credentials_including_through_parsed_packet() {
+        let packet = HelloPacket {
+            game_id: -2,
+            build_version: "1.0".to_string(),
+            access_token: "synthetic-access-secret".to_string(),
+            key_time: 0,
+            key: vec![11, 22, 33],
+            user_platform: "Steam".to_string(),
+            play_platform: "Steam".to_string(),
+            platform_token: "synthetic-platform-secret".to_string(),
+            client_token: "synthetic-client-secret".to_string(),
+            user_token: "synthetic-user-secret".to_string(),
+        };
+        let direct = format!("{packet:?}");
+        let wrapped = format!("{:?}", super::super::ParsedPacket::Hello(packet));
+        for output in [direct, wrapped] {
+            assert!(!output.contains("synthetic"));
+            assert!(!output.contains("[11, 22, 33]"));
+            assert!(output.contains("game_id: -2"));
+        }
     }
 
     #[test]

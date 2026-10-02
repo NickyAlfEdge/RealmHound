@@ -10,10 +10,12 @@ mod startup;
 
 pub mod migration;
 
+#[cfg(test)]
+pub use credentials::SavedCredential;
 #[cfg(windows)]
 pub use credentials::WindowsCredentialStore;
 pub use credentials::{
-    credential_target, CredentialError, CredentialStore, InMemoryCredentialStore, SavedCredential,
+    credential_target, CredentialError, CredentialStore, InMemoryCredentialStore,
 };
 pub use identity::{AccountId, AccountIdError, AccountKey, AccountKeyError};
 pub use lock::{ProfileLock, ProfileLockError};

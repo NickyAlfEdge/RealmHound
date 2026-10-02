@@ -1,7 +1,7 @@
 //! Lightweight packet capture for account discovery.
 //!
 //! Inspects game traffic only far enough to establish account identity:
-//! HELLO (token) → CreateSuccess (object_id) → Update (account ID from that
+//! HELLO → CreateSuccess (object_id) → Update (account ID from that
 //! object). No account-scoped resources are opened and no game state is tracked.
 
 use std::collections::HashMap;
@@ -25,20 +25,15 @@ const MAX_CANDIDATES: usize = 8;
 pub struct DiscoveredCandidate {
     pub account_id: AccountId,
     pub display_name: Option<String>,
-    pub token: String,
 }
 
 /// Per-connection state machine for identity extraction.
 #[derive(Debug)]
 enum CandidateState {
     /// HELLO captured; waiting for CreateSuccess.
-    AwaitingCreateSuccess {
-        token: String,
-        started_at: std::time::Instant,
-    },
+    AwaitingCreateSuccess { started_at: std::time::Instant },
     /// CreateSuccess captured; waiting for Update with this object_id.
     AwaitingIdentity {
-        token: String,
         object_id: i32,
         started_at: std::time::Instant,
     },
@@ -147,19 +142,17 @@ fn discovery_loop(
                         candidates.insert(
                             conn_key,
                             CandidateState::AwaitingCreateSuccess {
-                                token: hello.access_token.clone(),
                                 started_at: std::time::Instant::now(),
                             },
                         );
                     }
                     ParsedPacket::CreateSuccess(cs) => {
-                        if let Some(CandidateState::AwaitingCreateSuccess { token, started_at }) =
+                        if let Some(CandidateState::AwaitingCreateSuccess { started_at }) =
                             candidates.remove(&conn_key)
                         {
                             candidates.insert(
                                 conn_key,
                                 CandidateState::AwaitingIdentity {
-                                    token,
                                     object_id: cs.object_id,
                                     started_at,
                                 },
@@ -174,9 +167,8 @@ fn discovery_loop(
                         if !should_extract {
                             continue;
                         }
-                        let CandidateState::AwaitingIdentity {
-                            token, object_id, ..
-                        } = candidates.remove(&conn_key).unwrap()
+                        let CandidateState::AwaitingIdentity { object_id, .. } =
+                            candidates.remove(&conn_key).unwrap()
                         else {
                             unreachable!();
                         };
@@ -186,7 +178,6 @@ fn discovery_loop(
                             candidates.insert(
                                 conn_key,
                                 CandidateState::AwaitingIdentity {
-                                    token,
                                     object_id,
                                     started_at: std::time::Instant::now(),
                                 },
@@ -199,7 +190,6 @@ fn discovery_loop(
                             candidates.insert(
                                 conn_key,
                                 CandidateState::AwaitingIdentity {
-                                    token,
                                     object_id,
                                     started_at: std::time::Instant::now(),
                                 },
@@ -220,7 +210,6 @@ fn discovery_loop(
                         let candidate = DiscoveredCandidate {
                             account_id,
                             display_name: identity.account_name,
-                            token,
                         };
                         if tx.send(candidate).is_err() {
                             return;
@@ -276,16 +265,14 @@ mod tests {
         )
     }
 
-    fn make_candidate_state_awaiting_cs(token: &str) -> CandidateState {
+    fn make_candidate_state_awaiting_cs() -> CandidateState {
         CandidateState::AwaitingCreateSuccess {
-            token: token.to_string(),
             started_at: std::time::Instant::now(),
         }
     }
 
-    fn make_candidate_state_awaiting_id(token: &str, object_id: i32) -> CandidateState {
+    fn make_candidate_state_awaiting_id(object_id: i32) -> CandidateState {
         CandidateState::AwaitingIdentity {
-            token: token.to_string(),
             object_id,
             started_at: std::time::Instant::now(),
         }
@@ -297,20 +284,18 @@ mod tests {
         let conn = make_connection_key(12345);
 
         // Simulate HELLO
-        candidates.insert(conn, make_candidate_state_awaiting_cs("tok123"));
+        candidates.insert(conn, make_candidate_state_awaiting_cs());
         assert!(matches!(
             candidates.get(&conn),
             Some(CandidateState::AwaitingCreateSuccess { .. })
         ));
 
         // Simulate CreateSuccess
-        if let Some(CandidateState::AwaitingCreateSuccess { token, started_at }) =
-            candidates.remove(&conn)
+        if let Some(CandidateState::AwaitingCreateSuccess { started_at }) = candidates.remove(&conn)
         {
             candidates.insert(
                 conn,
                 CandidateState::AwaitingIdentity {
-                    token,
                     object_id: 42,
                     started_at,
                 },
@@ -329,7 +314,7 @@ mod tests {
     fn syn_resets_candidate_state() {
         let mut candidates: HashMap<ConnectionKey, CandidateState> = HashMap::new();
         let conn = make_connection_key(12345);
-        candidates.insert(conn, make_candidate_state_awaiting_cs("tok123"));
+        candidates.insert(conn, make_candidate_state_awaiting_cs());
 
         // SYN clears existing state
         candidates.remove(&conn);
@@ -340,7 +325,7 @@ mod tests {
     fn fin_discards_candidate() {
         let mut candidates: HashMap<ConnectionKey, CandidateState> = HashMap::new();
         let conn = make_connection_key(12345);
-        candidates.insert(conn, make_candidate_state_awaiting_id("tok", 42));
+        candidates.insert(conn, make_candidate_state_awaiting_id(42));
 
         candidates.remove(&conn);
         assert!(candidates.get(&conn).is_none());
@@ -350,7 +335,6 @@ mod tests {
     fn timeout_expires_candidate() {
         let conn = make_connection_key(12345);
         let old_state = CandidateState::AwaitingCreateSuccess {
-            token: "tok".to_string(),
             started_at: std::time::Instant::now() - Duration::from_secs(120),
         };
         let mut candidates = HashMap::new();
@@ -371,7 +355,7 @@ mod tests {
     fn update_with_wrong_object_id_keeps_candidate() {
         let mut candidates: HashMap<ConnectionKey, CandidateState> = HashMap::new();
         let conn = make_connection_key(12345);
-        candidates.insert(conn, make_candidate_state_awaiting_id("tok", 42));
+        candidates.insert(conn, make_candidate_state_awaiting_id(42));
 
         // Update that doesn't contain our object_id (simulated)
         let update = UpdatePacket {
@@ -382,15 +366,11 @@ mod tests {
             drops: vec![],
         };
 
-        if let Some(CandidateState::AwaitingIdentity {
-            token, object_id, ..
-        }) = candidates.remove(&conn)
-        {
+        if let Some(CandidateState::AwaitingIdentity { object_id, .. }) = candidates.remove(&conn) {
             if update.find_object(object_id).is_none() {
                 candidates.insert(
                     conn,
                     CandidateState::AwaitingIdentity {
-                        token,
                         object_id,
                         started_at: std::time::Instant::now(),
                     },
@@ -413,7 +393,7 @@ mod tests {
         let conn2 = make_connection_key(2222);
         let acct = AccountId::new("ACCT-1").unwrap();
 
-        candidates.insert(conn1, make_candidate_state_awaiting_cs("old_tok"));
+        candidates.insert(conn1, make_candidate_state_awaiting_cs());
         seen.insert(acct.clone(), conn1);
 
         // Second connection for same account replaces the first.
@@ -432,7 +412,7 @@ mod tests {
 
         for i in 0..MAX_CANDIDATES {
             let conn = make_connection_key(10000 + i as u16);
-            candidates.insert(conn, make_candidate_state_awaiting_cs("tok"));
+            candidates.insert(conn, make_candidate_state_awaiting_cs());
         }
 
         let extra_conn = make_connection_key(20000);

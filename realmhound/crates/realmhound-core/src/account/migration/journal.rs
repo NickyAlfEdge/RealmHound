@@ -79,7 +79,8 @@ pub struct ItemRecord {
     pub progress: ItemProgress,
 }
 
-/// Redacted outcome of the plaintext-token import. Never carries the token.
+/// Legacy token migration state, retained to resume journals from older builds.
+/// New builds never import tokens. No state carries credential contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialOutcome {

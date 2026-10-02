@@ -137,12 +137,12 @@ fn first_startup_completes_known_flat_data_through_resolver() {
 
     // Verified identity comes from the migrated profile manifest.
     assert_eq!(context.account_id().as_str(), "ACCT-1");
-    // The credential is available through the credential store, and the plaintext
-    // token is gone from the flat layout.
-    assert_eq!(
-        context.read_credential().unwrap().token(),
-        "secret-token-value"
-    );
+    // Tokens are not imported; the obsolete plaintext is removed.
+    use crate::account::CredentialStore;
+    assert!(credentials
+        .read(&crate::account::credential_target(context.account_key()))
+        .unwrap()
+        .is_none());
     assert!(!root.path().join("access_token.txt").exists());
 
     // Every account path is under the profile root, never the flat layout.
@@ -455,8 +455,6 @@ fn selected_context_paths_all_derive_from_one_profile_root() {
             "path {path:?} escaped the profile root {profile_root:?}"
         );
     }
-    // Profile mode never exposes the legacy flat token path.
-    assert!(context.persistence().legacy_access_token().is_none());
 }
 
 #[test]
@@ -489,39 +487,93 @@ fn corrupt_snapshot_fails_repeatedly_rather_than_becoming_empty() {
 #[test]
 fn credential_store_errors_never_block_startup() {
     let (_temp, root) = root();
-    // A credential store whose reads always fail must not block selected startup.
+    // Cleanup failure must not block capture, and must be visible to the user.
     #[derive(Debug, Default)]
-    struct FailingReadStore;
-    impl crate::account::CredentialStore for FailingReadStore {
-        fn read(
-            &self,
-            _target: &str,
-        ) -> Result<Option<SavedCredential>, crate::account::CredentialError> {
-            Err(crate::account::CredentialError::Unavailable)
-        }
-        fn write(
-            &self,
-            _target: &str,
-            _credential: &SavedCredential,
-        ) -> Result<(), crate::account::CredentialError> {
-            Ok(())
-        }
+    struct FailingCleanupStore;
+    impl crate::account::CredentialStore for FailingCleanupStore {
         fn delete(&self, _target: &str) -> Result<(), crate::account::CredentialError> {
             Ok(())
+        }
+        fn purge_accounts(&self) -> Result<(), crate::account::CredentialError> {
+            Err(crate::account::CredentialError::Unavailable)
         }
     }
 
     let credentials = creds();
     let key = complete_known_migration(&root, credentials, "ACCT-1");
-    // Swap in a failing store for the resolver.
-    let failing: Arc<dyn crate::account::CredentialStore> = Arc::new(FailingReadStore);
-    let resolution = StartupResolver::new(root.clone(), None, failing).resolve();
-    let StartupResolution::Selected(selected) = resolution else {
+    let failing: Arc<dyn crate::account::CredentialStore> = Arc::new(FailingCleanupStore);
+    let outcome = StartupResolver::new(root.clone(), None, failing).resolve_startup();
+    assert!(!outcome.cleanup_warnings.is_empty());
+    let StartupResolution::Selected(selected) = outcome.resolution else {
         panic!("expected Selected startup despite credential failure");
     };
     assert_eq!(selected.context().account_key(), key);
-    // The failing read is a non-blocking "no token".
-    assert!(selected.context().read_credential().is_none());
+}
+
+#[test]
+fn startup_removes_orphan_credentials_and_legacy_files_without_restoring_tokens() {
+    use crate::account::{credential_target, CredentialStore};
+    let (_temp, root) = root();
+    let credentials = creds();
+    let registry = AccountRegistryStore::new(root.clone());
+    let entry = registry
+        .register_verified(AccountId::new("ACCT-1").unwrap(), None, Utc::now())
+        .unwrap();
+    let target = credential_target(entry.key());
+    registry
+        .set_credential_target(entry.key(), Some(&target))
+        .unwrap();
+    let orphan = credential_target(AccountKey::generate());
+    for name in [&target, &orphan, "OtherApp/credential"] {
+        credentials
+            .write(name, &SavedCredential::new("synthetic-secret", None))
+            .unwrap();
+    }
+    write(&root, "access_token.txt", br#"{"token":"broken"#);
+    write(&root, "access_token.txt.tmp", b"synthetic-secret");
+    let resolver = resolver(&root, credentials.clone());
+    let outcome = resolver.resolve_startup();
+    assert!(
+        outcome.cleanup_warnings.is_empty(),
+        "{:?}",
+        outcome.cleanup_warnings
+    );
+    assert!(credentials.read(&target).unwrap().is_none());
+    assert!(credentials.read(&orphan).unwrap().is_none());
+    assert!(credentials.read("OtherApp/credential").unwrap().is_some());
+    assert!(!root.path().join("access_token.txt").exists());
+    assert!(!root.path().join("access_token.txt.tmp").exists());
+    assert!(registry
+        .reconcile()
+        .unwrap()
+        .registry
+        .entry(entry.key())
+        .unwrap()
+        .credential_target()
+        .is_none());
+    drop(outcome);
+    assert!(resolver.resolve_startup().cleanup_warnings.is_empty());
+}
+
+#[test]
+fn cleanup_failure_is_visible_and_retried_without_blocking_discovery() {
+    let (_temp, root) = root();
+    // A directory at the exact obsolete filename cannot be deleted as a file.
+    let path = root.path().join("access_token.txt.tmp");
+    std::fs::create_dir(&path).unwrap();
+    let resolver = resolver(&root, creds());
+    let outcome = resolver.resolve_startup();
+    assert!(matches!(
+        outcome.resolution,
+        StartupResolution::Discovery(_)
+    ));
+    assert!(outcome
+        .cleanup_warnings
+        .iter()
+        .any(|w| w.contains("access_token.txt.tmp")));
+    assert!(path.is_dir());
+    std::fs::remove_dir(&path).unwrap();
+    assert!(resolver.resolve_startup().cleanup_warnings.is_empty());
 }
 
 /// Seed a partial known flat layout: a known account identity and snapshot, but

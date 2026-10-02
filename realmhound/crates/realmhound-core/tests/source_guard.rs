@@ -34,6 +34,22 @@ const GUARDED: &[&str] = &[
     "src/account/migration/inventory.rs",
 ];
 
+#[test]
+fn production_has_no_credential_manager_read_or_write_api() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("src/account/credentials.rs")).unwrap();
+    for forbidden in ["CredRead", "CredWrite"] {
+        assert!(
+            !source.contains(forbidden),
+            "credential backend references {forbidden}"
+        );
+    }
+    let token = std::fs::read_to_string(root.join("src/api/token.rs")).unwrap();
+    assert!(!token.contains("std::fs"));
+    let migration = std::fs::read_to_string(root.join("src/account/migration/mod.rs")).unwrap();
+    assert!(!migration.contains("credentials.write("));
+}
+
 /// Whether a source line is a comment (skipped so doc examples that mention a
 /// path do not trip the guard).
 fn is_comment(line: &str) -> bool {

@@ -14,10 +14,16 @@ use std::io;
 /// For-reconnect packet (ID 218) - Incoming
 ///
 /// Carries an opaque reconnect-info string (a 16-bit length-prefixed string).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ForReconnectPacket {
     /// Opaque reconnect information token.
     pub reconnect_info: String,
+}
+
+impl std::fmt::Debug for ForReconnectPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForReconnectPacket").finish_non_exhaustive()
+    }
 }
 
 impl RotmgPacket for ForReconnectPacket {
@@ -28,13 +34,24 @@ impl RotmgPacket for ForReconnectPacket {
     }
 
     fn description(&self) -> String {
-        format!("ForReconnect: {}", self.reconnect_info)
+        "ForReconnect".to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_and_description_omit_reconnect_token() {
+        let packet = ForReconnectPacket {
+            reconnect_info: "synthetic-reconnect-secret".to_string(),
+        };
+        assert_eq!(packet.description(), "ForReconnect");
+        assert!(!format!("{packet:?}").contains("synthetic-reconnect-secret"));
+        let wrapped = super::super::ParsedPacket::ForReconnect(packet);
+        assert!(!format!("{wrapped:?}").contains("synthetic-reconnect-secret"));
+    }
 
     fn build_bytes(info: &str) -> Vec<u8> {
         let mut data = Vec::new();

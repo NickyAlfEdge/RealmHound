@@ -722,13 +722,11 @@ impl AccountRegistryStore {
         credentials: &dyn super::CredentialStore,
     ) -> Result<AccountRegistry, AccountError> {
         let registry = self.reconcile()?.registry;
-        let entry = registry
+        registry
             .entry(account_key)
             .ok_or(AccountError::AccountNotFound(account_key))?;
-        let target = entry
-            .credential_target()
-            .map(str::to_string)
-            .unwrap_or_else(|| super::credential_target(account_key));
+        // Stored references are migration metadata, not deletion authority.
+        let target = super::credential_target(account_key);
 
         let paths = AccountPaths::new(self.storage_root.clone(), account_key);
         self.storage_root
@@ -2146,6 +2144,35 @@ mod tests {
             .unwrap());
         assert!(creds.read(&target).unwrap().is_none());
         assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn delete_account_ignores_foreign_credential_references() {
+        for foreign_target in [
+            super::super::credential_target(AccountKey::generate()),
+            "OtherApp/credential".to_string(),
+        ] {
+            let (_temp, store) = store();
+            let creds = super::super::InMemoryCredentialStore::new();
+            let entry = register(&store, "acc-1", "Alice");
+            let owned_target = super::super::credential_target(entry.key());
+            for target in [&owned_target, &foreign_target] {
+                creds
+                    .write(
+                        target,
+                        &super::super::SavedCredential::new("synthetic-secret", None),
+                    )
+                    .unwrap();
+            }
+            store
+                .set_credential_target(entry.key(), Some(&foreign_target))
+                .unwrap();
+
+            store.delete_account(entry.key(), &creds).unwrap();
+
+            assert!(creds.read(&owned_target).unwrap().is_none());
+            assert!(creds.read(&foreign_target).unwrap().is_some());
+        }
     }
 
     #[test]

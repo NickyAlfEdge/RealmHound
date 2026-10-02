@@ -31,7 +31,7 @@ pub enum SourceClass {
     Obsolete,
     /// Live SQLite database migrated by the checkpoint/backup algorithm.
     ActiveDatabase,
-    /// The plaintext access token: secure-import then discard, never copied.
+    /// The obsolete plaintext access token: discard without reading or copying.
     Credential,
 }
 

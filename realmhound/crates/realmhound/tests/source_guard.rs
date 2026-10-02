@@ -16,6 +16,23 @@ const GUARDED: &[&str] = &[
     "src/panels/trophy_hall.rs",
 ];
 
+#[test]
+fn application_never_restores_or_persists_tokens() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for rel in ["src/app.rs", "src/main.rs", "src/discovery.rs"] {
+        let source = std::fs::read_to_string(root.join(rel)).unwrap();
+        for forbidden in [
+            "SavedCredential",
+            "read_credential",
+            "save_account_credential",
+            "load_saved_token",
+            "save_token(",
+        ] {
+            assert!(!source.contains(forbidden), "{rel} references {forbidden}");
+        }
+    }
+}
+
 fn is_comment(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*")

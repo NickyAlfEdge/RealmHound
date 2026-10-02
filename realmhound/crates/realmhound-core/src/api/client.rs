@@ -17,7 +17,7 @@ const API_BASE_URL: &str = "https://realmofthemadgodhrd.appspot.com";
 pub enum ApiError {
     /// HTTP request failed
     #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(&'static str),
 
     /// Authentication failed (invalid token)
     #[error("Authentication failed: {0}")]
@@ -36,11 +36,28 @@ pub enum ApiError {
     InvalidResponse(String),
 }
 
+impl From<reqwest::Error> for ApiError {
+    fn from(error: reqwest::Error) -> Self {
+        // Do not retain the URL, source chain, or server-supplied error text.
+        Self::Http(if error.is_timeout() {
+            "request timed out"
+        } else if error.is_connect() {
+            "connection failed"
+        } else if error.is_body() || error.is_decode() {
+            "response could not be read"
+        } else if error.is_redirect() {
+            "redirect failed"
+        } else {
+            "request could not be completed"
+        })
+    }
+}
+
 /// RotMG API client for fetching character data.
 ///
 /// Uses an access token captured from game traffic to authenticate
 /// with RotMG's web API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RotmgApiClient {
     client: Client,
     access_token: String,
@@ -49,6 +66,14 @@ pub struct RotmgApiClient {
     /// verified account profile diagnostics path exists.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     diagnostics_dir: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for RotmgApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotmgApiClient")
+            .field("access_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl RotmgApiClient {
@@ -163,47 +188,38 @@ impl RotmgApiClient {
 
         tracing::debug!("[API] Response: {} ({} bytes)", status.as_u16(), text.len());
 
-        // Save XML response for debugging
+        let text = Self::check_response(status, text)?;
         self.save_response_debug(endpoint, &text);
+        Ok(text)
+    }
 
+    fn check_response(status: reqwest::StatusCode, text: String) -> Result<String, ApiError> {
         if status.is_success() {
-            // Check for error responses in XML
-            if text.contains("<Error>") {
-                // Extract error message
-                if let Some(start) = text.find("<Error>") {
-                    if let Some(end) = text.find("</Error>") {
-                        let error_msg = &text[start + 7..end];
-                        let lower = error_msg.to_lowercase();
-                        // Map token/credential failures to Auth. An expired token
-                        // reports "Account credentials not valid" (no "token"/"auth").
-                        if lower.contains("token")
-                            || lower.contains("auth")
-                            || lower.contains("credentials not valid")
-                        {
-                            return Err(ApiError::Auth(error_msg.to_string()));
-                        }
-                        return Err(ApiError::Server(error_msg.to_string()));
+            if let Some((_, after)) = text.split_once("<Error>") {
+                if let Some((error_msg, _)) = after.split_once("</Error>") {
+                    let lower = error_msg.to_lowercase();
+                    // Map token/credential failures to Auth. An expired token
+                    // reports "Account credentials not valid" (no "token"/"auth").
+                    if lower.contains("token")
+                        || lower.contains("auth")
+                        || lower.contains("credentials not valid")
+                    {
+                        return Err(ApiError::Auth("Account credentials not valid".to_string()));
+                    }
+                    if lower.contains("account in use") {
+                        return Err(ApiError::Server("Account in use".to_string()));
                     }
                 }
-                return Err(ApiError::Server(text));
+                return Err(ApiError::Server("Request rejected by server".to_string()));
             }
             Ok(text)
         } else if status.as_u16() == 429 {
             Err(ApiError::RateLimited)
         } else if status.as_u16() == 401 || status.as_u16() == 403 {
-            Err(ApiError::Auth(text))
+            Err(ApiError::Auth("Account credentials not valid".to_string()))
         } else {
-            Err(ApiError::Server(format!(
-                "HTTP {}: {}",
-                status.as_u16(),
-                text
-            )))
+            Err(ApiError::Server(format!("HTTP {}", status.as_u16())))
         }
-    }
-
-    /// Get the access token being used by this client.
-    pub fn access_token(&self) -> &str {
-        &self.access_token
     }
 
     /// Save an API response snapshot for inspection.
@@ -220,6 +236,13 @@ impl RotmgApiClient {
         if std::fs::create_dir_all(dir).is_ok() {
             let filename = format!("{}.xml", sanitize_endpoint(endpoint));
             let filepath = dir.join(filename);
+            let response = if self.access_token.is_empty() {
+                response.to_string()
+            } else {
+                response
+                    .replace(&*urlencoding::encode(&self.access_token), "<redacted>")
+                    .replace(&self.access_token, "<redacted>")
+            };
             if let Err(e) = std::fs::write(&filepath, response) {
                 tracing::warn!("[API] Failed to save debug response: {}", e);
             } else {
@@ -255,9 +278,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_client_creation() {
-        let client = RotmgApiClient::new("test_token".to_string());
-        assert_eq!(client.access_token(), "test_token");
+    fn transport_errors_discard_url_and_source() {
+        let token = "synthetic-secret";
+        let error = Client::new()
+            .get(format!("invalid-scheme://host/?accessToken={token}"))
+            .send()
+            .unwrap_err();
+        let error = ApiError::from(error);
+        assert!(!format!("{error} {error:?}").contains(token));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn response_errors_never_echo_bodies() {
+        for status in [200, 401, 403, 429, 500] {
+            for body in [
+                "<Error>synthetic-secret</Error>",
+                "<Error>token synthetic-secret</Error>",
+                "<Error>Account in use synthetic-secret</Error>",
+                "</Error><Error>synthetic-secret",
+            ] {
+                let error = RotmgApiClient::check_response(
+                    reqwest::StatusCode::from_u16(status).unwrap(),
+                    body.to_string(),
+                )
+                .unwrap_err();
+                assert!(!format!("{error} {error:?}").contains("synthetic-secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn account_in_use_remains_recognizable() {
+        let error = RotmgApiClient::check_response(
+            reqwest::StatusCode::OK,
+            "<Error>Account in use</Error>".to_string(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Server(message) if message == "Account in use"));
+    }
+
+    #[test]
+    fn client_debug_redacts_token() {
+        let client = RotmgApiClient::new("synthetic-secret".to_string());
+        assert!(!format!("{client:?}").contains("synthetic-secret"));
     }
 
     #[cfg(debug_assertions)]
@@ -283,6 +347,22 @@ mod tests {
         assert!(diag.join("char_list.xml").exists());
         assert_eq!(sanitize_endpoint("char/list"), "char_list");
         assert_eq!(sanitize_endpoint("a/../b"), "a____b");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn diagnostics_redact_plain_and_encoded_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = RotmgApiClient::with_diagnostics(
+            "synthetic+secret/=".to_string(),
+            Some(temp.path().to_path_buf()),
+        );
+        client.save_response_debug(
+            "char/list",
+            "<Chars>synthetic+secret/= synthetic%2Bsecret%2F%3D</Chars>",
+        );
+        let snapshot = std::fs::read_to_string(temp.path().join("char_list.xml")).unwrap();
+        assert!(!snapshot.contains("synthetic"));
     }
 
     // Note: Live API tests would require a valid access token

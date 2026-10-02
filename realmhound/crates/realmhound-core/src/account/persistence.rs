@@ -29,17 +29,14 @@ pub struct AccountPersistencePaths {
     chat_logs: PathBuf,
     event_notifications: PathBuf,
     watchlist_detections: PathBuf,
-    legacy_access_token: Option<PathBuf>,
     api_diagnostics: Option<PathBuf>,
 }
 
 impl AccountPersistencePaths {
     /// Resolve the flat single-account layout below the storage root.
     ///
-    /// This is the production binding until the migration phases run: it maps
-    /// the exact current flat files and retains the legacy character/vault and
-    /// access-token inputs for compatibility. No profile diagnostics path exists
-    /// yet, so API diagnostics stay disabled.
+    /// Retains legacy character/vault inputs for compatibility. No profile
+    /// diagnostics path exists in this layout, so API diagnostics stay disabled.
     pub fn flat_compat(root: &StorageRoot) -> Result<Self, StorageError> {
         let characters_cache = root.ensure_no_links("characters_cache.json")?;
         let live_vault = root.ensure_no_links("live_vault.json")?;
@@ -59,7 +56,6 @@ impl AccountPersistencePaths {
             chat_logs: root.ensure_no_links(Path::new("logs").join("chat"))?,
             event_notifications: root.ensure_no_links("event_notification_log.csv")?,
             watchlist_detections: root.ensure_no_links("watchlist_detections.log")?,
-            legacy_access_token: Some(root.ensure_no_links("access_token.txt")?),
             api_diagnostics: None,
         })
     }
@@ -81,7 +77,6 @@ impl AccountPersistencePaths {
             chat_logs: paths.chat_logs()?,
             event_notifications: paths.event_notifications()?,
             watchlist_detections: paths.watchlist_detections()?,
-            legacy_access_token: None,
             api_diagnostics: Some(paths.api_diagnostics()?),
         })
     }
@@ -145,11 +140,6 @@ impl AccountPersistencePaths {
     pub fn api_diagnostics(&self) -> Option<&Path> {
         self.api_diagnostics.as_deref()
     }
-
-    /// Legacy flat access-token file, present only in flat compatibility mode.
-    pub fn legacy_access_token(&self) -> Option<&Path> {
-        self.legacy_access_token.as_deref()
-    }
 }
 
 /// Resolve the Roaming `characters_cache.json`, matching the historical legacy
@@ -192,10 +182,6 @@ mod tests {
             paths.watchlist_detections(),
             base.join("watchlist_detections.log")
         );
-        assert_eq!(
-            paths.legacy_access_token(),
-            Some(base.join("access_token.txt").as_path())
-        );
         // Flat compatibility does not write profile diagnostics.
         assert!(paths.api_diagnostics().is_none());
     }
@@ -222,8 +208,6 @@ mod tests {
             paths.api_diagnostics(),
             Some(profile_root.join("diagnostics").join("api").as_path())
         );
-        // Profile mode never exposes the legacy flat token path.
-        assert!(paths.legacy_access_token().is_none());
     }
 
     #[test]

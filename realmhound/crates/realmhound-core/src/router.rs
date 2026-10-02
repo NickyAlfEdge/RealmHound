@@ -219,9 +219,6 @@ pub enum GameEvent {
     /// Another player requested a trade (TradeRequested packet).
     TradeRequested { name: String },
 
-    /// Hello packet processed - access token captured.
-    HelloReceived { access_token: String },
-
     /// Update packet processed - carries data for loot/encounter GUI wiring.
     UpdateReceived(UpdatePacket, u64),
 
@@ -667,21 +664,7 @@ impl PacketRouter {
             // ----- Hello -----
             // Note: Multi-client isolation is handled by the app before routing,
             // because it requires raw packet network metadata and the reassembler.
-            ParsedPacket::Hello(hello) => {
-                let mut events = Vec::new();
-                if !hello.access_token.is_empty() {
-                    tracing::info!(
-                        "[HELLO] Captured access token: len={}, gameId={}, version={}",
-                        hello.access_token.len(),
-                        hello.game_id,
-                        hello.build_version
-                    );
-                    events.push(GameEvent::HelloReceived {
-                        access_token: hello.access_token.clone(),
-                    });
-                }
-                RouteResult::Routed(events)
-            }
+            ParsedPacket::Hello(_) => RouteResult::Routed(Vec::new()),
 
             // ----- Update -----
             ParsedPacket::Update(update) => {
@@ -2124,7 +2107,7 @@ mod tests {
     // -- Hello --
 
     #[test]
-    fn hello_with_token_emits_hello_received() {
+    fn hello_with_token_emits_no_events() {
         let mut router = PacketRouter::new();
         let mut session = make_session();
 
@@ -2143,15 +2126,7 @@ mod tests {
 
         let result = router.route(&packet, &mut session);
         match result {
-            RouteResult::Routed(events) => {
-                assert_eq!(events.len(), 1);
-                match &events[0] {
-                    GameEvent::HelloReceived { access_token } => {
-                        assert_eq!(access_token, "my_token_12345");
-                    }
-                    other => panic!("Expected HelloReceived, got {:?}", other),
-                }
-            }
+            RouteResult::Routed(events) => assert!(events.is_empty()),
             RouteResult::Unmapped => panic!("Expected Routed"),
         }
     }

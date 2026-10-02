@@ -36,7 +36,7 @@ use crate::tab_icons::get_tab_icon;
 use crate::ui_ext::HoverTooltipExt;
 use eframe::egui::{self, Color32, RichText, Visuals};
 use realmhound_core::{
-    account::{AccountContext, AccountPersistencePaths, AccountRegistryStore, SavedCredential},
+    account::{AccountContext, AccountPersistencePaths, AccountRegistryStore},
     account_stats::{ForgeMaterialTier, MaterialAmounts},
     assets::get_asset_manager,
     combat::CombatDatabase,
@@ -1011,11 +1011,8 @@ impl RealmHoundApp {
             )
         };
 
-        // The selected credential comes only from the credential store, never
-        // the flat `access_token.txt`. A store error is a non-blocking "no token".
-        let saved_credential = account.read_credential();
-        let captured_access_token = saved_credential.as_ref().map(|c| c.token().to_string());
-        let token_captured_at = saved_credential.and_then(|c| c.captured_at());
+        let captured_access_token = None;
+        let token_captured_at = None;
 
         let mut app = Self {
             capture: CaptureManager::new(interfaces),
@@ -1153,23 +1150,6 @@ impl RealmHoundApp {
         app.start_capture();
 
         Ok(app)
-    }
-
-    /// Persist the selected account's access token through the credential store,
-    /// keyed by the deterministic target. Never writes the legacy flat token file.
-    fn save_account_credential(
-        &self,
-        token: &str,
-        captured_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) {
-        let credential = SavedCredential::new(token, captured_at);
-        if let Err(e) = self
-            .account
-            .credentials()
-            .write(self.account.credential_target(), &credential)
-        {
-            tracing::warn!("[TOKEN] Failed to store account credential: {e}");
-        }
     }
 
     /// Update window state in settings from current egui context.
@@ -1633,11 +1613,8 @@ impl RealmHoundApp {
                     self.vault_panel.reset_on_new_token();
                 }
 
-                // A freshly captured token's owning account is not yet verified,
-                // so it is never persisted here. Persistence is deferred to a
-                // fetch that confirms the token belongs to the selected account
-                // (see check_api_result handling), and always goes through the
-                // credential store -- never the legacy flat token file.
+                // The worker releases tokens only for the verified connection.
+                // They stay in this process and are never persisted.
 
                 // Fetch exalt stats once per app session
                 if !self.exalts_fetched {
@@ -8506,33 +8483,6 @@ impl RealmHoundApp {
                 // Refresh button - fetches character/vault data from Realm API
                 // Check for API results (needed since panel may not be visible)
                 if let Some(data) = self.characters_panel.check_api_result() {
-                    // Persist the token only once a fetch positively confirms it
-                    // belongs to the selected account. This keeps a mule's token
-                    // from silently becoming the saved default. The selected
-                    // identity is the verified account context, never the legacy
-                    // `settings.account`.
-                    let saved_main = self.account.account_id().as_str();
-                    let token_belongs_to_main = match &data.account_id {
-                        // Positive match with the selected account: safe to persist.
-                        Some(incoming) => incoming == saved_main,
-                        // The fetch's identity is unknown: do NOT persist (mule).
-                        None => false,
-                    };
-                    if token_belongs_to_main {
-                        // Persist the token this fetch used, not the current one:
-                        // a mid-flight capture could otherwise swap in a mule token.
-                        if let Some((token, captured_at)) =
-                            self.characters_panel.last_fetch_token()
-                        {
-                            self.save_account_credential(token, captured_at);
-                        } else if let Some(token) = self.captured_access_token.clone() {
-                            self.save_account_credential(&token, self.token_captured_at);
-                        }
-                    } else {
-                        tracing::warn!(
-                            "[TOKEN] Not saving token: fetched account differs from the selected account."
-                        );
-                    }
                     let scope = AccountOperationScope {
                         account_key: self.account.account_key(),
                         expected_account_id: self.account.account_id().clone(),
@@ -8593,7 +8543,8 @@ impl RealmHoundApp {
                 if !can_refresh {
                     if !has_token {
                         refresh_btn.disabled_hover_tip(
-                            "No access token - start capture and log into RotMG to capture token"
+                            "Tokens are memory-only. Start capture, then reconnect or log into RotMG \
+                             to enable API refresh after restarting or switching accounts."
                         );
                     } else if is_loading {
                         refresh_btn.disabled_hover_tip("Loading...");

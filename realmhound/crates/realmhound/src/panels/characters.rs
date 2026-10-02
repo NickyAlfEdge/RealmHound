@@ -404,9 +404,6 @@ pub struct CharactersPanel {
     fetch_state: CharactersFetchState,
     /// Receiver for API results (returns AccountData which includes characters and exaltation stats)
     api_result_rx: Option<mpsc::Receiver<Result<AccountData, String>>>,
-    /// Token (and capture time) used for the last fetch, so the app can persist
-    /// exactly the token a successful fetch verified (not a mid-flight swap).
-    last_fetch_token: Option<(String, Option<chrono::DateTime<chrono::Utc>>)>,
     /// Currently playing character ID (from CREATE_SUCCESS)
     live_char_id: Option<i32>,
     /// Last-known loot-drop-boost seconds per character id. Populated from the
@@ -524,7 +521,6 @@ impl CharactersPanel {
             cache,
             fetch_state: CharactersFetchState::Idle,
             api_result_rx: None,
-            last_fetch_token: None,
             live_char_id: None,
             loot_boost_by_char: std::collections::HashMap::new(),
             editing_label: None,
@@ -872,7 +868,6 @@ impl CharactersPanel {
         let token = access_token.to_string();
         let (tx, rx) = mpsc::channel();
 
-        self.last_fetch_token = Some((token.clone(), captured_at));
         self.fetch_state = CharactersFetchState::Loading;
         self.api_result_rx = Some(rx);
 
@@ -919,13 +914,6 @@ impl CharactersPanel {
                 }
             }
         });
-    }
-
-    /// The token (and capture time) used for the most recent fetch, if any.
-    pub fn last_fetch_token(&self) -> Option<(&str, Option<chrono::DateTime<chrono::Utc>>)> {
-        self.last_fetch_token
-            .as_ref()
-            .map(|(t, at)| (t.as_str(), *at))
     }
 
     /// The current fetch error message, if the last fetch failed.
