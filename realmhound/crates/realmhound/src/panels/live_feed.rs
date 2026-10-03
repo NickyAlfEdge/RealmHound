@@ -537,11 +537,8 @@ pub struct DungeonEntry {
     pub dungeon_name: String,
     /// Portal object id for sprite rendering (None if unknown)
     pub portal_id: Option<i32>,
-    /// Modifier display names (e.g. "Weak Boss III"); falls back to a prettified
-    /// token for unknown modifiers. Retained for display and dedup signature.
-    pub modifiers: Vec<String>,
     /// Per-modifier display chips (name + type + danger color) for the Live Feed
-    /// second line. Parallel to [`modifiers`].
+    /// second line, in callout order.
     pub mods: Vec<ModChip>,
     /// Outline / background fill category for the whole callout.
     pub outline: OutlineKind,
@@ -729,7 +726,6 @@ impl DungeonEntry {
             expires_at,
             dungeon_name,
             portal_id,
-            modifiers,
             mods,
             outline,
             grade,
@@ -2456,6 +2452,20 @@ impl LiveFeedPanel {
             None if entered_from_nexus => self.nexus_marker.text().map(str::to_string),
             None => None,
         };
+        // Suppress repeated MapInfo packets for the same dungeon *before* anything
+        // is recorded for it: the game re-sends the same map info, and a duplicate
+        // is not another run of the dungeon. Counting one as a run would let a
+        // single instance teach event-mod learning that an ordinary mod is an
+        // event preset, which would then stop it being called.
+        let signature = (
+            fp,
+            display_name.clone(),
+            modifier_tokens.to_vec(),
+            grade.clone(),
+        );
+        if self.last_dungeon_signature.as_ref() == Some(&signature) {
+            return;
+        }
         // Recognize (and remember) the mods this event applies to every instance
         // of this dungeon, so calls stop advertising a mod nobody rolled.
         self.remember_dungeon_mods(&display_name, modifier_tokens);
@@ -2475,17 +2485,6 @@ impl LiveFeedPanel {
         );
         entry.map_seed = fp;
         entry.entered_from_nexus = entered_from_nexus;
-        let signature = (
-            fp,
-            entry.dungeon_name.clone(),
-            entry.modifiers.clone(),
-            entry.grade.clone(),
-        );
-
-        // Suppress repeated MapInfo packets for the same dungeon.
-        if self.last_dungeon_signature.as_ref() == Some(&signature) {
-            return;
-        }
 
         // Genuinely new dungeon: consume the spawn anchor and expire any prior
         // still-active dungeon entry (you can't call a dungeon you just left).
@@ -6704,6 +6703,11 @@ mod tests {
             .count()
     }
 
+    /// Display names of a dungeon entry's modifier chips, in callout order.
+    fn chip_names(entry: &DungeonEntry) -> Vec<String> {
+        entry.mods.iter().map(|chip| chip.name.clone()).collect()
+    }
+
     #[test]
     fn prettify_modifier_formats_tokens() {
         assert_eq!(prettify_modifier("CHEF"), "Chef");
@@ -6734,7 +6738,7 @@ mod tests {
         match panel.entries.front().unwrap() {
             FeedEntry::Dungeon(d) => {
                 assert_eq!(
-                    d.modifiers,
+                    chip_names(d),
                     vec!["Looting".to_string(), "Rewarding".to_string()]
                 );
                 assert_eq!(d.loot_bonus, 75);
@@ -6838,7 +6842,7 @@ mod tests {
         );
         match panel.entries.front().unwrap() {
             FeedEntry::Dungeon(d) => {
-                assert_eq!(d.modifiers, vec!["Weak Boss III".to_string()]);
+                assert_eq!(chip_names(d), vec!["Weak Boss III".to_string()]);
                 assert_eq!(d.loot_bonus, 1);
             }
             other => panic!("Expected Dungeon entry, got {:?}", other),
@@ -6860,7 +6864,7 @@ mod tests {
             FeedEntry::Dungeon(d) => {
                 assert_eq!(d.dungeon_name, "Spider Den");
                 assert_eq!(
-                    d.modifiers,
+                    chip_names(d),
                     vec!["Chef".to_string(), "Souvenir I (Legacy)".to_string()]
                 );
                 assert_eq!(d.grade, Some("S".to_string()));
@@ -7452,6 +7456,28 @@ mod tests {
             None,
         );
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake keyf"));
+    }
+
+    #[test]
+    fn repeated_map_info_packets_do_not_teach_event_mods() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+
+        // The client re-sends MapInfo for the same instance. Those are duplicates
+        // of one run, not evidence that the mod is applied to every instance this
+        // week, so they must not count towards the learning threshold.
+        for _ in 0..4 {
+            panel.push_dungeon(1, "Snake Pit", &["GENEROUS".to_string()], None);
+        }
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+
+        // Real instances still count: two more runs (new seeds) teach it.
+        panel.push_dungeon(2, "Snake Pit", &["GENEROUS".to_string()], None);
+        panel.push_dungeon(3, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(panel.learned_event_mods("Snake Pit"), ["GENEROUS"]);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
     }
 
     #[test]
