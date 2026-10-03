@@ -381,17 +381,29 @@ impl FlatLayoutMigration {
         Ok(())
     }
 
-    /// Cheap, lock-free peek at whether migration still has work to do.
+    /// Lock-free peek at whether migration still has work to do.
     ///
-    /// Reads only the journal to decide, so it never mutates state or acquires
-    /// the root lock; the authoritative migration in [`Self::run_at`] runs
-    /// regardless. A `Complete` journal means nothing to do; a missing or
-    /// unreadable journal, or any earlier phase, errs toward pending so the
-    /// caller can surface progress.
+    /// Never mutates state or acquires the root lock; the authoritative
+    /// migration in [`Self::run_at`] runs regardless. Errors err toward pending
+    /// so the caller can surface progress.
     pub fn pending(&self) -> bool {
         match load_journal(&self.local) {
             Ok(Some(journal)) => journal.phase != MigrationPhase::Complete,
-            Ok(None) => true,
+            Ok(None) => {
+                let settings_path = match self.local.ensure_no_links("settings.json") {
+                    Ok(path) => path,
+                    Err(_) => return true,
+                };
+                let settings = match read_legacy_account_settings(&settings_path) {
+                    Ok(settings) => settings,
+                    Err(_) => return true,
+                };
+                if settings.and_then(|settings| settings.account_id).is_some() {
+                    return true;
+                }
+                let items = flat_layout_inventory(self.roaming.is_some());
+                self.has_migratable_sources(&items).unwrap_or(true)
+            }
             Err(_) => true,
         }
     }
@@ -419,14 +431,30 @@ impl FlatLayoutMigration {
         // Load the journal first. After the registry has been committed the
         // migration is self-describing and must not depend on mutable settings.
         let existing = load_journal(&self.local)?;
+        let items = flat_layout_inventory(self.roaming.is_some());
+        let item_ids: Vec<&str> = items.iter().map(|item| item.id).collect();
         if let Some(journal) = existing.as_ref() {
+            journal.verify_item_ids_exhaustive(&item_ids)?;
+            if journal.phase == MigrationPhase::Complete {
+                return Ok(MigrationOutcome::AlreadyComplete {
+                    account_key: journal.target_account_key,
+                });
+            }
+            if journal.kind == MigrationKind::Unknown
+                && journal.phase == MigrationPhase::AwaitingAttribution
+                && !self.unknown_migration_has_payload(journal, &items)?
+            {
+                let mut completed = journal.clone();
+                completed.phase = MigrationPhase::Complete;
+                save_journal(&self.local, &completed)?;
+                tracing::info!("[MIGRATION] Empty legacy migration marked complete");
+                return Ok(MigrationOutcome::AlreadyComplete { account_key: None });
+            }
             if !phase_before(journal.phase, MigrationPhase::RegistryCommitted) {
-                if journal.phase != MigrationPhase::Complete {
-                    tracing::info!(
-                        "[MIGRATION] Resuming migration after registry commit (phase={:?})",
-                        journal.phase
-                    );
-                }
+                tracing::info!(
+                    "[MIGRATION] Resuming migration after registry commit (phase={:?})",
+                    journal.phase
+                );
                 return self.resume_after_commit(journal.clone(), now);
             }
         }
@@ -441,9 +469,6 @@ impl FlatLayoutMigration {
             MigrationKind::Unknown
         };
 
-        let has_roaming = self.roaming.is_some();
-        let items = flat_layout_inventory(has_roaming);
-        let item_ids: Vec<&str> = items.iter().map(|item| item.id).collect();
         let fingerprint = inventory_fingerprint(kind, &item_ids);
 
         let resuming = existing.is_some();
@@ -459,6 +484,9 @@ impl FlatLayoutMigration {
                 existing
             }
             None => {
+                if kind == MigrationKind::Unknown && !self.has_migratable_sources(&items)? {
+                    return Ok(MigrationOutcome::AlreadyComplete { account_key: None });
+                }
                 // A brand-new journal must not adopt foreign quarantine content.
                 if let Some(reason) = self.preexisting_quarantine_conflict()? {
                     return Ok(MigrationOutcome::Blocked { reason });
@@ -503,6 +531,35 @@ impl FlatLayoutMigration {
             }
             MigrationKind::Unknown => self.run_unknown(&mut journal, &items, now),
         }
+    }
+
+    fn has_migratable_sources(&self, items: &[InventoryItem]) -> Result<bool, MigrationError> {
+        for item in items {
+            if matches!(item.class, SourceClass::Global | SourceClass::Credential) {
+                continue;
+            }
+            if self.path_exists(&self.absolute_source(item)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn unknown_migration_has_payload(
+        &self,
+        journal: &MigrationJournal,
+        items: &[InventoryItem],
+    ) -> Result<bool, MigrationError> {
+        if self.has_migratable_sources(items)? {
+            return Ok(true);
+        }
+        if !self.local.read_directory(QUARANTINE_DIR)?.is_empty() {
+            return Ok(true);
+        }
+        Ok(!self
+            .local
+            .read_directory(&journal.backup_directory)?
+            .is_empty())
     }
 
     /// Detect a foreign, non-empty quarantine directory before a new journal is

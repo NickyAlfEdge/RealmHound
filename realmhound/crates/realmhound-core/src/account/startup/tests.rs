@@ -225,11 +225,10 @@ fn interrupted_migration_resumes_to_selected_startup() {
 fn unknown_account_resolves_to_discovery_without_account_resources() {
     let (_temp, root) = root();
     let credentials = creds();
-    // No account id in settings: an unknown migration quarantines nothing here
-    // and awaits attribution.
 
     let resolution = resolver(&root, credentials).resolve();
     assert!(matches!(resolution, StartupResolution::Discovery(_)));
+    assert!(load_journal(&root).unwrap().is_none());
 
     // Discovery opened no account profile or database.
     let accounts = root.read_directory("accounts").unwrap();

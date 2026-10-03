@@ -270,6 +270,120 @@ fn unknown_migration_quarantines_and_awaits_attribution() {
         .read("RealmHound/account/anything")
         .unwrap()
         .is_none());
+
+    let resumed = migration(&root, credentials).run_at(Utc::now()).unwrap();
+    assert!(matches!(
+        resumed,
+        MigrationOutcome::AwaitingAttribution { .. }
+    ));
+}
+
+#[test]
+fn empty_unknown_layout_completes_without_a_journal() {
+    let (_temp, root) = root();
+
+    let outcome = migration(&root, Arc::new(InMemoryCredentialStore::new()))
+        .run_at(Utc::now())
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        MigrationOutcome::AlreadyComplete { account_key: None }
+    );
+    assert!(super::journal::load_journal(&root).unwrap().is_none());
+    assert!(!root.path().join("quarantine").exists());
+    assert!(!root.path().join("migration-backups").exists());
+}
+
+#[test]
+fn global_sources_do_not_start_unknown_migration() {
+    let (_temp, root) = root();
+    write(&root, "settings.json", br#"{"account":{}}"#);
+    write(&root, "logs/app.log", b"global log");
+    write(&root, "assets/ObjectID.list", b"global asset");
+
+    let outcome = migration(&root, Arc::new(InMemoryCredentialStore::new()))
+        .run_at(Utc::now())
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        MigrationOutcome::AlreadyComplete { account_key: None }
+    );
+    assert!(super::journal::load_journal(&root).unwrap().is_none());
+}
+
+#[test]
+fn credential_only_layout_does_not_start_unknown_migration() {
+    let (_temp, root) = root();
+    write(&root, "access_token.txt", b"obsolete token");
+
+    let outcome = migration(&root, Arc::new(InMemoryCredentialStore::new()))
+        .run_at(Utc::now())
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        MigrationOutcome::AlreadyComplete { account_key: None }
+    );
+    assert!(super::journal::load_journal(&root).unwrap().is_none());
+}
+
+#[test]
+fn roaming_only_layout_starts_unknown_migration() {
+    let (_local_temp, local) = root();
+    let (_roaming_temp, roaming) = root();
+    write(&roaming, "characters_cache.json", br#"{"characters":[]}"#);
+
+    let outcome = FlatLayoutMigration::new(
+        local.clone(),
+        Some(roaming),
+        Arc::new(InMemoryCredentialStore::new()),
+    )
+    .run_at(Utc::now())
+    .unwrap();
+
+    assert!(matches!(
+        outcome,
+        MigrationOutcome::AwaitingAttribution { .. }
+    ));
+    assert!(super::journal::load_journal(&local).unwrap().is_some());
+}
+
+#[test]
+fn empty_awaiting_attribution_journal_is_repaired() {
+    let (_temp, root) = root();
+    let items = flat_layout_inventory(false);
+    let item_ids: Vec<&str> = items.iter().map(|item| item.id).collect();
+    let mut journal = super::journal::MigrationJournal::prepared(
+        super::journal::MigrationKind::Unknown,
+        super::journal::inventory_fingerprint(super::journal::MigrationKind::Unknown, &item_ids),
+        None,
+        None,
+        "migration-backups/20261003T160000Z".to_string(),
+        &item_ids,
+        Utc::now(),
+    );
+    journal.phase = super::journal::MigrationPhase::AwaitingAttribution;
+    journal.recovery = super::journal::RecoveryStatus::Healthy;
+    super::journal::save_journal(&root, &journal).unwrap();
+
+    let first = migration(&root, Arc::new(InMemoryCredentialStore::new()))
+        .run_at(Utc::now())
+        .unwrap();
+    let second = migration(&root, Arc::new(InMemoryCredentialStore::new()))
+        .run_at(Utc::now())
+        .unwrap();
+
+    assert_eq!(
+        first,
+        MigrationOutcome::AlreadyComplete { account_key: None }
+    );
+    assert_eq!(second, first);
+    assert_eq!(
+        super::journal::load_journal(&root).unwrap().unwrap().phase,
+        super::journal::MigrationPhase::Complete
+    );
 }
 
 #[test]
@@ -554,7 +668,7 @@ fn symlinked_source_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Cheap, lock-free pending() pre-check.
+// Lock-free pending() pre-check.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -570,6 +684,13 @@ fn pending_true_before_migration_and_false_after_completion() {
 
     // Completed journal: nothing to do.
     assert!(!migration(&root, creds).pending());
+}
+
+#[test]
+fn pending_false_for_empty_unknown_layout_without_journal() {
+    let (_temp, root) = root();
+
+    assert!(!migration(&root, Arc::new(InMemoryCredentialStore::new())).pending());
 }
 
 #[test]
@@ -926,6 +1047,21 @@ fn tampered_journal_with_missing_item_fails_closed() {
     run_until(&root, creds.clone(), "prepared");
 
     // Drop an inventory item from the journal on disk.
+    let mut journal = read_journal(&root);
+    journal.items.retain(|item| item.id != "quests.json");
+    super::journal::save_journal(&root, &journal).unwrap();
+
+    let error = migration(&root, creds).run_at(Utc::now()).unwrap_err();
+    assert!(matches!(error, MigrationError::JournalMismatch { .. }));
+}
+
+#[test]
+fn tampered_complete_journal_with_missing_item_fails_closed() {
+    let (_temp, root) = root();
+    seed_known_flat_layout(&root, "ACCT-1");
+    let creds = Arc::new(InMemoryCredentialStore::new());
+    migration(&root, creds.clone()).run_at(Utc::now()).unwrap();
+
     let mut journal = read_journal(&root);
     journal.items.retain(|item| item.id != "quests.json");
     super::journal::save_journal(&root, &journal).unwrap();
