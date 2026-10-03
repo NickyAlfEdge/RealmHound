@@ -849,8 +849,10 @@ pub struct ActiveEncounter {
 pub enum ClipboardWrite {
     /// Put this callout on the clipboard.
     Copy(String),
-    /// Empty the clipboard (the auto-copied callout is no longer valid).
-    Clear,
+    /// Empty the clipboard, but only while it still holds exactly this callout.
+    /// The user may have copied something else in the meantime, and that content
+    /// is theirs to keep.
+    ClearIfUnchanged(String),
 }
 
 /// Live feed panel state and UI.
@@ -1030,6 +1032,10 @@ pub struct LiveFeedPanel {
     /// `map_seed` of the dungeon whose callout this panel put on the clipboard
     /// automatically and has not released yet.
     auto_clipboard_seed: Option<i32>,
+    /// Exact text this panel put on the clipboard for `auto_clipboard_seed`, so
+    /// the automatic release can tell our callout from anything the user copied
+    /// afterwards.
+    auto_clipboard_text: Option<String>,
     /// Clipboard write the app still has to perform for this panel. The panel
     /// is only rendered while its tab is open, so it hands the write to the
     /// app, which has the egui context every frame.
@@ -1192,6 +1198,7 @@ impl LiveFeedPanel {
             callout_percent: false,
             auto_clipboard_calls: false,
             auto_clipboard_seed: None,
+            auto_clipboard_text: None,
             pending_clipboard: None,
             reward_mods: realmhound_core::settings::default_reward_mods(),
             dungeon_name_overrides: std::collections::BTreeMap::new(),
@@ -2553,16 +2560,20 @@ impl LiveFeedPanel {
         };
         if let Some((seed, text)) = queued {
             self.auto_clipboard_seed = Some(seed);
+            self.auto_clipboard_text = Some(text.clone());
             self.pending_clipboard = Some(ClipboardWrite::Copy(text));
         }
     }
 
     /// Stop holding the automatic callout copy and queue a clipboard clear.
-    /// Does nothing when this panel never put a callout there, so the user's
-    /// own clipboard contents are left alone.
+    /// Does nothing when this panel never put a callout there, and the clear it
+    /// queues only fires while the clipboard still holds that callout, so
+    /// anything the user copied since is left alone.
     fn release_auto_clipboard(&mut self) {
         if self.auto_clipboard_seed.take().is_some() {
-            self.pending_clipboard = Some(ClipboardWrite::Clear);
+            self.pending_clipboard = Some(ClipboardWrite::ClearIfUnchanged(
+                self.auto_clipboard_text.take().unwrap_or_default(),
+            ));
         }
     }
 
@@ -2591,7 +2602,9 @@ impl LiveFeedPanel {
             return None;
         }
         self.auto_clipboard_seed = None;
-        Some(ClipboardWrite::Clear)
+        Some(ClipboardWrite::ClearIfUnchanged(
+            self.auto_clipboard_text.take().unwrap_or_default(),
+        ))
     }
 
     /// Settle the live dungeon run timer for the row matching `map_seed` to the
@@ -7780,14 +7793,19 @@ mod tests {
             ..Default::default()
         });
         panel.push_dungeon(1, "Snake Pit", &[], None);
-        assert!(matches!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::Copy(_))
-        ));
+        let copied = match panel.poll_clipboard() {
+            Some(ClipboardWrite::Copy(text)) => text,
+            other => panic!("expected a copy, got {other:?}"),
+        };
 
         // Leaving the dungeon (any non-dungeon map change) releases the copy.
         panel.deactivate_active_dungeons();
-        assert_eq!(panel.poll_clipboard(), Some(ClipboardWrite::Clear));
+        // The clear carries the exact callout, so the app can tell it apart from
+        // anything the user copied since.
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::ClearIfUnchanged(copied))
+        );
         // Nothing is held any more, so no further clear is queued.
         assert_eq!(panel.poll_clipboard(), None);
     }
@@ -7801,13 +7819,16 @@ mod tests {
             ..Default::default()
         });
         panel.push_dungeon(1, "Snake Pit", &[], None);
-        assert!(matches!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::Copy(_))
-        ));
+        let copied = match panel.poll_clipboard() {
+            Some(ClipboardWrite::Copy(text)) => text,
+            other => panic!("expected a copy, got {other:?}"),
+        };
 
         panel.force_realm_closed();
-        assert_eq!(panel.poll_clipboard(), Some(ClipboardWrite::Clear));
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::ClearIfUnchanged(copied))
+        );
     }
 
     #[test]
@@ -7819,10 +7840,10 @@ mod tests {
             ..Default::default()
         });
         panel.push_dungeon(1, "Snake Pit", &[], None);
-        assert!(matches!(
-            panel.poll_clipboard(),
-            Some(ClipboardWrite::Copy(_))
-        ));
+        let copied = match panel.poll_clipboard() {
+            Some(ClipboardWrite::Copy(text)) => text,
+            other => panic!("expected a copy, got {other:?}"),
+        };
 
         // The countdown runs out on its own, with no map change.
         for entry in panel.entries.iter_mut() {
@@ -7830,7 +7851,10 @@ mod tests {
                 dungeon.deactivate();
             }
         }
-        assert_eq!(panel.poll_clipboard(), Some(ClipboardWrite::Clear));
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::ClearIfUnchanged(copied))
+        );
     }
 
     #[test]

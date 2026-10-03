@@ -1597,7 +1597,14 @@ impl RealmHoundApp {
         if let Some(write) = self.live_feed_panel.poll_clipboard() {
             match write {
                 crate::panels::live_feed::ClipboardWrite::Copy(text) => ctx.copy_text(text),
-                crate::panels::live_feed::ClipboardWrite::Clear => ctx.copy_text(String::new()),
+                crate::panels::live_feed::ClipboardWrite::ClearIfUnchanged(copied) => {
+                    // Only drop the callout this panel copied. If the clipboard
+                    // holds anything else, the user copied something in the
+                    // meantime and it stays untouched.
+                    if crate::clipboard::still_holds(&copied) {
+                        ctx.copy_text(String::new());
+                    }
+                }
             }
         }
 
