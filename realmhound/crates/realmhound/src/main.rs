@@ -127,6 +127,11 @@ fn main() -> Result<()> {
         .with_icon(egui::IconData::default());
 
     if let Some((x, y)) = window_pos {
+        #[cfg(windows)]
+        if x.is_finite() && y.is_finite() {
+            viewport = viewport.with_position([x, y]);
+        }
+        #[cfg(not(windows))]
         if x > -10000.0 && y > -10000.0 {
             viewport = viewport.with_position([x, y]);
         }
@@ -644,6 +649,9 @@ mod root_app_tests {
     use eframe::App;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(windows)]
+    use windows_sys::Win32::Foundation::RECT;
+
     #[test]
     fn root_app_forwards_shutdown_to_active_app() {
         struct ExitApp(Arc<AtomicBool>);
@@ -658,6 +666,90 @@ mod root_app_tests {
         root.state = RootState::Active(Box::new(ExitApp(exited.clone())));
         root.on_exit(None);
         assert!(exited.load(Ordering::SeqCst));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn title_bar_visibility_requires_configured_minimum() {
+        let work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let enough = RECT {
+            left: -850,
+            top: 100,
+            right: 800,
+            bottom: 800,
+        };
+        let too_narrow = RECT {
+            left: -1800,
+            top: 100,
+            right: 149,
+            bottom: 800,
+        };
+        let too_short = RECT {
+            left: 100,
+            top: -1,
+            right: 1000,
+            bottom: 49,
+        };
+        let exact_minimum = RECT {
+            left: -850,
+            top: 0,
+            right: 150,
+            bottom: 700,
+        };
+
+        assert!(has_usable_title_bar(enough, work_area));
+        assert!(has_usable_title_bar(exact_minimum, work_area));
+        assert!(!has_usable_title_bar(too_narrow, work_area));
+        assert!(!has_usable_title_bar(too_short, work_area));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fitted_center_uses_monitor_work_area() {
+        let window = RECT {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 700,
+        };
+        let work_area = RECT {
+            left: -1920,
+            top: 40,
+            right: 0,
+            bottom: 1080,
+        };
+
+        assert_eq!(
+            fitted_centered_window(window, work_area),
+            (-1460, 210, 1000, 700)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fitted_center_shrinks_oversized_window() {
+        let window = RECT {
+            left: 0,
+            top: 0,
+            right: 3000,
+            bottom: 2000,
+        };
+        let work_area = RECT {
+            left: 0,
+            top: 40,
+            right: 1920,
+            bottom: 1080,
+        };
+
+        assert_eq!(
+            fitted_centered_window(window, work_area),
+            (0, 40, 1920, 1040)
+        );
     }
 }
 
@@ -998,11 +1090,182 @@ impl Drop for BoundedApp {
 #[cfg(windows)]
 pub fn apply_window_chrome<W: raw_window_handle::HasWindowHandle>(window: &W) {
     use std::sync::Once;
+    ensure_window_visible(window);
     static CHROME: Once = Once::new();
     CHROME.call_once(|| {
         set_titlebar_icon_from_resource(window);
         set_titlebar_dark_mode(window);
     });
+}
+
+#[cfg(windows)]
+const MIN_VISIBLE_TITLE_BAR_WIDTH: i32 = 150;
+#[cfg(windows)]
+const MIN_VISIBLE_TITLE_BAR_HEIGHT: i32 = 50;
+#[cfg(windows)]
+static NORMAL_WINDOW_PLACEMENT_CHECKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Center a window on the primary display when its saved placement leaves too
+/// little title bar visible to notice and drag it.
+#[cfg(windows)]
+fn ensure_window_visible<W: raw_window_handle::HasWindowHandle>(window: &W) {
+    use raw_window_handle::RawWindowHandle;
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, IsIconic, IsZoomed, SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER,
+    };
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = win32.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+
+    unsafe {
+        if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
+            NORMAL_WINDOW_PLACEMENT_CHECKED.store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if NORMAL_WINDOW_PLACEMENT_CHECKED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        let mut window_rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut window_rect) == 0 {
+            return;
+        }
+
+        match title_bar_is_visible_on_any_monitor(window_rect) {
+            Some(true) => {
+                NORMAL_WINDOW_PLACEMENT_CHECKED.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            Some(false) => {}
+            None => return,
+        }
+
+        let primary = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if primary == 0 {
+            return;
+        }
+        let mut primary_info: MONITORINFO = std::mem::zeroed();
+        primary_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(primary, &mut primary_info) == 0 {
+            return;
+        }
+
+        let (x, y, width, height) = fitted_centered_window(window_rect, primary_info.rcWork);
+        if SetWindowPos(hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE) != 0 {
+            NORMAL_WINDOW_PLACEMENT_CHECKED.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("[WINDOW] Recentered window after display layout change");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn title_bar_is_visible_on_any_monitor(
+    window: windows_sys::Win32::Foundation::RECT,
+) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+
+    struct MonitorCheck {
+        window: RECT,
+        seen: bool,
+        visible: bool,
+    }
+
+    unsafe extern "system" fn check_monitor(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let check = &mut *(data as *mut MonitorCheck);
+        check.seen = true;
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0
+            && has_usable_title_bar(check.window, info.rcWork)
+        {
+            check.visible = true;
+            return 0;
+        }
+        1
+    }
+
+    let mut check = MonitorCheck {
+        window,
+        seen: false,
+        visible: false,
+    };
+    unsafe {
+        EnumDisplayMonitors(
+            0,
+            std::ptr::null(),
+            Some(check_monitor),
+            &mut check as *mut MonitorCheck as LPARAM,
+        );
+    }
+    check.seen.then_some(check.visible)
+}
+
+#[cfg(windows)]
+fn title_bar_rect(
+    window: windows_sys::Win32::Foundation::RECT,
+) -> windows_sys::Win32::Foundation::RECT {
+    windows_sys::Win32::Foundation::RECT {
+        left: window.left,
+        top: window.top,
+        right: window.right,
+        bottom: window
+            .top
+            .saturating_add(MIN_VISIBLE_TITLE_BAR_HEIGHT)
+            .min(window.bottom),
+    }
+}
+
+#[cfg(windows)]
+fn has_usable_title_bar(
+    window: windows_sys::Win32::Foundation::RECT,
+    work_area: windows_sys::Win32::Foundation::RECT,
+) -> bool {
+    let title_bar = title_bar_rect(window);
+    let width = i64::from(title_bar.right.min(work_area.right))
+        - i64::from(title_bar.left.max(work_area.left));
+    let height = i64::from(title_bar.bottom.min(work_area.bottom))
+        - i64::from(title_bar.top.max(work_area.top));
+    width >= i64::from(MIN_VISIBLE_TITLE_BAR_WIDTH)
+        && height >= i64::from(MIN_VISIBLE_TITLE_BAR_HEIGHT)
+}
+
+#[cfg(windows)]
+fn fitted_centered_window(
+    window: windows_sys::Win32::Foundation::RECT,
+    work_area: windows_sys::Win32::Foundation::RECT,
+) -> (i32, i32, i32, i32) {
+    let work_width =
+        (i64::from(work_area.right) - i64::from(work_area.left)).clamp(1, i64::from(i32::MAX));
+    let work_height =
+        (i64::from(work_area.bottom) - i64::from(work_area.top)).clamp(1, i64::from(i32::MAX));
+    let window_width = (i64::from(window.right) - i64::from(window.left)).clamp(1, work_width);
+    let window_height = (i64::from(window.bottom) - i64::from(window.top)).clamp(1, work_height);
+    let x = i64::from(work_area.left) + (work_width - window_width) / 2;
+    let y = i64::from(work_area.top) + (work_height - window_height) / 2;
+    (
+        x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        window_width as i32,
+        window_height as i32,
+    )
 }
 
 /// Set the window's title-bar icon (ICON_SMALL/ICON_BIG) from the multi-size

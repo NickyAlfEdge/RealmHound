@@ -1155,26 +1155,26 @@ impl RealmHoundApp {
     /// Update window state in settings from current egui context.
     fn update_window_state(&mut self, ctx: &egui::Context) {
         ctx.input(|i| {
-            if let Some(rect) = i.viewport().inner_rect {
-                let mut settings = match self.settings.write() {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
+            let viewport = i.viewport();
+            let mut settings = match self.settings.write() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
 
-                // Update size
+            if let Some(maximized) = viewport.maximized {
+                settings.window.maximized = maximized;
+                if maximized {
+                    return;
+                }
+            }
+
+            if let Some(rect) = viewport.inner_rect {
                 settings.window.width = rect.width();
                 settings.window.height = rect.height();
-
-                // Update position
-                if let Some(pos) = i.viewport().outer_rect {
-                    settings.window.x = Some(pos.min.x);
-                    settings.window.y = Some(pos.min.y);
-                }
-
-                // Check maximized state
-                if let Some(maximized) = i.viewport().maximized {
-                    settings.window.maximized = maximized;
-                }
+            }
+            if let Some(pos) = viewport.outer_rect {
+                settings.window.x = Some(pos.min.x);
+                settings.window.y = Some(pos.min.y);
             }
         });
     }
