@@ -20,6 +20,21 @@ pub fn still_holds(copied: &str) -> bool {
     should_clear(text().as_deref(), copied)
 }
 
+/// Upper bound on the units RealmHound will look at. Only a short callout is
+/// ever written here, so an implausibly large clipboard block is not worth
+/// copying into a `String` even though its size is known.
+const MAX_UNITS: usize = 1 << 20;
+
+/// Decode a UTF-16 clipboard block, given the units the block actually holds.
+///
+/// Returns `None` when the block carries no null terminator, rather than reading
+/// past the memory its owner allocated: a malformed payload must never be
+/// scanned out of bounds.
+fn decode_utf16_block(units: &[u16]) -> Option<String> {
+    let len = units.iter().position(|&unit| unit == 0)?;
+    Some(String::from_utf16_lossy(&units[..len]))
+}
+
 /// The clipboard's current text, or `None` when it is empty, unreadable, or
 /// holds something that is not plain text.
 #[cfg(windows)]
@@ -28,14 +43,11 @@ fn text() -> Option<String> {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     };
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
     /// `CF_UNICODETEXT` from winuser.h. windows-sys exposes the clipboard
     /// functions but not the predefined format constants.
     const CF_UNICODETEXT: u32 = 13;
-    /// Upper bound on the units read, so a truncated or unterminated string in
-    /// someone else's clipboard window cannot make this scan run away.
-    const MAX_UNITS: usize = 1 << 20;
 
     unsafe {
         // Not holding text at all -- e.g. an image or a file list: leave it be.
@@ -53,21 +65,20 @@ fn text() -> Option<String> {
             return None;
         }
         let hglobal: HGLOBAL = handle as HGLOBAL;
+        // How many units the owner actually allocated. A size of 0 means the
+        // handle is not a memory block we can bound, so nothing is read.
+        let bytes = GlobalSize(hglobal);
         let ptr = GlobalLock(hglobal) as *const u16;
-        let text = if ptr.is_null() {
+        let text = if ptr.is_null() || bytes == 0 {
             None
         } else {
-            let mut len = 0usize;
-            while len < MAX_UNITS && *ptr.add(len) != 0 {
-                len += 1;
-            }
-            let text = if len == MAX_UNITS {
-                // Unterminated: unusable, and not our own callout either.
+            // Bounded by the allocation, so the scan itself can never run past
+            // the block.
+            let units = (bytes / std::mem::size_of::<u16>()).min(MAX_UNITS);
+            let text = if units == 0 {
                 None
             } else {
-                Some(String::from_utf16_lossy(std::slice::from_raw_parts(
-                    ptr, len,
-                )))
+                decode_utf16_block(std::slice::from_raw_parts(ptr, units))
             };
             GlobalUnlock(hglobal);
             text
@@ -84,7 +95,7 @@ fn text() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_clear, still_holds};
+    use super::{decode_utf16_block, should_clear, still_holds};
 
     #[test]
     fn clears_only_the_callout_we_copied() {
@@ -111,5 +122,26 @@ mod tests {
         assert!(!still_holds(
             "realmhound clipboard sentinel 4f3c1d9a-2b6e-4a58-9c71-0e5d8a6b7c42"
         ));
+    }
+
+    #[test]
+    fn decodes_text_up_to_the_terminator() {
+        assert_eq!(decode_utf16_block(&[104, 105, 0]), Some("hi".to_string()));
+        // Anything the block holds after the terminator is not part of the text.
+        assert_eq!(decode_utf16_block(&[104, 0, 105, 0]), Some("h".to_string()));
+        // A terminated but empty block is valid text (never our own callout).
+        assert_eq!(decode_utf16_block(&[0]), Some(String::new()));
+    }
+
+    #[test]
+    fn rejects_a_block_without_a_terminator() {
+        // What a malformed payload looks like: the allocated block ends without
+        // a null, so decoding it must stop here instead of walking past the
+        // memory the clipboard owner allocated.
+        assert_eq!(
+            decode_utf16_block(&[u16::from(b'a'), u16::from(b'b')]),
+            None
+        );
+        assert_eq!(decode_utf16_block(&[]), None);
     }
 }
