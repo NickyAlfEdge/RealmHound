@@ -7,6 +7,7 @@
 //! - Short name: the event's short community name (e.g. `rav rot`), or a user
 //!   override.
 //! - Full name: the encounter's full display name.
+//! - None: no name at all (the callout carries only the upcoming hint, if any).
 //! - Add upcoming: append the dungeon it is about to drop (e.g.
 //!   `rav rot, halls soon`).
 //!
@@ -80,6 +81,13 @@ const EVENT_SHORT_NAMES: &[(&str, &str)] = &[
     ("Jack Frost",                     "jack"),
     ("Jotunn",                         "jotunn"),
     ("Oryx Horde",                     "oryx horde"),
+    // Newer realm encounters (the in-game names of their bosses).
+    ("Artificial Slop",                "slop"),
+    ("Cold Soul",                      "cold soul"),
+    ("Cube Deity",                     "deity"),
+    ("Man-eating Barnacle",            "barnacle"),
+    ("Stygian Mirror",                 "mirror"),
+    ("Towering Perfection",            "tower perf"),
 ];
 
 /// Upcoming-dungeon hint suffix for encounters that drop dungeon portals, keyed
@@ -166,6 +174,8 @@ pub fn event_upcoming_hint(display_name: &str) -> Option<&'static str> {
 
 /// Resolve the event's callout name part, honoring a user short-name override
 /// (Short mode only), then the curated short name, then the full display name.
+/// Returns an empty string in [`DungeonNameStyle::None`] mode (the name-less
+/// style), where the callout carries only the upcoming hint.
 fn resolve_event_name(
     display_name: &str,
     name_style: DungeonNameStyle,
@@ -183,27 +193,32 @@ fn resolve_event_name(
         DungeonNameStyle::Short => event_short_name(display_name)
             .map(|s| s.to_string())
             .unwrap_or_else(|| display_name.trim().to_string()),
+        // The name-less style omits the encounter name entirely.
+        DungeonNameStyle::None => String::new(),
     }
 }
 
 /// Build the bare clipboard callout body (no `/p`, server, or `j`) for an event
 /// encounter, honoring the event name style, upcoming toggle, and user
 /// overrides. Falls back to the full display name when the encounter has no
-/// curated short name.
+/// curated short name; in [`DungeonNameStyle::None`] mode the body is just the
+/// upcoming hint (empty when the encounter drops no dungeon).
 pub fn event_call_body(
     display_name: &str,
     name_style: DungeonNameStyle,
     add_upcoming: bool,
     overrides: &BTreeMap<String, String>,
 ) -> String {
-    let mut body = resolve_event_name(display_name, name_style, overrides);
-    if add_upcoming {
-        if let Some(hint) = event_upcoming_hint(display_name) {
-            body.push_str(", ");
-            body.push_str(hint);
-        }
+    let name = resolve_event_name(display_name, name_style, overrides);
+    let hint = add_upcoming
+        .then(|| event_upcoming_hint(display_name))
+        .flatten();
+    match (name.is_empty(), hint) {
+        (false, Some(hint)) => format!("{name}, {hint}"),
+        (false, None) => name,
+        (true, Some(hint)) => hint.to_string(),
+        (true, None) => String::new(),
     }
-    body
 }
 
 /// Parse an Alien Invasion wave encounter name into `(is_veteran, wave_number)`.
@@ -264,6 +279,28 @@ mod tests {
         // Punctuation/case differences must not matter.
         assert_eq!(event_short_name("world's oyster"), Some("oyster"));
         assert_eq!(event_short_name("Mysterious Crystal"), Some("cry"));
+    }
+
+    #[test]
+    fn new_realm_bosses_have_short_calls() {
+        // The newer realm encounters are called by their community nicknames.
+        assert_eq!(event_short_name("Artificial Slop"), Some("slop"));
+        assert_eq!(event_short_name("Cold Soul"), Some("cold soul"));
+        assert_eq!(event_short_name("Cube Deity"), Some("deity"));
+        assert_eq!(event_short_name("Man-eating Barnacle"), Some("barnacle"));
+        assert_eq!(event_short_name("Stygian Mirror"), Some("mirror"));
+        assert_eq!(event_short_name("Towering Perfection"), Some("tower perf"));
+        // Punctuation/case don't matter for the lookup.
+        assert_eq!(event_short_name("man eating barnacle"), Some("barnacle"));
+        assert_eq!(
+            event_call_body(
+                "Towering Perfection",
+                DungeonNameStyle::Short,
+                true,
+                &no_overrides()
+            ),
+            "tower perf"
+        );
     }
 
     #[test]
@@ -360,6 +397,40 @@ mod tests {
                 &no_overrides()
             ),
             "Ravenous Rot, halls soon"
+        );
+    }
+
+    #[test]
+    fn none_style_omits_the_name() {
+        // The name-less style calls only the upcoming hint, when the encounter
+        // drops a dungeon.
+        assert_eq!(
+            event_call_body(
+                "Ravenous Rot",
+                DungeonNameStyle::None,
+                true,
+                &no_overrides()
+            ),
+            "halls soon"
+        );
+        // Without an upcoming hint there is nothing left to call.
+        assert_eq!(
+            event_call_body(
+                "Mysterious Crystal",
+                DungeonNameStyle::None,
+                true,
+                &no_overrides()
+            ),
+            ""
+        );
+        assert_eq!(
+            event_call_body(
+                "Ravenous Rot",
+                DungeonNameStyle::None,
+                false,
+                &no_overrides()
+            ),
+            ""
         );
     }
 

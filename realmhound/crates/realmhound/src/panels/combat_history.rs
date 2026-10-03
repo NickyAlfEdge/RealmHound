@@ -13,7 +13,10 @@ use std::time::Instant;
 use chrono::{Local, TimeZone, Utc};
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use realmhound_core::{
-    assets::{get_asset_manager, get_dungeon_portal_map, BossGroup, CatalogEntry},
+    assets::{
+        get_asset_manager, get_dungeon_portal_map, is_mv_boss, BossGroup, CatalogEntry,
+        DungeonPortalMap, MV_UMI_TYPE,
+    },
     combat::{
         build_bundle, sanitize_player_name, CombatDatabase, DamageProvenance,
         DamageTakenProvenance, EncounterRecord, FightQuery, FightRecord, FightSelection,
@@ -24,6 +27,7 @@ use realmhound_core::{
 
 use crate::panels::loot::DateFilter;
 use crate::panels::{empty_state, empty_state_lines, AppAction, Panel, PanelContext};
+use crate::rendering::EmbeddedIcon;
 
 /// How often to poll the fight count for new fights (wall clock).
 const POLL_INTERVAL_MS: u128 = 1000;
@@ -39,6 +43,195 @@ const CARD_HEIGHT: f32 = 52.0;
 /// damage column. The Messenger aux representative (45365) is
 /// excluded since guard damage is only tracked on the main O3 body.
 const O3_BOSS_TYPE: i32 = 45363;
+
+/// Boss starting HP a fight's damage shares reconcile against, or 0 when the HP
+/// is not a real damage pool. Moonlight Village mechanics bosses floor
+/// invulnerable and are cleared by the run's own completion instead of a death,
+/// so their nominal max HP is never removed; a 0 pool makes the participant
+/// table show each player's raw share of the tracked total rather than a
+/// fraction of that fake pool (and suppresses the "Unattributed" HP-gap row).
+fn share_hp_pool(boss_object_type: i32, boss_start_hp: i32) -> i64 {
+    if is_mv_boss(boss_object_type) {
+        0
+    } else {
+        boss_start_hp as i64
+    }
+}
+
+/// The overlaid text on a boss HP bar. An uncapped boss (Moonlight Village
+/// mechanics boss) has no finite pool, so it reads `<party damage> / ∞`;
+/// ordinary bosses read `<start HP> / <max HP>`, or nothing when no HP was ever
+/// registered.
+fn boss_bar_label(
+    boss_object_type: i32,
+    start_hp: i64,
+    max_hp: i64,
+    damage: i64,
+) -> Option<String> {
+    if is_mv_boss(boss_object_type) {
+        Some(format!("{} / ∞", fmt_thousands(damage)))
+    } else if max_hp > 0 {
+        Some(format!(
+            "{} / {}",
+            fmt_thousands(start_hp),
+            fmt_thousands(max_hp)
+        ))
+    } else {
+        None
+    }
+}
+
+/// The stat segment of a boss row header in a grouped encounter. An uncapped
+/// boss has no finite HP, so its row shows the party's total damage instead of
+/// an HP fraction, plus the Moonlight Village spirits it released when any were
+/// collected.
+fn boss_row_hp_label(
+    boss_object_type: i32,
+    boss_start_hp: i32,
+    boss_max_hp: i32,
+    damage: i64,
+    spirits: i32,
+) -> String {
+    if is_mv_boss(boss_object_type) {
+        if spirits > 0 {
+            format!("Damage {}  ·  Spirits {}", fmt_thousands(damage), spirits)
+        } else {
+            format!("Damage {}", fmt_thousands(damage))
+        }
+    } else {
+        format!("HP {}/{}", boss_start_hp, boss_max_hp)
+    }
+}
+
+/// The run-level modes a dungeon card is tagged with, in the order the title
+/// lists them. A mode is only ever set for the dungeon that has it (Leisure and
+/// Petless for Moonlight Village, hard mode for The Shatters and Spectral
+/// Penitentiary), so the tags never mix in practice.
+#[derive(Default, Clone, Copy)]
+struct RunModes {
+    /// Moonlight Village's Leisurely Mode: a Tofu Delicacy was consumed.
+    leisurely: bool,
+    /// Moonlight Village's Challenge Mode: the local player whacked the
+    /// Challenge Gate and lost their pet to a permanent stasis.
+    petless: bool,
+    /// The dungeon's hard mode: The Shatters' Stone Idol route, or Spectral
+    /// Penitentiary's objective-cleared mini-boss taunts.
+    hard_mode: bool,
+}
+
+/// The dungeon name shown as a card/header title, with the modes the run was
+/// played in as tags. Moonlight Village marks a Leisurely run (a Tofu Delicacy
+/// was consumed: shorter phases, reduced loot) and a Petless one (the local
+/// player whacked the Challenge Gate, which pet-stasises them for the run) --
+/// neither is comparable with a normal clear. The Shatters and Spectral
+/// Penitentiary mark hard mode the same way, since its extra mechanics (and, in
+/// the Shatters, its renamed bosses) make it a different fight.
+fn dungeon_display_name(portal_map: &DungeonPortalMap, dungeon: &str, modes: RunModes) -> String {
+    let name = portal_map.normalize_dungeon_name(dungeon);
+    let mut tags: Vec<&str> = Vec::new();
+    if modes.leisurely {
+        tags.push("Leisure");
+    }
+    if modes.petless {
+        tags.push("Petless");
+    }
+    if modes.hard_mode {
+        tags.push("HM");
+    }
+    if tags.is_empty() {
+        name
+    } else {
+        format!("{name} ({})", tags.join(", "))
+    }
+}
+
+/// Draw a boss portrait. Hard mode reveals the Forgotten King as King Azamoth
+/// without swapping in another object, so his card is drawn from the extra frame
+/// of his own sprite sheet ([`shatters_hm_boss_sprite`]); every other boss uses
+/// the sprite of its object type.
+fn draw_boss_sprite(
+    sprite_renderer: &mut crate::rendering::SpriteRenderer,
+    ui: &egui::Ui,
+    object_type: i32,
+    shatters_hm: bool,
+    rect: egui::Rect,
+) {
+    if shatters_hm {
+        if let Some((sheet, frame)) = realmhound_core::assets::shatters_hm_boss_sprite(object_type)
+        {
+            if sprite_renderer.draw_outlined_sprite_by_sheet(ui, sheet, frame, rect) {
+                return;
+            }
+        }
+    }
+    // A boss whose art is larger than the portrait cell is fitted to it instead
+    // of being drawn at 1x (its smallest integer scale) and spilling over the
+    // row: The Shattered Queen's 32x32 statue in a 22px phase row.
+    sprite_renderer.draw_outlined_sprite_fitting_cell(ui, object_type, rect);
+}
+
+/// Draw a Moonlight Village spirit tally sprite: the dancers share the bundled
+/// spirit flame, while Kitsune Umi's own spirits (her phases and her total) use
+/// the "Concentrated Soul Fire" object sprite. Falls back to the shared flame
+/// when the object sprite isn't available, so a tally is never left blank.
+fn draw_spirit_sprite(
+    sprite_renderer: &mut crate::rendering::SpriteRenderer,
+    ui: &egui::Ui,
+    umi: bool,
+    rect: egui::Rect,
+) {
+    if umi
+        && sprite_renderer.draw_sprite_in_rect(
+            ui,
+            realmhound_core::assets::MV_UMI_SPIRIT_TYPE,
+            rect,
+        )
+    {
+        return;
+    }
+    // `draw_embedded_icon_fitted` keeps the flame's own aspect ratio instead of
+    // stretching it to the rect (it is a tall 24x48 sprite in a square cell).
+    sprite_renderer.draw_embedded_icon_fitted(ui, EmbeddedIcon::MvSpirit, rect);
+}
+
+/// A boss row's stats split around its spirit tally, so the spirit sprite can be
+/// drawn directly before the count: `(leading, spirits)`, where `spirits` is
+/// `Some` only for a Moonlight Village phase that collected any.
+fn boss_row_stats_parts(
+    boss_object_type: i32,
+    boss_start_hp: i32,
+    boss_max_hp: i32,
+    damage: i64,
+    spirits: i32,
+) -> (String, Option<i32>) {
+    if is_mv_boss(boss_object_type) && spirits > 0 {
+        (
+            format!("Damage {}  ·  ", fmt_thousands(damage)),
+            Some(spirits),
+        )
+    } else {
+        (
+            boss_row_hp_label(
+                boss_object_type,
+                boss_start_hp,
+                boss_max_hp,
+                damage,
+                spirits,
+            ),
+            None,
+        )
+    }
+}
+
+/// The header line for a Moonlight Village spirit total, carrying the loot tier
+/// the total earned ("(Tier:N)", 4 being the best). `umi` scores the total on
+/// Kitsune Umi's own thresholds; a Leisurely Mode dance is scored on them too.
+fn spirit_total_label(label: &str, spirits: i32, leisurely: bool, umi: bool) -> String {
+    match realmhound_core::assets::mv_spirit_tier(spirits, leisurely, umi) {
+        Some(tier) => format!("{label}{spirits} (Tier:{tier})"),
+        None => format!("{label}{spirits}"),
+    }
+}
 
 /// Cached autocomplete data (distinct bosses/dungeons) for search suggestions.
 #[derive(Default)]
@@ -1661,6 +1854,15 @@ impl CombatHistoryPanel {
                     cui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 let dungeon_label = portal_map.normalize_dungeon_name(&fight.dungeon);
+                let dungeon_title = dungeon_display_name(
+                    portal_map,
+                    &fight.dungeon,
+                    RunModes {
+                        leisurely: fight.leisurely,
+                        petless: fight.petless,
+                        hard_mode: fight.shatters_hm || fight.spectral_hm,
+                    },
+                );
                 if resp
                     .hover_tip(format!("{}\n(Click to filter)", dungeon_label))
                     .clicked()
@@ -1672,9 +1874,11 @@ impl CombatHistoryPanel {
                 let (brect, bresp) =
                     cui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
                 if fight.boss_object_type != 0 {
-                    ctx.sprite_renderer.draw_outlined_sprite_in_rect(
+                    draw_boss_sprite(
+                        ctx.sprite_renderer,
                         cui,
                         fight.boss_object_type,
+                        fight.shatters_hm,
                         brect,
                     );
                 }
@@ -1842,7 +2046,7 @@ impl CombatHistoryPanel {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             ui.label(
-                                RichText::new(&dungeon_label)
+                                RichText::new(&dungeon_title)
                                     .size(17.0)
                                     .strong()
                                     .color(Color32::WHITE),
@@ -2260,6 +2464,8 @@ impl CombatHistoryPanel {
                     fight.boss_object_type,
                     fight.boss_start_hp as i64,
                     fight.boss_max_hp as i64,
+                    fight.total_damage(),
+                    fight.shatters_hm,
                 );
 
                 ui.add_space(6.0);
@@ -2279,7 +2485,15 @@ impl CombatHistoryPanel {
                         ui.label(
                             RichText::new(format!(
                                 "{}  ·  {}",
-                                portal_map.normalize_dungeon_name(&fight.dungeon),
+                                dungeon_display_name(
+                                    portal_map,
+                                    &fight.dungeon,
+                                    RunModes {
+                                        leisurely: fight.leisurely,
+                                        petless: fight.petless,
+                                        hard_mode: fight.shatters_hm || fight.spectral_hm,
+                                    },
+                                ),
                                 datetime_s,
                             ))
                             .color(Color32::GRAY),
@@ -2383,7 +2597,7 @@ impl CombatHistoryPanel {
                     ctx,
                     &fight.participants,
                     "combat_detail_table",
-                    fight.boss_start_hp as i64,
+                    share_hp_pool(fight.boss_object_type, fight.boss_start_hp),
                     fight.killed,
                     !fight.killed,
                     fight.boss_object_type == O3_BOSS_TYPE,
@@ -2496,6 +2710,12 @@ impl CombatHistoryPanel {
     /// yellow diamond + boss portrait overlapping the bar's right end. Returns
     /// the x offset (from the left edge) where the bar starts, so the meta text
     /// below can be aligned with it.
+    ///
+    /// Moonlight Village mechanics bosses have no finite HP pool (they floor
+    /// invulnerable and are cleared by the encounter's own mechanic), so their
+    /// bar is drawn full green and labelled `<party damage> / ∞` instead of a
+    /// start/max HP fraction. `damage` is the total damage dealt by every
+    /// participant, used only for that label.
     fn draw_boss_hp_bar(
         &self,
         ui: &mut egui::Ui,
@@ -2504,6 +2724,8 @@ impl CombatHistoryPanel {
         boss_type: i32,
         start_hp: i64,
         max_hp: i64,
+        damage: i64,
+        shatters_hm: bool,
     ) -> f32 {
         const YELLOW: Color32 = Color32::from_rgb(0xff, 0xc1, 0x00);
         const DARK_YELLOW: Color32 = Color32::from_rgb(0xab, 0x83, 0x00);
@@ -2546,8 +2768,12 @@ impl CombatHistoryPanel {
         // Dark background for the whole bar.
         painter.rect_filled(bar_rect, ROUNDING, DARK_BG);
 
-        // Colored fill proportional to discovered/max HP.
-        let frac = if max_hp > 0 {
+        // Colored fill proportional to discovered/max HP. An uncapped boss has no
+        // finite pool, so its bar is drawn full as an "infinite" bar.
+        let uncapped = is_mv_boss(boss_type);
+        let frac = if uncapped {
+            1.0
+        } else if max_hp > 0 {
             (start_hp as f32 / max_hp as f32).clamp(0.0, 1.0)
         } else {
             0.0
@@ -2576,9 +2802,9 @@ impl CombatHistoryPanel {
         );
 
         // HP numbers, centered in the bar area left of the diamond: yellow text
-        // with a 1px black outline.
-        if max_hp > 0 {
-            let text = format!("{} / {}", fmt_thousands(start_hp), fmt_thousands(max_hp));
+        // with a 1px black outline. An uncapped boss reads "<damage> / ∞": the
+        // party's total damage against an unlimited pool.
+        if let Some(text) = boss_bar_label(boss_type, start_hp, max_hp, damage) {
             let font = egui::FontId::proportional(15.0);
             let text_cx = (bar_rect.left() + (bar_rect.right() - DIAMOND * 0.5)) * 0.5;
             let center = egui::pos2(text_cx, bar_rect.center().y);
@@ -2611,7 +2837,7 @@ impl CombatHistoryPanel {
         ));
         if boss_type != 0 {
             let p_rect = egui::Rect::from_center_size(dc, egui::vec2(PORTRAIT, PORTRAIT));
-            sprite_renderer.draw_outlined_sprite_in_rect(ui, boss_type, p_rect);
+            draw_boss_sprite(sprite_renderer, ui, boss_type, shatters_hm, p_rect);
         }
 
         // Tooltip scoped to the bar itself.
@@ -2620,9 +2846,13 @@ impl CombatHistoryPanel {
             ui.id().with("boss_hp_bar_tooltip"),
             egui::Sense::hover(),
         );
-        bar_resp.hover_tip(
-            "Boss's HP at the start of the fight / Boss's max HP registered during the fight",
-        );
+        bar_resp.hover_tip(if uncapped {
+            "This boss never loses HP -- it is cleared by the encounter's own \
+             mechanic -- so its HP is effectively infinite. The number shown is \
+             the total damage dealt by the party."
+        } else {
+            "Boss's HP at the start of the fight / Boss's max HP registered during the fight"
+        });
 
         bar_inset
     }
@@ -3244,18 +3474,26 @@ impl CombatHistoryPanel {
             .filter(|p| !(hide_crates && get_asset_manager().is_treasure_crate(p.boss_object_type)))
             .collect();
 
-        // Display order: final boss at the top, earlier bosses below in
-        // reverse-kill order. Crates done after the main boss are the latest
-        // phases, so they land above the main boss (folded). Sort by kill time
-        // descending.
-        visible_phases.sort_by(|a, b| b.ended_at.cmp(&a.ended_at));
+        // Display order: the last boss fought at the top, so reading the rows
+        // bottom-to-top is the order the party fought them. Ordering is by fight
+        // start, not finalization: an earlier phase can flush after a later one
+        // (e.g. a Moonlight Village dancer suspended and folded at the run's end),
+        // and it must not jump above the boss the run actually finished on.
+        visible_phases.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then(b.ended_at.cmp(&a.ended_at))
+        });
 
         // The main dungeon boss: the run anchor (last real boss), else the last
         // non-crate phase. Its section auto-expands and shows the "Main" badge.
+        // The latest row of that object type is the anchor phase itself, since a
+        // single boss can be recorded under several rows (re-detections).
         let am = get_asset_manager();
         let anchor_id: Option<i64> = enc
             .phases
             .iter()
+            .rev()
             .find(|p| p.boss_object_type == enc.anchor_object_type)
             .or_else(|| {
                 enc.phases
@@ -3306,12 +3544,18 @@ impl CombatHistoryPanel {
                 let portal_id = portal_map.get_portal_id(&enc.dungeon).unwrap_or(0);
 
                 // The HP bar reflects the main boss identified above.
-                let (anchor_start, anchor_max) = enc
+                let (anchor_start, anchor_max, anchor_damage) = enc
                     .phases
                     .iter()
                     .find(|p| Some(p.id) == anchor_id)
-                    .map(|p| (p.boss_start_hp as i64, p.boss_max_hp as i64))
-                    .unwrap_or((0, 0));
+                    .map(|p| {
+                        (
+                            p.boss_start_hp as i64,
+                            p.boss_max_hp as i64,
+                            p.total_damage(),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0));
 
                 let bar_inset = self.draw_boss_hp_bar(
                     ui,
@@ -3320,6 +3564,8 @@ impl CombatHistoryPanel {
                     icon_type,
                     anchor_start,
                     anchor_max,
+                    anchor_damage,
+                    enc.shatters_hm,
                 );
 
                 ui.add_space(6.0);
@@ -3347,7 +3593,15 @@ impl CombatHistoryPanel {
                         ui.label(
                             RichText::new(format!(
                                 "{}  ·  {}",
-                                portal_map.normalize_dungeon_name(&enc.dungeon),
+                                dungeon_display_name(
+                                    portal_map,
+                                    &enc.dungeon,
+                                    RunModes {
+                                        leisurely: enc.leisurely,
+                                        petless: enc.petless,
+                                        hard_mode: enc.shatters_hm || enc.spectral_hm,
+                                    },
+                                ),
                                 datetime_s,
                             ))
                             .color(Color32::GRAY),
@@ -3374,6 +3628,62 @@ impl CombatHistoryPanel {
                             "Wall-clock time from entering the dungeon to the final \
                          boss death, including minion clear and travel between bosses.",
                         );
+                        // Moonlight Village spirits: each spirit released at the
+                        // end of a dance (or Umi) phase is one object, and the
+                        // run total sets the dungeon's loot tier. Shown per side
+                        // because the dancers and Umi have separate thresholds.
+                        let dancer_spirits: i32 = enc
+                            .phases
+                            .iter()
+                            // Sage Genji / Dancer Miko / Drummer Kaguya.
+                            .filter(|p| matches!(p.boss_object_type, 20450..=20452))
+                            .map(|p| p.spirits)
+                            .sum();
+                        let umi_spirits: i32 = enc
+                            .phases
+                            .iter()
+                            .filter(|p| p.boss_object_type == 20493)
+                            .map(|p| p.spirits)
+                            .sum();
+                        for (label, count, umi, tip) in [
+                            (
+                                "Total spirits collected (Dancers): ",
+                                dancer_spirits,
+                                false,
+                                "Moonlight Village spirits collected from Sage Genji, \
+                                 Dancer Miko and Drummer Kaguya. This total sets the \
+                                 dancers' loot tier (Tier 4 from 78, Tier 3 from 58, \
+                                 Tier 2 from 40) and the odds of the Kitsune Umi \
+                                 encounter. A Leisurely Mode dance is scored on Umi's \
+                                 lower thresholds instead.",
+                            ),
+                            (
+                                "Total spirits collected (Umi): ",
+                                umi_spirits,
+                                true,
+                                "Moonlight Village spirits collected during the \
+                                 Kitsune Umi phases, scored on their own, lower tier \
+                                 thresholds (Tier 4 from 48, Tier 3 from 36, Tier 2 \
+                                 from 24).",
+                            ),
+                        ] {
+                            if count <= 0 {
+                                continue;
+                            }
+                            // Tier the total earned: 4 is the best, and a Leisurely
+                            // Mode dance shares Umi's thresholds.
+                            let text = spirit_total_label(label, count, enc.leisurely, umi);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(16.0, 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                draw_spirit_sprite(ctx.sprite_renderer, ui, umi, rect);
+                                ui.label(RichText::new(text).color(Color32::GRAY))
+                                    .hover_tip(tip);
+                            });
+                        }
                         let enc_close_calls = enc.total_close_calls();
                         if enc_close_calls > 0 {
                             let cc_char_id = enc
@@ -3479,23 +3789,31 @@ impl CombatHistoryPanel {
                     } else {
                         ("Escaped", Color32::GRAY)
                     };
-                    let header = format!(
-                        "{arrow}  {name}   HP {start}/{max}   {dur}",
-                        name = match phase.aux_member_count {
-                            Some(count) if count > 0 => format!("{} x{count}", phase.boss_name),
-                            _ => phase.boss_name.clone(),
-                        },
-                        start = phase.boss_start_hp,
-                        max = phase.boss_max_hp,
-                        dur = fmt_duration(phase.duration_ms()),
+                    let phase_name = match phase.aux_member_count {
+                        Some(count) if count > 0 => format!("{} x{count}", phase.boss_name),
+                        _ => phase.boss_name.clone(),
+                    };
+                    // An uncapped boss (Moonlight Village mechanics bosses) has no
+                    // finite HP, so its row shows the party's total damage instead
+                    // of an HP fraction. Its spirit tally is split out so the
+                    // spirit sprite can precede the count.
+                    let (phase_stats, phase_spirits) = boss_row_stats_parts(
+                        phase.boss_object_type,
+                        phase.boss_start_hp,
+                        phase.boss_max_hp,
+                        phase.total_damage(),
+                        phase.spirits,
                     );
+                    let header = format!("{arrow}  {phase_name}   {phase_stats}");
                     ui.horizontal(|ui| {
                         if phase.boss_object_type != 0 {
                             let (rect, _) = ui
                                 .allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                            ctx.sprite_renderer.draw_outlined_sprite_in_rect(
+                            draw_boss_sprite(
+                                ctx.sprite_renderer,
                                 ui,
                                 phase.boss_object_type,
+                                phase.shatters_hm,
                                 rect,
                             );
                         }
@@ -3506,10 +3824,26 @@ impl CombatHistoryPanel {
                                 self.expanded_phases.insert(phase.id);
                             }
                         }
+                        if let Some(spirits) = phase_spirits {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            draw_spirit_sprite(
+                                ctx.sprite_renderer,
+                                ui,
+                                phase.boss_object_type == MV_UMI_TYPE,
+                                rect,
+                            );
+                            ui.label(format!("Spirits {spirits}"));
+                        }
+                        ui.label(fmt_duration(phase.duration_ms()));
                         ui.label(RichText::new(state).color(scolor).small());
-                        if Some(phase.id) == anchor_id
+                        // Kitsune Umi is an optional boss: a card she is the only
+                        // boss of still headlines on her, but she is never the
+                        // run's "Main".
+                        let show_main = Some(phase.id) == anchor_id
                             && !am.is_treasure_crate(phase.boss_object_type)
-                        {
+                            && phase.boss_object_type != MV_UMI_TYPE;
+                        if show_main {
                             ui.label(
                                 RichText::new("Main")
                                     .color(Color32::from_rgb(0xff, 0xc1, 0x00))
@@ -3526,7 +3860,7 @@ impl CombatHistoryPanel {
                             ctx,
                             &phase.participants,
                             &format!("phase_table_{}", phase.id),
-                            phase.boss_start_hp as i64,
+                            share_hp_pool(phase.boss_object_type, phase.boss_start_hp),
                             phase.killed,
                             !enc.killed,
                             phase.boss_object_type == O3_BOSS_TYPE,
@@ -3623,7 +3957,159 @@ fn assign_drops_exclusive(
 
 #[cfg(test)]
 mod tests {
-    use super::assign_drops_exclusive;
+    use super::{
+        assign_drops_exclusive, boss_bar_label, boss_row_hp_label, boss_row_stats_parts,
+        dungeon_display_name, share_hp_pool, spirit_total_label, RunModes,
+    };
+    use realmhound_core::assets::get_dungeon_portal_map;
+
+    #[test]
+    fn mv_boss_rows_split_out_the_spirit_tally() {
+        // A dancer that collected spirits splits the tally out, so the spirit
+        // sprite can be drawn directly before the count.
+        assert_eq!(
+            boss_row_stats_parts(20450, 360_000, 360_000, 328_071, 24),
+            ("Damage 328,071  ·  ".to_string(), Some(24))
+        );
+        // No spirits: the row keeps the plain damage text.
+        assert_eq!(
+            boss_row_stats_parts(20451, 360_000, 360_000, 1_000, 0),
+            ("Damage 1,000".to_string(), None)
+        );
+        // Umi is an MV boss too, so her row splits the same way.
+        assert_eq!(
+            boss_row_stats_parts(20493, 360_000, 360_000, 893_980, 50),
+            ("Damage 893,980  ·  ".to_string(), Some(50))
+        );
+        // Ordinary bosses keep their HP label and never split.
+        assert_eq!(
+            boss_row_stats_parts(45073, 50, 100, 0, 0),
+            ("HP 50/100".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn spirit_totals_show_the_loot_tier_they_earned() {
+        let dancers = "Total spirits collected (Dancers): ";
+        let umi = "Total spirits collected (Umi): ";
+        assert_eq!(
+            spirit_total_label(dancers, 88, false, false),
+            "Total spirits collected (Dancers): 88 (Tier:4)"
+        );
+        assert_eq!(
+            spirit_total_label(dancers, 45, false, false),
+            "Total spirits collected (Dancers): 45 (Tier:2)"
+        );
+        // Umi is scored on her own, lower thresholds.
+        assert_eq!(
+            spirit_total_label(umi, 50, false, true),
+            "Total spirits collected (Umi): 50 (Tier:4)"
+        );
+        // A Leisurely Mode dance shares Umi's thresholds.
+        assert_eq!(
+            spirit_total_label(dancers, 50, true, false),
+            "Total spirits collected (Dancers): 50 (Tier:4)"
+        );
+        assert_eq!(
+            spirit_total_label(dancers, 50, false, false),
+            "Total spirits collected (Dancers): 50 (Tier:2)"
+        );
+        // An empty tally names no tier (the line is hidden anyway).
+        assert_eq!(
+            spirit_total_label(dancers, 0, false, false),
+            "Total spirits collected (Dancers): 0"
+        );
+    }
+
+    #[test]
+    fn run_modes_are_appended_to_the_dungeon_name() {
+        let portal_map = get_dungeon_portal_map();
+        let modes = |leisurely: bool, petless: bool, hard_mode: bool| RunModes {
+            leisurely,
+            petless,
+            hard_mode,
+        };
+        // Moonlight Village's modes, in the order the card lists them.
+        assert_eq!(
+            dungeon_display_name(portal_map, "Moonlight Village", modes(true, false, false)),
+            "Moonlight Village (Leisure)"
+        );
+        assert_eq!(
+            dungeon_display_name(portal_map, "Moonlight Village", modes(true, true, false)),
+            "Moonlight Village (Leisure, Petless)"
+        );
+        assert_eq!(
+            dungeon_display_name(portal_map, "Moonlight Village", modes(false, true, false)),
+            "Moonlight Village (Petless)"
+        );
+        assert_eq!(
+            dungeon_display_name(portal_map, "Moonlight Village", modes(false, false, false)),
+            "Moonlight Village"
+        );
+        // Every other dungeon ignores the Moonlight Village modes (they are never
+        // set for them), and hard mode appends on its own. Spectral
+        // Penitentiary's hard mode is the same tag as the Shatters'.
+        for dungeon in ["The Shatters", "Spectral Penitentiary"] {
+            assert_eq!(
+                dungeon_display_name(portal_map, dungeon, modes(false, false, false)),
+                dungeon
+            );
+            assert_eq!(
+                dungeon_display_name(portal_map, dungeon, modes(false, false, true)),
+                format!("{dungeon} (HM)")
+            );
+        }
+        // The run-level modes are independent and can combine.
+        assert_eq!(
+            dungeon_display_name(portal_map, "The Shatters", modes(true, true, true)),
+            "The Shatters (Leisure, Petless, HM)"
+        );
+    }
+
+    #[test]
+    fn mv_bosses_share_against_tracked_total() {
+        // Moonlight Village mechanics bosses have no real HP pool: the share
+        // denominator is 0 so the table uses the tracked total, not the boss HP.
+        for boss in [20450, 20451, 20452, 20493] {
+            assert_eq!(share_hp_pool(boss, 720_000), 0);
+        }
+        // Ordinary bosses keep reconciling against their starting HP.
+        assert_eq!(share_hp_pool(0x10E4, 12_000), 12_000);
+    }
+
+    #[test]
+    fn mv_boss_bar_reads_damage_over_infinity() {
+        // The top bar labels an uncapped boss by the party's damage against an
+        // unlimited pool, and stays a full bar.
+        assert_eq!(
+            boss_bar_label(20450, 720_000, 720_000, 515_998).as_deref(),
+            Some("515,998 / ∞")
+        );
+        // Ordinary bosses keep the start/max HP label; no HP -> no label.
+        assert_eq!(
+            boss_bar_label(0x10E4, 8_000, 12_000, 12_000).as_deref(),
+            Some("8,000 / 12,000")
+        );
+        assert_eq!(boss_bar_label(0x10E4, 0, 0, 0), None);
+    }
+
+    #[test]
+    fn mv_boss_row_shows_damage_and_spirits() {
+        // The row header drops the HP fraction for an uncapped boss and prints
+        // the summed damage once, plus collected spirits when any were released.
+        assert_eq!(
+            boss_row_hp_label(20452, 720_000, 720_000, 511_088, 0),
+            "Damage 511,088"
+        );
+        assert_eq!(
+            boss_row_hp_label(20452, 720_000, 720_000, 511_088, 8),
+            "Damage 511,088  ·  Spirits 8"
+        );
+        assert_eq!(
+            boss_row_hp_label(0x10E4, 8_000, 12_000, 12_000, 0),
+            "HP 8000/12000"
+        );
+    }
 
     #[test]
     fn bag_after_third_kill_links_only_to_that_fight() {

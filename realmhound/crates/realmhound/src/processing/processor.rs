@@ -1347,6 +1347,18 @@ impl PacketProcessor {
                             }
                         }
 
+                        // Moonlight Village's Leisurely Mode is announced with a
+                        // server notification when the group consumes a Tofu
+                        // Delicacy; the run's card is labelled with it. Notifications
+                        // are not routed into GameEvents, so feed it straight in.
+                        if let ParsedPacket::Notification(notification) = parsed {
+                            if realmhound_core::assets::is_mv_leisurely_mode_notification(
+                                &notification.message,
+                            ) {
+                                self.combat.on_mv_leisurely_mode();
+                            }
+                        }
+
                         // Route through PacketRouter (all packet types)
                         match self.router.route(parsed, &mut self.session) {
                             RouteResult::Routed(events) => {
@@ -2194,10 +2206,16 @@ impl PacketProcessor {
                 }
 
                 // Boss taunts drive the Marble Colossus survival-phase split off
-                // its authoritative second-coming taunt (the object id ties the
-                // taunt to the boss's fight, so no fuzzy matching is needed).
-                self.combat
-                    .on_boss_text(text.object_id, &text.text, now_ms());
+                // its authoritative second-coming taunt, Moonlight Village's
+                // completion and Spectral Penitentiary's hard mode off its
+                // mini-bosses' objective-cleared lines (the object id ties the
+                // taunt to the boss's fight where needed).
+                self.combat.on_boss_text(
+                    text.object_id,
+                    Some(text.name.as_str()),
+                    &text.text,
+                    now_ms(),
+                );
 
                 // Keyper seasonal event: the realm-wide "#The Keyper" taunts are
                 // the authoritative spawn/tower cues. Suppress join-time replays
@@ -2232,8 +2250,11 @@ impl PacketProcessor {
                             });
                         }
                     } else {
-                        let me = self.session.connection.detected_account_name.as_deref();
+                        // Owned so the pings below do not hold a borrow of `self`
+                        // across the audio emits.
+                        let me = self.session.connection.detected_account_name.clone();
                         let is_self = me
+                            .as_deref()
                             .map(|m| chat_msg.sender.eq_ignore_ascii_case(m))
                             .unwrap_or(false);
                         if chat_msg.chat_type == ChatType::Whisper && is_self {
@@ -2257,6 +2278,49 @@ impl PacketProcessor {
                                     .unwrap_or(false);
                                 if enabled {
                                     self.emit(UiPayload::Audio(AudioCommand::Play(sound)));
+                                }
+                            }
+
+                            // Opt-in extras: ping when the body of a player chat
+                            // message mentions our character name, or when it
+                            // contains the trigger word the user configured. Only
+                            // the body is searched, so authoring the message or
+                            // being the whisper recipient never triggers them by
+                            // itself. Server announcements and boss calls are not
+                            // chat traffic and never ping.
+                            if matches!(
+                                chat_msg.chat_type,
+                                ChatType::Normal
+                                    | ChatType::Party
+                                    | ChatType::Guild
+                                    | ChatType::Whisper
+                            ) {
+                                let (mention_ping, custom_ping) = self
+                                    .settings
+                                    .read()
+                                    .map(|s| {
+                                        let pings = realmhound_core::chat_ping::pings_for(
+                                            &chat_msg.text,
+                                            me.as_deref(),
+                                            s.sound.custom_chat_text.as_str(),
+                                        );
+                                        (
+                                            pings.ign_mention
+                                                && SoundType::IgnMention.is_enabled(&s.sound),
+                                            pings.custom_chat
+                                                && SoundType::CustomChat.is_enabled(&s.sound),
+                                        )
+                                    })
+                                    .unwrap_or((false, false));
+                                if mention_ping {
+                                    self.emit(UiPayload::Audio(AudioCommand::Play(
+                                        SoundType::IgnMention,
+                                    )));
+                                }
+                                if custom_ping {
+                                    self.emit(UiPayload::Audio(AudioCommand::Play(
+                                        SoundType::CustomChat,
+                                    )));
                                 }
                             }
                         }
@@ -2747,9 +2811,10 @@ impl PacketProcessor {
                 for drop in &new_drops {
                     // A core-boss bag latches its realm-event card to Completed
                     // even when the core (e.g. Towering Perfection) was never seen
-                    // dying and only its segments were damaged.
+                    // dying and only its segments were damaged; a Moonlight
+                    // Village bag is what clears the (invulnerable) dancers/Umi.
                     self.combat
-                        .on_boss_loot(drop.mob_type, drop.player.map_seed);
+                        .on_boss_loot(drop.mob_type, drop.player.map_seed, time_ms as i64);
                     self.emit(UiPayload::PushLoot(drop.clone()));
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
                     if let Some((ref settings, ref catalog)) = enchant_ctx {

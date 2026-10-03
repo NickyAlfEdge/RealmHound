@@ -50,9 +50,9 @@ mod stat_bonus;
 pub mod unity;
 
 pub use boss_group::{
-    boss_exempt_from_flawless, boss_group, dungeon_for_mark_name, encounter_spawn_limited,
-    normalize_train_sprite, BossGroup, CatalogEntry, KOGBOLD_TRAIN_DISPLAY_NAME,
-    KOGBOLD_TRAIN_LOCOMOTIVE_SPRITE, SEASONAL_NOTIFY_EXCLUDED_IDS,
+    boss_earns_secret_stats, boss_exempt_from_flawless, boss_group, dungeon_for_mark_name,
+    encounter_spawn_limited, normalize_train_sprite, BossGroup, CatalogEntry,
+    KOGBOLD_TRAIN_DISPLAY_NAME, KOGBOLD_TRAIN_LOCOMOTIVE_SPRITE, SEASONAL_NOTIFY_EXCLUDED_IDS,
 };
 pub use dungeon_category::{build_categories, DungeonCategory};
 pub use dungeon_data::dungeon_difficulty;
@@ -78,11 +78,20 @@ pub use manager::{
     encounter_ids_matching_name, encounter_loot_completes, encounter_realm_grouped,
     encounter_supports_loot_completion, find_assets_dir, get_asset_manager,
     get_resources_assets_stamp, is_dedup_prone_boss, is_invuln_finish_boss,
-    is_legacy_lod_ivory_boss, is_optional_secondary_boss_type, is_post_boss_bonus_type,
-    is_second_coming_boss, is_second_coming_transition_taunt, is_treasure_crate_type,
-    lod_dragon_chest_pairs, loot_emitter_for_boss, parse_grave_tier, prismimic_display_name,
-    AssetManager, AssetStats, AuxTarget, CharacterDyeInfo, DyeInfo, DyeStyle, Encounter, GraveTier,
-    ASSET_MANAGER, LEGACY_LOD_IVORY_BOSS,
+    is_legacy_lod_ivory_boss, is_mv_boss, is_mv_dance_concluded_text,
+    is_mv_leisurely_mode_notification, is_mv_spirit, is_optional_secondary_boss_type,
+    is_post_boss_bonus_type, is_second_coming_boss, is_second_coming_transition_taunt,
+    is_shatters_main_boss, is_spectral_murcian, is_treasure_crate_type, lod_dragon_chest_pairs,
+    loot_emitter_for_boss, mv_loot_completion_targets, mv_spirit_tier, object_name_override,
+    parse_grave_tier, prismimic_display_name, shatters_boss_name, shatters_hm_boss_name,
+    shatters_hm_boss_sprite, shatters_hm_named_boss, spectral_hm_taunt_boss,
+    spectral_hm_taunt_boss_of_type, AssetManager, AssetStats, AuxTarget, CharacterDyeInfo, DyeInfo,
+    DyeStyle, Encounter, GraveTier, ASSET_MANAGER, LEGACY_LOD_IVORY_BOSS, MV_CHALLENGE_GATE_TYPE,
+    MV_DANCER_TYPES, MV_SPIRIT_TYPE, MV_UMI_SPIRIT_TYPE, MV_UMI_TYPE,
+    SHATTERS_BRIDGE_SENTINEL_TYPE, SHATTERS_KING_TYPE, SHATTERS_QUEEN_TYPE,
+    SHATTERS_STONE_IDOL_TYPE, SHATTERS_TEMPEST_TYPE, SHATTERS_THE_SOURCE_TYPE,
+    SHATTERS_TWILIGHT_ARCHMAGE_TYPE, SPECTRAL_HM_BOSS_TYPES, SPECTRAL_HM_TAUNTS,
+    SPECTRAL_MURCIAN_TYPE,
 };
 pub use object_list::{
     AbilityEffect, AbilityEffects, BleedingEffect, ConditionSelfEffect, DamageNovaEffect,

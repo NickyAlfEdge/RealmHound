@@ -347,11 +347,11 @@ impl KeyPopEntry {
         }
     }
 
-    /// The "Thanks <opener> for the key" clipboard callout, or `None` when the
+    /// The "Thanks <opener> for the key!" clipboard callout, or `None` when the
     /// local player opened the key.
     pub fn callout(&self) -> Option<String> {
         self.thankable
-            .then(|| format!("Thanks {} for the key", self.opener))
+            .then(|| format!("Thanks {} for the key!", self.opener))
     }
 }
 
@@ -537,11 +537,8 @@ pub struct DungeonEntry {
     pub dungeon_name: String,
     /// Portal object id for sprite rendering (None if unknown)
     pub portal_id: Option<i32>,
-    /// Modifier display names (e.g. "Weak Boss III"); falls back to a prettified
-    /// token for unknown modifiers. Retained for display and dedup signature.
-    pub modifiers: Vec<String>,
     /// Per-modifier display chips (name + type + danger color) for the Live Feed
-    /// second line. Parallel to [`modifiers`].
+    /// second line, in callout order.
     pub mods: Vec<ModChip>,
     /// Outline / background fill category for the whole callout.
     pub outline: OutlineKind,
@@ -567,6 +564,15 @@ pub struct DungeonEntry {
     pub server_name: Option<String>,
     /// Realm name at time of dungeon entry (for callout assembly).
     pub realm_name: Option<String>,
+    /// Realm completion (percent) of the realm this dungeon was entered from,
+    /// when it was entered through a realm portal and the realm is still the one
+    /// we are tracking. Drives the optional realm-status callout suffix.
+    pub realm_score_percent: Option<i32>,
+    /// True when this dungeon was entered from a hub space counted as the Nexus
+    /// (its portal was used there -- key or spawn we saw -- or the party call out
+    /// of one), or later found hosted on the hub server. Drives the optional
+    /// `Opened in Nexus` suffix, in both cases on recomputation.
+    pub entered_from_nexus: bool,
     /// True when the join window is estimated rather than anchored to an observed
     /// portal spawn (e.g. joined via a party call). Estimated entries use a
     /// shorter window and mark the countdown with a `?`.
@@ -590,6 +596,69 @@ const DUNGEON_WINDOW_ESTIMATED: std::time::Duration = std::time::Duration::from_
 /// Time from a realm-close message to the castle teleport.
 const CASTLE_TELEPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long after entering a dungeon the connection to its instance still counts
+/// as that instance's host. The host is identified from the new socket a beat
+/// after the dungeon's MapInfo arrives, so the hint is always slightly late.
+const NEXUS_ORIGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many recent entries of one dungeon the panel remembers, and therefore the
+/// widest window `learn_event_mods_runs` can compare. An event that started
+/// mid-session is recognized a few runs in, so a handful of spawns is enough.
+const MAX_LEARN_EVENT_MOD_SETS: usize = 10;
+
+/// Whether two modifier tokens name the same mod (wire ids vary by separators).
+fn same_modifier(a: &str, b: &str) -> bool {
+    realmhound_core::dungeon_modifiers::canonical(a)
+        == realmhound_core::dungeon_modifiers::canonical(b)
+}
+
+/// Whether a MapInfo map name is a hub space whose portals are Nexus portals:
+/// the Nexus itself plus the Vault, Guild Hall and Bazaar.
+///
+/// The game counts all of these as the Nexus -- `/server` answers `Nexus` from
+/// inside them and a dungeon entered from one returns the player to the Nexus --
+/// so a portal used in any of them is a Nexus portal. Names arrive as
+/// localization tokens (`{s.nexus}`, `{s.vault}`, `{s.guildhall}`) or resolved
+/// (`Nexus`, `Guild Hall`), so the match is on the raw name either way.
+///
+/// Realm entries reached from a hub are not hub maps: they report their own
+/// names (Meridian, Hearth, ...) plus a realm score, so a realm portal used in
+/// the Nexus never produces a Nexus marker.
+fn is_hub_map(display_name: &str) -> bool {
+    const HUB_MARKERS: &[&str] = &["nexus", "vault", "guildhall", "guild hall", "bazaar"];
+    let name = display_name.trim().to_ascii_lowercase();
+    HUB_MARKERS.iter().any(|hub| name.contains(hub))
+}
+
+/// Whether a dungeon's `MapInfo` realm field names a hub space rather than a
+/// realm, i.e. the dungeon was opened in a hub (the Nexus, or the Vault, Guild
+/// Hall and Bazaar, which all count as the Nexus).
+///
+/// The field names the area a dungeon was opened in: hubs report the plain Nexus
+/// (`Nexus`, or `{s.nexus}` in the raw form), while a realm entry reports
+/// `NexusPortal.<Realm>` and a dungeon opened in a realm reports that same realm
+/// name. So a hub parent is the plain Nexus, never the `NexusPortal.` prefix that
+/// marks a realm (see [`parse_realm_name_for_realm`]).
+fn realm_field_is_hub(realm_name_field: &str) -> bool {
+    let name = realm_name_field
+        .trim()
+        .trim_start_matches("{s.")
+        .trim_end_matches('}')
+        .trim()
+        .to_ascii_lowercase();
+    name.is_empty()
+        || matches!(
+            name.as_str(),
+            "nexus"
+                | "nexusportal"
+                | "nexusportal."
+                | "vault"
+                | "guildhall"
+                | "guild hall"
+                | "bazaar"
+        )
+}
+
 impl DungeonEntry {
     /// Create a new dungeon entry from a display name and decoded modifier tokens.
     ///
@@ -603,6 +672,7 @@ impl DungeonEntry {
         params: &crate::panels::dungeon_callout::DungeonCalloutParams<'_>,
         server_name: Option<String>,
         realm_name: Option<String>,
+        realm_score_percent: Option<i32>,
         anchor: std::time::Instant,
         estimated: bool,
     ) -> Self {
@@ -656,7 +726,6 @@ impl DungeonEntry {
             expires_at,
             dungeon_name,
             portal_id,
-            modifiers,
             mods,
             outline,
             grade,
@@ -668,6 +737,8 @@ impl DungeonEntry {
             modifier_tokens: modifier_tokens.to_vec(),
             server_name,
             realm_name,
+            realm_score_percent,
+            entered_from_nexus: false,
             estimated,
             map_seed: 0,
             entered_at: std::time::Instant::now(),
@@ -773,6 +844,17 @@ pub struct ActiveEncounter {
     pub added_at: std::time::Instant,
 }
 
+/// A clipboard write the Live Feed panel asks the app to perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardWrite {
+    /// Put this callout on the clipboard.
+    Copy(String),
+    /// Empty the clipboard, but only while it still holds exactly this callout.
+    /// The user may have copied something else in the meantime, and that content
+    /// is theirs to keep.
+    ClearIfUnchanged(String),
+}
+
 /// Live feed panel state and UI.
 pub struct LiveFeedPanel {
     /// Feed entries (newest at front)
@@ -807,6 +889,48 @@ pub struct LiveFeedPanel {
     is_score_stale: bool,
     /// True when the player is inside a dungeon (from MapChanged.is_dungeon).
     currently_in_dungeon: bool,
+    /// Whether the map this dungeon entry replaced was itself a dungeon (set
+    /// alongside [`Self::currently_in_dungeon`]). A dungeon keyed open inside
+    /// another instance runs on that instance's host, which for a hub-opened
+    /// parent is the hub: the host hint alone would then call the child a Nexus
+    /// entry, so it only counts for entries that came from outside a dungeon.
+    left_from_dungeon: bool,
+    /// Whether the map the player is standing on is a realm (MapInfo reported a
+    /// realm score). Set by [`Self::update_location`].
+    map_is_realm: bool,
+    /// Whether the map this location update replaced was a realm. A dungeon call
+    /// only names the realm score when its portal was opened in a realm, so a
+    /// dungeon keyed open in the Nexus, inside another dungeon or in the Oryx
+    /// areas (Castle / Chamber / Wine Cellar / Sanctuary) inherits nothing even
+    /// though the realm score stays remembered there. Captured by
+    /// [`Self::update_location`] and read by [`Self::push_dungeon`].
+    left_from_realm: bool,
+    /// Whether the map the player is standing on is a hub space (the Nexus, the
+    /// Vault, the Guild Hall, the Bazaar -- see [`is_hub_map`]). A dungeon opened
+    /// there (a portal or a key) is what [`Self::opened_in_nexus`] names; realm
+    /// entries reached from a hub keep their own map names (Meridian, Hearth,
+    /// ...) and are never Nexus entries. Set by [`Self::update_location`].
+    map_is_hub: bool,
+    /// Whether the map this location update replaced was a hub space. Only an
+    /// immediately preceding hub counts, so a dungeon entered from a realm (or
+    /// from another dungeon) is never labelled `in nex`. Captured by
+    /// [`Self::update_location`] and read by [`Self::push_dungeon`].
+    left_from_hub: bool,
+    /// When the hub host was last named (see [`Self::set_server_name`]), for as
+    /// long as it has not been claimed by a dungeon entry. The client connects to
+    /// an instance's host *before* that instance's MapInfo arrives, so a
+    /// party-call join names the host first: the hint has to be kept until the
+    /// entry it belongs to shows up (see [`Self::push_dungeon`]) rather than only
+    /// read when the entry already exists.
+    hub_host_hint: Option<std::time::Instant>,
+    /// Whether the map the player just entered is a dungeon that names no realm
+    /// of its own, entered from a realm. A dungeon's MapInfo carries the area it
+    /// was opened in ("NexusPortal.<Realm>" from a realm portal), so a dungeon
+    /// that names none while we were in a realm is not part of that realm: it
+    /// runs under the Nexus, which is what a party call into someone else's
+    /// Nexus-popped key looks like. Set by [`Self::update_location`], read (and
+    /// spent) by [`Self::push_dungeon`].
+    nexus_parent_dungeon: bool,
     /// Countdown expiry to the castle teleport after a realm close.
     /// `None` when no realm-close countdown is active. Cleared on a fresh realm
     /// entry, hub entry, or disconnect; kept running while diving into a
@@ -865,9 +989,57 @@ pub struct LiveFeedPanel {
     dust_label: realmhound_core::settings::DustLabel,
     /// How the XP-boost tag is rendered. Mirrors `Settings.live_feed.xp_label`.
     xp_label: realmhound_core::settings::XpLabel,
+    /// Minimum loot bonus (%) for the loot tag. Mirrors
+    /// `Settings.live_feed.loot_threshold`.
+    loot_threshold: i32,
+    /// Minimum dust bonus (%) for the dust tag. Mirrors
+    /// `Settings.live_feed.dust_threshold`.
+    dust_threshold: i32,
+    /// Minimum XP bonus (%) for the XP tag. Mirrors
+    /// `Settings.live_feed.xp_threshold`.
+    xp_threshold: i32,
+    /// Whether to call mods the game applies to an instance itself during a
+    /// special event. Mirrors `Settings.live_feed.call_event_mods`.
+    call_event_mods: bool,
+    /// Whether to recognize event mods from the dungeons the user enters.
+    /// Mirrors `Settings.live_feed.learn_event_mods`.
+    learn_event_mods: bool,
+    /// How many consecutive spawns of one dungeon must carry a mod before it is
+    /// recognized as an event mod. Mirrors
+    /// `Settings.live_feed.learn_event_mods_runs`.
+    learn_event_mods_runs: u32,
+    /// Modifier sets of this session's dungeon entries, keyed by the dungeon's
+    /// display name, newest last (capped). Used to recognize the mods the game
+    /// applies to every instance of a dungeon during an event, which the game
+    /// files cannot mark (see `EVENT_PRESET_MODS`).
+    dungeon_mod_sets: HashMap<String, Vec<Vec<String>>>,
+    /// How the realm a dungeon was entered from is named. Mirrors
+    /// `Settings.live_feed.realm_status`.
+    realm_status: realmhound_core::settings::RealmStatusMode,
+    /// Minimum realm score (%) for the `in <n>% realm` tag. Mirrors
+    /// `Settings.live_feed.realm_status_threshold`.
+    realm_status_threshold: i32,
+    /// The Nexus marker a dungeon opened in a hub space gets appended (`nex` or
+    /// `in nexus`; nothing when unset). Mirrors
+    /// `Settings.live_feed.nexus_marker`.
+    nexus_marker: realmhound_core::settings::NexusMarker,
     /// Whether callout reward values include a `%` sign.
     /// Mirrors `Settings.live_feed.callout_percent`.
     callout_percent: bool,
+    /// Whether entering a joinable dungeon copies its callout to the clipboard
+    /// by itself. Mirrors `Settings.live_feed.auto_clipboard_dungeon_calls`.
+    auto_clipboard_calls: bool,
+    /// `map_seed` of the dungeon whose callout this panel put on the clipboard
+    /// automatically and has not released yet.
+    auto_clipboard_seed: Option<i32>,
+    /// Exact text this panel put on the clipboard for `auto_clipboard_seed`, so
+    /// the automatic release can tell our callout from anything the user copied
+    /// afterwards.
+    auto_clipboard_text: Option<String>,
+    /// Clipboard write the app still has to perform for this panel. The panel
+    /// is only rendered while its tab is open, so it hands the write to the
+    /// app, which has the egui context every frame.
+    pending_clipboard: Option<ClipboardWrite>,
     /// Editable reward-modifier callout tags. Mirrors `Settings.live_feed.reward_mods`.
     reward_mods: Vec<realmhound_core::settings::RewardModEntry>,
     /// Dungeon short-name overrides. Mirrors `Settings.live_feed.dungeon_name_overrides`.
@@ -987,6 +1159,13 @@ impl LiveFeedPanel {
             realm_score: None,
             is_score_stale: false,
             currently_in_dungeon: false,
+            left_from_dungeon: false,
+            map_is_realm: false,
+            left_from_realm: false,
+            map_is_hub: false,
+            left_from_hub: false,
+            hub_host_hint: None,
+            nexus_parent_dungeon: false,
             castle_timer_expires_at: None,
             realm_closed: false,
             // Dust status bar state
@@ -1006,7 +1185,21 @@ impl LiveFeedPanel {
             loot_label: realmhound_core::settings::LootLabel::default(),
             dust_label: realmhound_core::settings::DustLabel::default(),
             xp_label: realmhound_core::settings::XpLabel::default(),
+            loot_threshold: 5,
+            dust_threshold: 10,
+            xp_threshold: 10,
+            call_event_mods: true,
+            learn_event_mods: true,
+            learn_event_mods_runs: realmhound_core::settings::LEARN_EVENT_MOD_RUNS_DEFAULT,
+            dungeon_mod_sets: HashMap::new(),
+            realm_status: realmhound_core::settings::RealmStatusMode::default(),
+            realm_status_threshold: 33,
+            nexus_marker: realmhound_core::settings::NexusMarker::None,
             callout_percent: false,
+            auto_clipboard_calls: false,
+            auto_clipboard_seed: None,
+            auto_clipboard_text: None,
+            pending_clipboard: None,
             reward_mods: realmhound_core::settings::default_reward_mods(),
             dungeon_name_overrides: std::collections::BTreeMap::new(),
             event_name_overrides: std::collections::BTreeMap::new(),
@@ -1055,6 +1248,15 @@ impl LiveFeedPanel {
             || self.loot_label != settings.loot_label
             || self.dust_label != settings.dust_label
             || self.xp_label != settings.xp_label
+            || self.loot_threshold != settings.loot_threshold
+            || self.dust_threshold != settings.dust_threshold
+            || self.xp_threshold != settings.xp_threshold
+            || self.call_event_mods != settings.call_event_mods
+            || self.learn_event_mods != settings.learn_event_mods
+            || self.learn_event_mods_runs != settings.learn_event_mods_runs
+            || self.realm_status != settings.realm_status
+            || self.realm_status_threshold != settings.realm_status_threshold
+            || self.nexus_marker != settings.nexus_marker
             || self.callout_percent != settings.callout_percent
             || self.reward_mods != settings.reward_mods
             || self.dungeon_name_overrides != settings.dungeon_name_overrides;
@@ -1070,7 +1272,24 @@ impl LiveFeedPanel {
         self.loot_label = settings.loot_label;
         self.dust_label = settings.dust_label;
         self.xp_label = settings.xp_label;
+        self.loot_threshold = settings.loot_threshold;
+        self.dust_threshold = settings.dust_threshold;
+        self.xp_threshold = settings.xp_threshold;
+        self.call_event_mods = settings.call_event_mods;
+        self.learn_event_mods = settings.learn_event_mods;
+        self.learn_event_mods_runs = settings.learn_event_mods_runs.clamp(
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+        );
+        self.realm_status = settings.realm_status;
+        self.realm_status_threshold = settings.realm_status_threshold;
+        self.nexus_marker = settings.nexus_marker;
         self.callout_percent = settings.callout_percent;
+        self.auto_clipboard_calls = settings.auto_clipboard_dungeon_calls;
+        // Turning the feature off releases any callout it is holding.
+        if !self.auto_clipboard_calls {
+            self.release_auto_clipboard();
+        }
         self.reward_mods = settings.reward_mods.clone();
         self.dungeon_name_overrides = settings.dungeon_name_overrides.clone();
         self.event_name_overrides = settings.event_name_overrides.clone();
@@ -1111,17 +1330,106 @@ impl LiveFeedPanel {
             realmhound_core::season::battlepass_target(season, chrono::Utc::now());
     }
 
+    /// The realm-status suffix for a dungeon callout (`in a closing realm` or
+    /// `in 74% realm`), or `None` when the mode is off, the realm the dungeon was
+    /// entered from is unknown, or its score is below the configured threshold.
+    ///
+    /// `realm_score` must already be gated on the realm still being the one the
+    /// dungeon was entered from: naming a score from a realm the player has since
+    /// left would be wrong.
+    fn realm_status_suffix(&self, realm_score: Option<i32>) -> Option<String> {
+        crate::panels::dungeon_callout::realm_status_suffix(
+            self.realm_status,
+            self.realm_status_threshold,
+            realm_score,
+        )
+    }
+
+    /// Mods the session has seen in *every* one of the last
+    /// [`LiveFeedSettings::learn_event_mods_runs`] entries of `dungeon`, with at
+    /// least one of those entries carrying the mod as its only own: the signature
+    /// of a mod the game applies to the instance itself during an event instead
+    /// of rolling it.
+    ///
+    /// This complements the curated [`EVENT_PRESET_MODS`] table: the game files
+    /// cannot mark an event mod (they all ship as `ROLLABLE`), so a new event is
+    /// only recognizable from the traffic itself. Empty while the feature is off
+    /// and until enough entries of the dungeon have been seen, so a single
+    /// coincidence can't hide a real roll.
+    ///
+    /// [`LiveFeedSettings::learn_event_mods_runs`]: realmhound_core::settings::LiveFeedSettings::learn_event_mods_runs
+    /// [`EVENT_PRESET_MODS`]: realmhound_core::dungeon_modifiers::EVENT_PRESET_MODS
+    fn learned_event_mods(&self, dungeon: &str) -> Vec<String> {
+        if !self.learn_event_mods {
+            return Vec::new();
+        }
+        let runs = self.learn_event_mods_runs.clamp(
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+            *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+        ) as usize;
+        let Some(sets) = self.dungeon_mod_sets.get(dungeon) else {
+            return Vec::new();
+        };
+        if sets.len() < runs {
+            return Vec::new();
+        }
+        let recent = &sets[sets.len() - runs..];
+        let mut candidates = recent[0].clone();
+        candidates.retain(|modifier| {
+            recent[1..]
+                .iter()
+                .all(|set| set.iter().any(|t| same_modifier(t, modifier)))
+        });
+        // A mod that stood alone in at least one of those entries cannot be part
+        // of the rolled set (which fills the instance's grade), so it is one the
+        // game added. Requiring this keeps three identical *rolls* from
+        // suppressing a genuine call.
+        candidates.retain(|modifier| {
+            recent
+                .iter()
+                .any(|set| set.len() == 1 && same_modifier(&set[0], modifier))
+        });
+        candidates
+    }
+
+    /// Record a dungeon entry's modifier set for [`Self::learned_event_mods`].
+    fn remember_dungeon_mods(&mut self, dungeon: &str, modifier_tokens: &[String]) {
+        let sets = self
+            .dungeon_mod_sets
+            .entry(dungeon.to_string())
+            .or_default();
+        sets.push(modifier_tokens.to_vec());
+        if sets.len() > MAX_LEARN_EVENT_MOD_SETS {
+            let overflow = sets.len() - MAX_LEARN_EVENT_MOD_SETS;
+            sets.drain(0..overflow);
+        }
+    }
+
     /// Borrow the current dungeon-callout formatting parameters from the panel's
-    /// settings mirrors.
-    fn dungeon_callout_params(&self) -> crate::panels::dungeon_callout::DungeonCalloutParams<'_> {
+    /// settings mirrors. `origin_status` is the named origin to append (see
+    /// [`Self::realm_status_suffix`] and [`Self::push_dungeon`]: the realm score
+    /// of the realm the dungeon was entered from, or `in nex`), when any;
+    /// `learned_event_mods` are the mods this session has recognized as applied
+    /// by an event.
+    fn dungeon_callout_params<'a>(
+        &'a self,
+        origin_status: Option<&'a str>,
+        learned_event_mods: &'a [String],
+    ) -> crate::panels::dungeon_callout::DungeonCalloutParams<'a> {
         crate::panels::dungeon_callout::DungeonCalloutParams {
             name_style: self.dungeon_name_style,
             name_overrides: &self.dungeon_name_overrides,
             loot_label: self.loot_label,
             dust_label: self.dust_label,
             xp_label: self.xp_label,
+            loot_threshold: self.loot_threshold,
+            dust_threshold: self.dust_threshold,
+            xp_threshold: self.xp_threshold,
+            call_event_mods: self.call_event_mods,
             percent: self.callout_percent,
             reward_mods: &self.reward_mods,
+            learned_event_mods,
+            origin_status,
         }
     }
 
@@ -1129,17 +1437,62 @@ impl LiveFeedPanel {
     /// settings mirrors. Called when callout-affecting settings change so that
     /// existing feed entries reflect the new formatting.
     fn recompute_dungeon_callouts(&mut self) {
+        // Copy the settings mirrors out of `self` so the mutable pass over the
+        // entries doesn't conflict with the immutable borrows the parameters need.
+        let current_realm = self.realm_name.clone();
+        // Learned event mods per dungeon, resolved before that mutable pass.
+        let dungeons: Vec<String> = self.dungeon_mod_sets.keys().cloned().collect();
+        let learned_event_mods: HashMap<String, Vec<String>> = dungeons
+            .into_iter()
+            .map(|name| {
+                let mods = self.learned_event_mods(&name);
+                (name, mods)
+            })
+            .collect();
         let params = crate::panels::dungeon_callout::DungeonCalloutParams {
             name_style: self.dungeon_name_style,
             name_overrides: &self.dungeon_name_overrides,
             loot_label: self.loot_label,
             dust_label: self.dust_label,
             xp_label: self.xp_label,
+            loot_threshold: self.loot_threshold,
+            dust_threshold: self.dust_threshold,
+            xp_threshold: self.xp_threshold,
+            call_event_mods: self.call_event_mods,
             percent: self.callout_percent,
             reward_mods: &self.reward_mods,
+            learned_event_mods: &[],
+            origin_status: None,
         };
+        let realm_mode = self.realm_status;
+        let realm_threshold = self.realm_status_threshold;
+        let nexus_marker = self.nexus_marker;
         for entry in &mut self.entries {
             if let FeedEntry::Dungeon(d) = entry {
+                // The realm status is only named while the realm the dungeon was
+                // entered from is still the one we are in (or last saw): leaving
+                // it for another realm or the nexus drops the suffix.
+                let score = d
+                    .realm_score_percent
+                    .filter(|_| d.realm_name.is_some() && d.realm_name == current_realm);
+                let realm_status = crate::panels::dungeon_callout::realm_status_suffix(
+                    realm_mode,
+                    realm_threshold,
+                    score,
+                );
+                // A dungeon opened in the Nexus names that instead (the same slot:
+                // an entry originates in one place only).
+                let origin_status = match realm_status {
+                    Some(status) => Some(status),
+                    None if d.entered_from_nexus => nexus_marker.text().map(str::to_string),
+                    None => None,
+                };
+                let learned = learned_event_mods.get(&d.dungeon_name);
+                let params = crate::panels::dungeon_callout::DungeonCalloutParams {
+                    origin_status: origin_status.as_deref(),
+                    learned_event_mods: learned.map(Vec::as_slice).unwrap_or_default(),
+                    ..params
+                };
                 d.callout = crate::panels::dungeon_callout::dungeon_callout_for(
                     &d.dungeon_name,
                     &d.modifier_tokens,
@@ -1266,8 +1619,48 @@ impl LiveFeedPanel {
     /// Set the server name (from IP address lookup). Called when a new server
     /// connection to a known nexus IP is detected. Unmapped IPs (in-realm and
     /// dungeon backend hosts) are ignored so the last known name persists.
+    ///
+    /// A *named* host is always a region hub (the Nexus and the other hub
+    /// spaces); realm and dungeon backends are unmapped. Since a dungeon instance
+    /// runs on the host that ran the portal used to enter it, connecting to a
+    /// named host right after entering a dungeon means that instance is running
+    /// on the hub, i.e. its portal was popped in the Nexus. That is the only way
+    /// to name the origin when the entry never loaded a Nexus map at all -- a
+    /// party-call join from a realm teleports straight into the instance.
     pub fn set_server_name(&mut self, name: String) {
         self.server_name = Some(name);
+        // The hubs are the only hosts RH can name, so being named one right now
+        // means the client just connected to a hub: either the Nexus itself or a
+        // dungeon instance running on it. Remember it for the entry that is about
+        // to arrive (see [`Self::push_dungeon`]), and let the entry that already
+        // exists claim it here.
+        self.hub_host_hint = Some(std::time::Instant::now());
+        self.note_hub_hosted_dungeon();
+    }
+
+    /// Mark the dungeon just entered as opened in the Nexus, for the case where
+    /// its host turned out to be the hub (see [`Self::set_server_name`]).
+    fn note_hub_hosted_dungeon(&mut self) {
+        if !self.currently_in_dungeon || self.left_from_dungeon {
+            return;
+        }
+        let marked = match self.entries.front_mut() {
+            Some(FeedEntry::Dungeon(entry))
+                if !entry.entered_from_nexus
+                    && entry.entered_at.elapsed() < NEXUS_ORIGIN_WINDOW =>
+            {
+                entry.entered_from_nexus = true;
+                tracing::info!(
+                    "[LIVE_FEED] '{}' is hosted on a hub server: naming it as opened in the nexus",
+                    entry.dungeon_name
+                );
+                true
+            }
+            _ => false,
+        };
+        if marked {
+            self.recompute_dungeon_callouts();
+        }
     }
 
     /// Authoritatively set the header server and realm from a `/server` command
@@ -1354,10 +1747,46 @@ impl LiveFeedPanel {
 
         // Check if we're in a realm (has valid score)
         let in_realm = max_score > 0;
+        // Remember what the map this update replaces was before overwriting it: a
+        // dungeon call only names the realm score when its portal was opened in a
+        // realm (see `push_dungeon`). Realms are the only maps MapInfo reports a
+        // score for, so the Oryx areas, hubs and dungeons all clear this.
+        self.left_from_realm = self.map_is_realm;
+        self.map_is_realm = in_realm;
+        // A hub space (Nexus/Vault/Guild Hall/Bazaar) is where a dungeon can be
+        // opened with a key or a portal. Realm entries reached from one are not
+        // hub entries: they report their own map name (Meridian, Hearth, ...) and
+        // a realm score.
+        self.left_from_hub = self.map_is_hub;
+        self.map_is_hub = is_hub_map(display_name);
+        // Standing in a hub space is itself the origin signal for whatever is
+        // entered from there, so a hint from connecting to that hub is spent (and
+        // a stale one must not label a dungeon entered from a realm later on).
+        if self.map_is_hub {
+            self.hub_host_hint = None;
+        }
 
         // Parse realm name from realm_name field (e.g., "NexusPortal.Medusa" -> "Medusa")
         // Server name comes from IP lookup, not from this field
-        if let Some(realm) = Self::parse_realm_name_for_realm(realm_name_field) {
+        let parsed_realm = Self::parse_realm_name_for_realm(realm_name_field);
+        // A dungeon reports the area it was opened in: `NexusPortal.<Realm>` for
+        // one entered through a realm portal, and the plain Nexus for one opened
+        // in a hub (a hub is not a realm, so the game has no realm name to
+        // report). That makes the field the instance's own statement of where it
+        // was opened, and the only origin signal a party call gives us -- the entry
+        // never loads a hub map, and the instance's host need not be one RH can
+        // name. It is read whatever we came from (a realm, or another dungeon).
+        self.nexus_parent_dungeon =
+            !in_realm && !self.map_is_hub && realm_field_is_hub(realm_name_field);
+        if !in_realm && !self.map_is_hub {
+            tracing::info!(
+                "[LIVE_FEED] entering '{display_name}': realm field '{realm_name_field}' \
+                 (came from realm={}, hub={})",
+                self.left_from_realm,
+                self.left_from_hub
+            );
+        }
+        if let Some(realm) = parsed_realm {
             if in_realm {
                 // Realm entry - only cancel a pending castle teleport countdown
                 // when this is actually a *different* realm than before. If
@@ -1441,6 +1870,13 @@ impl LiveFeedPanel {
         self.realm_score = None;
         self.is_score_stale = false;
         self.currently_in_dungeon = false;
+        self.left_from_dungeon = false;
+        self.map_is_realm = false;
+        self.left_from_realm = false;
+        self.map_is_hub = false;
+        self.left_from_hub = false;
+        self.hub_host_hint = None;
+        self.nexus_parent_dungeon = false;
         self.castle_timer_expires_at = None;
         self.realm_closed = false;
         self.crystal_pin = None;
@@ -1819,6 +2255,8 @@ impl LiveFeedPanel {
         // The realm is closing and the Oryx endgame begins; dungeons opened with
         // a key inside the castle areas from here on stay callable.
         self.realm_closed = true;
+        // A realm close makes the dungeon we may have auto-copied unjoinable.
+        self.release_auto_clipboard();
         // Start the castle teleport countdown; ignore repeated
         // realm-close messages so the window isn't reset each time.
         if self.castle_timer_expires_at.is_none() {
@@ -1974,7 +2412,72 @@ impl LiveFeedPanel {
             .filter(|spawn| spawn.elapsed() < DUNGEON_JOIN_WINDOW);
         let estimated = fresh_spawn.is_none();
         let anchor = fresh_spawn.unwrap_or_else(std::time::Instant::now);
-        let params = self.dungeon_callout_params();
+        // Realm status is only called for dungeons entered through a portal from
+        // a realm: a party-call join (estimated window) belongs to no realm of
+        // its own, and a dungeon keyed open in the Nexus, inside another dungeon
+        // or in the Oryx areas (Castle/Chamber/Wine Cellar/Sanctuary) is not a
+        // realm entry -- the realm score is only remembered there, not current.
+        let realm_score_percent = if estimated || !self.left_from_realm {
+            None
+        } else {
+            self.get_score_percent()
+        };
+        let realm_status = self.realm_status_suffix(realm_score_percent);
+        // Named origin of the call, resolved in the same slot as the realm status
+        // (a dungeon is opened either in a realm or at the Nexus, never both). The
+        // map we came *from* decides it: a portal used in a hub space (Nexus,
+        // Vault, Guild Hall, Bazaar) or a party call out of one. Realm entries
+        // reached from a hub keep their own map names (Meridian, Hearth, ...), so
+        // they never set this.
+        //
+        // A party call that teleports us straight into a Nexus-opened instance
+        // loads no hub map at all: the only hint is the host we end up on, which
+        // is named *before* the instance's MapInfo arrives (the client connects
+        // first). That buffered hint is claimed here -- by the entry it belongs
+        // to -- and by [`Self::note_hub_hosted_dungeon`] when it arrived last.
+        let hub_hosted = self
+            .hub_host_hint
+            .is_some_and(|at| at.elapsed() < NEXUS_ORIGIN_WINDOW);
+        if hub_hosted {
+            self.hub_host_hint = None;
+            tracing::info!(
+                "[LIVE_FEED] connected to a hub host just before '{display_name}': naming it as opened in the nexus"
+            );
+        }
+        // The instance's own MapInfo said it belongs to no realm although we came
+        // from one, so it was opened in the Nexus (see
+        // [`Self::nexus_parent_dungeon`]).
+        let nexus_parent = std::mem::take(&mut self.nexus_parent_dungeon);
+        if nexus_parent {
+            tracing::info!(
+                "[LIVE_FEED] '{display_name}' names no realm of its own: naming it as opened in the nexus"
+            );
+        }
+        let entered_from_nexus = self.left_from_hub || hub_hosted || nexus_parent;
+        let origin_status = match realm_status {
+            Some(status) => Some(status),
+            None if entered_from_nexus => self.nexus_marker.text().map(str::to_string),
+            None => None,
+        };
+        // Suppress repeated MapInfo packets for the same dungeon *before* anything
+        // is recorded for it: the game re-sends the same map info, and a duplicate
+        // is not another run of the dungeon. Counting one as a run would let a
+        // single instance teach event-mod learning that an ordinary mod is an
+        // event preset, which would then stop it being called.
+        let signature = (
+            fp,
+            display_name.clone(),
+            modifier_tokens.to_vec(),
+            grade.clone(),
+        );
+        if self.last_dungeon_signature.as_ref() == Some(&signature) {
+            return;
+        }
+        // Recognize (and remember) the mods this event applies to every instance
+        // of this dungeon, so calls stop advertising a mod nobody rolled.
+        self.remember_dungeon_mods(&display_name, modifier_tokens);
+        let learned_event_mods = self.learned_event_mods(&display_name);
+        let params = self.dungeon_callout_params(origin_status.as_deref(), &learned_event_mods);
         let mut entry = DungeonEntry::new(
             display_name,
             portal_id,
@@ -1983,21 +2486,12 @@ impl LiveFeedPanel {
             &params,
             self.server_name.clone(),
             self.realm_name.clone(),
+            realm_score_percent,
             anchor,
             estimated,
         );
         entry.map_seed = fp;
-        let signature = (
-            fp,
-            entry.dungeon_name.clone(),
-            entry.modifiers.clone(),
-            entry.grade.clone(),
-        );
-
-        // Suppress repeated MapInfo packets for the same dungeon.
-        if self.last_dungeon_signature.as_ref() == Some(&signature) {
-            return;
-        }
+        entry.entered_from_nexus = entered_from_nexus;
 
         // Genuinely new dungeon: consume the spawn anchor and expire any prior
         // still-active dungeon entry (you can't call a dungeon you just left).
@@ -2015,6 +2509,7 @@ impl LiveFeedPanel {
             entry.deactivate();
         }
         self.push_entry(FeedEntry::Dungeon(entry));
+        self.queue_auto_clipboard();
     }
 
     /// Force-expire every still-active dungeon entry in the feed. Called when the
@@ -2032,6 +2527,84 @@ impl LiveFeedPanel {
                 }
             }
         }
+        // The dungeon we may have auto-copied can no longer be joined.
+        self.release_auto_clipboard();
+    }
+
+    /// Queue the newly entered dungeon's callout for the clipboard, when the
+    /// "Auto clipboard dungeon calls" setting is on and the dungeon can actually
+    /// be joined from the outside. Instances that start out unjoinable -
+    /// non-callable ones (Cultist Hideout, The Void, Crystal Cavern, which carry
+    /// no callout at all) and dungeons entered from a realm that is already full
+    /// - are skipped.
+    fn queue_auto_clipboard(&mut self) {
+        if !self.auto_clipboard_calls {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let queued = match self.entries.front() {
+            Some(FeedEntry::Dungeon(entry))
+                if entry.callout.is_some() && !entry.remaining(now).is_zero() =>
+            {
+                Some((
+                    entry.map_seed,
+                    self.assemble_callout(
+                        entry.callout.as_deref().unwrap_or_default(),
+                        entry.server_name.as_deref(),
+                        entry.realm_name.as_deref(),
+                        self.dungeon_join_position,
+                    ),
+                ))
+            }
+            _ => None,
+        };
+        if let Some((seed, text)) = queued {
+            self.auto_clipboard_seed = Some(seed);
+            self.auto_clipboard_text = Some(text.clone());
+            self.pending_clipboard = Some(ClipboardWrite::Copy(text));
+        }
+    }
+
+    /// Stop holding the automatic callout copy and queue a clipboard clear.
+    /// Does nothing when this panel never put a callout there, and the clear it
+    /// queues only fires while the clipboard still holds that callout, so
+    /// anything the user copied since is left alone.
+    fn release_auto_clipboard(&mut self) {
+        if self.auto_clipboard_seed.take().is_some() {
+            self.pending_clipboard = Some(ClipboardWrite::ClearIfUnchanged(
+                self.auto_clipboard_text.take().unwrap_or_default(),
+            ));
+        }
+    }
+
+    /// The clipboard write the app should perform this frame, if any: a queued
+    /// copy/clear, or the clear that follows the auto-copied callout becoming
+    /// uncallable (its join window elapsed, or the player moved on).
+    ///
+    /// The panel is only rendered while its tab is open, so the app polls this
+    /// every frame and does the actual clipboard access.
+    pub fn poll_clipboard(&mut self) -> Option<ClipboardWrite> {
+        if let Some(write) = self.pending_clipboard.take() {
+            return Some(write);
+        }
+        let seed = self.auto_clipboard_seed?;
+        let now = std::time::Instant::now();
+        let live = self.auto_clipboard_calls
+            && self.entries.iter().any(|entry| match entry {
+                FeedEntry::Dungeon(dungeon) => {
+                    dungeon.map_seed == seed
+                        && dungeon.callout.is_some()
+                        && !dungeon.remaining(now).is_zero()
+                }
+                _ => false,
+            });
+        if live {
+            return None;
+        }
+        self.auto_clipboard_seed = None;
+        Some(ClipboardWrite::ClearIfUnchanged(
+            self.auto_clipboard_text.take().unwrap_or_default(),
+        ))
     }
 
     /// Settle the live dungeon run timer for the row matching `map_seed` to the
@@ -3980,8 +4553,8 @@ impl LiveFeedPanel {
 
     /// Render a public key-pop entry: the dungeon key sprite, dungeon name, and
     /// "Opened by <player>". Observed (not entered) events stay clickable and
-    /// never expire; clicking copies a "Thanks <opener> for the key"
-    /// callout. Returns true when clicked.
+    /// never expire; clicking copies a "Thanks <opener> for the key!" callout.
+    /// Returns true when clicked.
     fn render_key_pop_entry(
         &self,
         ui: &mut Ui,
@@ -4941,6 +5514,7 @@ impl Panel for LiveFeedPanel {
                     *max_realm_score,
                 );
                 self.clear_encounters();
+                self.left_from_dungeon = self.currently_in_dungeon;
                 self.currently_in_dungeon = *is_dungeon;
 
                 if *is_dungeon {
@@ -5602,6 +6176,7 @@ fn draw_chain_link(ui: &mut Ui, dim: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use realmhound_core::settings::NexusMarker;
 
     fn combined_variant(
         mark_id: i32,
@@ -5675,8 +6250,14 @@ mod tests {
             loot_label: realmhound_core::settings::LootLabel::Lb,
             dust_label: realmhound_core::settings::DustLabel::Db,
             xp_label: realmhound_core::settings::XpLabel::None,
+            loot_threshold: 5,
+            dust_threshold: 10,
+            xp_threshold: 10,
+            call_event_mods: true,
             percent: false,
             reward_mods: mods,
+            learned_event_mods: &[],
+            origin_status: None,
         }
     }
 
@@ -5705,6 +6286,7 @@ mod tests {
             &[],
             None,
             &params,
+            None,
             None,
             None,
             std::time::Instant::now(),
@@ -5771,7 +6353,7 @@ mod tests {
         assert_eq!(entry.key_id, 1234);
         assert_eq!(
             entry.callout(),
-            Some("Thanks Alice for the key".to_string())
+            Some("Thanks Alice for the key!".to_string())
         );
     }
 
@@ -6134,6 +6716,11 @@ mod tests {
             .count()
     }
 
+    /// Display names of a dungeon entry's modifier chips, in callout order.
+    fn chip_names(entry: &DungeonEntry) -> Vec<String> {
+        entry.mods.iter().map(|chip| chip.name.clone()).collect()
+    }
+
     #[test]
     fn prettify_modifier_formats_tokens() {
         assert_eq!(prettify_modifier("CHEF"), "Chef");
@@ -6164,7 +6751,7 @@ mod tests {
         match panel.entries.front().unwrap() {
             FeedEntry::Dungeon(d) => {
                 assert_eq!(
-                    d.modifiers,
+                    chip_names(d),
                     vec!["Looting".to_string(), "Rewarding".to_string()]
                 );
                 assert_eq!(d.loot_bonus, 75);
@@ -6225,6 +6812,7 @@ mod tests {
             &params,
             None,
             None,
+            None,
             std::time::Instant::now(),
             false,
         );
@@ -6248,6 +6836,7 @@ mod tests {
             &params,
             None,
             None,
+            None,
             std::time::Instant::now(),
             false,
         );
@@ -6266,7 +6855,7 @@ mod tests {
         );
         match panel.entries.front().unwrap() {
             FeedEntry::Dungeon(d) => {
-                assert_eq!(d.modifiers, vec!["Weak Boss III".to_string()]);
+                assert_eq!(chip_names(d), vec!["Weak Boss III".to_string()]);
                 assert_eq!(d.loot_bonus, 1);
             }
             other => panic!("Expected Dungeon entry, got {:?}", other),
@@ -6288,7 +6877,7 @@ mod tests {
             FeedEntry::Dungeon(d) => {
                 assert_eq!(d.dungeon_name, "Spider Den");
                 assert_eq!(
-                    d.modifiers,
+                    chip_names(d),
                     vec!["Chef".to_string(), "Souvenir I (Legacy)".to_string()]
                 );
                 assert_eq!(d.grade, Some("S".to_string()));
@@ -6482,6 +7071,605 @@ mod tests {
         assert!(!panel.realm_closed);
     }
 
+    /// A panel sitting in a realm at `current / max` score, mirroring what
+    /// MapInfo leaves behind on realm entry.
+    fn panel_in_realm(realm: &str, current: i32, max: i32) -> LiveFeedPanel {
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location(
+            "Realm of the Mad God",
+            &format!("NexusPortal.{realm}"),
+            current,
+            max,
+        );
+        panel
+    }
+
+    /// The callout of the newest dungeon entry, if it has one.
+    fn newest_callout(panel: &LiveFeedPanel) -> Option<String> {
+        match panel.entries.front() {
+            Some(FeedEntry::Dungeon(d)) => d.callout.clone(),
+            other => panic!("Expected Dungeon entry, got {:?}", other),
+        }
+    }
+
+    /// Mirror the MapChanged sequence of entering `dungeon` through a portal:
+    /// the dungeon's own MapInfo reports no realm score, and the call is made
+    /// after that map change, as `handle_event` does. The map the portal was
+    /// opened on must already be established with
+    /// [`LiveFeedPanel::update_location`].
+    fn enter_dungeon(panel: &mut LiveFeedPanel, fp: i32, dungeon: &str) {
+        let realm_field = format!(
+            "NexusPortal.{}",
+            panel.realm_name.clone().unwrap_or_default()
+        );
+        panel.update_location(dungeon, &realm_field, 0, 0);
+        panel.push_dungeon(fp, dungeon, &[], None);
+    }
+
+    #[test]
+    fn realm_status_names_the_realm_a_dungeon_was_entered_from() {
+        let _assets = crate::test_support::modifier_assets();
+        // Portal entry from a realm at 74%: the score is named (threshold 50).
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake in 74% realm")
+        );
+
+        // Below the threshold nothing is appended.
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // A closing realm is called as such past 90%.
+        let mut panel = panel_in_realm("Medusa", 95, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Spider Den");
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("sden in a closing realm")
+        );
+
+        // Off by default: no realm is named.
+        let mut panel = panel_in_realm("Medusa", 95, 100);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Spider Den");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
+    }
+
+    #[test]
+    fn opened_in_nexus_names_the_nexus_a_dungeon_was_opened_in() {
+        let _assets = crate::test_support::modifier_assets();
+
+        // Portal entry from the Nexus (the portal spawned there and we used it):
+        // off by default, so the call stays bare.
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // Setting on: the Nexus is named.
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
+
+        // Party call join while in the Nexus (no portal of ours, no realm in
+        // play) is the same origin: the dungeon's MapInfo follows the Nexus with
+        // no observed portal spawn, so only the estimated window applies.
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.update_location("Snake Pit", "NexusPortal.", 0, 0);
+        panel.push_dungeon(2, "Snake Pit", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
+
+        // A dungeon entered from a realm is never a Nexus entry, even with the
+        // realm-status suffix off.
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // The other hub spaces count as the Nexus for this: a key popped in the
+        // Vault (or the Guild Hall, or the Bazaar) opened the dungeon at the
+        // Nexus too, and the game returns the player to the Nexus from it.
+        for hub in ["{s.vault}", "{s.guildhall}", "Bazaar"] {
+            let mut panel = LiveFeedPanel::new();
+            panel.update_location(hub, hub, 0, 0);
+            panel.nexus_marker = NexusMarker::InNexus;
+            panel.pending_portal_spawn = Some(std::time::Instant::now());
+            enter_dungeon(&mut panel, 1, "Snake Pit");
+            assert_eq!(
+                newest_callout(&panel).as_deref(),
+                Some("snake in nexus"),
+                "{hub} counts as the nexus"
+            );
+        }
+
+        // ...and a dungeon whose own MapInfo names one of the Oryx endgame areas
+        // as the place it was opened is not a Nexus call either, whatever we
+        // walked in from.
+        for oryx in ["{s.oryx_s_castle}", "{s.wine_cellar}"] {
+            let mut panel = LiveFeedPanel::new();
+            panel.update_location(oryx, oryx, 0, 0);
+            panel.nexus_marker = NexusMarker::InNexus;
+            panel.pending_portal_spawn = Some(std::time::Instant::now());
+            panel.update_location("Snake Pit", oryx, 0, 0);
+            panel.push_dungeon(1, "Snake Pit", &[], None);
+            assert_eq!(newest_callout(&panel).as_deref(), Some("snake"), "{oryx}");
+        }
+
+        // A realm entered from the Nexus is not a dungeon call at all, and the
+        // Nexus origin must not survive the visit: a dungeon entered from that
+        // realm then gets the realm treatment, not `in nex`.
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.update_location("Meridian", "NexusPortal.Meridian", 10, 100);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // A dungeon keyed open inside another dungeon reports that instance's
+        // area, not the Nexus, so it names neither origin.
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.update_location("Spider Den", "Spider Den", 0, 0);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.update_location("Snake Pit", "Spider Den", 0, 0);
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // The shorter marker option appends just its own text.
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.nexus_marker = NexusMarker::Nex;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake nex"));
+    }
+
+    #[test]
+    fn opened_in_nexus_follows_the_joined_instance_not_the_origin() {
+        let _assets = crate::test_support::modifier_assets();
+        // A party call can arrive from anywhere -- a realm, a dungeon, a closed
+        // realm, the castle, the vault. What decides is what we join: an instance
+        // whose own MapInfo was opened in a hub reports the plain Nexus as its
+        // area (a key popped in the Bazaar and called into party looks like this).
+        let origins: [(&str, &str, i32, i32); 4] = [
+            ("Sprite World", "NexusPortal.Hearth", 0, 0), // inside a dungeon
+            ("Realm of the Mad God", "NexusPortal.Hearth", 20, 100), // in a realm
+            ("{s.oryx_s_castle}", "{s.oryx_s_castle}", 0, 0), // Oryx's castle
+            ("{s.vault}", "{s.vault}", 0, 0),             // the vault
+        ];
+        for (map, field, score, max) in origins {
+            let mut panel = LiveFeedPanel::new();
+            panel.update_location(map, field, score, max);
+            panel.nexus_marker = NexusMarker::Nex;
+            panel.update_location("Snake Pit", "Nexus", 0, 0);
+            panel.push_dungeon(1, "Snake Pit", &[], None);
+            assert_eq!(
+                newest_callout(&panel).as_deref(),
+                Some("snake nex"),
+                "joined from {map}"
+            );
+        }
+
+        // The mirror: whatever we came from, an instance that reports a realm (or
+        // any other non-hub area) as its own is not a Nexus call.
+        for field in [
+            "NexusPortal.Hearth",
+            "Hearth",
+            "{s.oryx_s_castle}",
+            "Spider Den",
+        ] {
+            let mut panel = LiveFeedPanel::new();
+            panel.update_location("Sprite World", "NexusPortal.Hearth", 0, 0);
+            panel.nexus_marker = NexusMarker::Nex;
+            panel.update_location("Snake Pit", field, 0, 0);
+            panel.push_dungeon(1, "Snake Pit", &[], None);
+            assert_eq!(newest_callout(&panel).as_deref(), Some("snake"), "{field}");
+        }
+    }
+
+    #[test]
+    fn opened_in_nexus_recompute_follows_the_setting() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // Turning the setting on rewrites the entries already in the feed.
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.recompute_dungeon_callouts();
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
+
+        panel.nexus_marker = NexusMarker::None;
+        panel.recompute_dungeon_callouts();
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn opened_in_nexus_from_a_party_call_the_instance_names_no_realm() {
+        // The reported case, straight from the packets: standing in Medusa, a
+        // friend pops a key in the Nexus and calls it, and the party call lands us
+        // in an instance whose own MapInfo names no realm (a hub is not a realm,
+        // so the game has nothing to report). The entry never loads a hub map, so
+        // this realm-less instance is the origin signal.
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::Nex;
+        // No portal of ours, no host we could name: only the map itself.
+        panel.update_location("Lair of Shaitan", "", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Lair of Shaitan", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("shait nex"));
+
+        // A dungeon that names the realm we came from was opened in that realm,
+        // and stays unmarked.
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::Nex;
+        panel.update_location("Lair of Shaitan", "NexusPortal.Medusa", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Lair of Shaitan", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("shait"));
+
+        // So does one that names a different realm (we joined a stranger's realm
+        // instance): it belongs to that realm, not the Nexus.
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::Nex;
+        panel.update_location("Lair of Shaitan", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Lair of Shaitan", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("shait"));
+
+        // The signal is spent with the entry: a second dungeon entered from a
+        // realm keeps its own origin (here it names its realm).
+        let mut panel = panel_in_realm("Medusa", 20, 100);
+        panel.nexus_marker = NexusMarker::Nex;
+        panel.update_location("Lair of Shaitan", "", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Lair of Shaitan", &[], None);
+        panel.update_location("Lair of Shaitan", "NexusPortal.Medusa", 0, 0);
+        panel.push_dungeon(2, "Lair of Shaitan", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("shait"));
+    }
+
+    #[test]
+    fn opened_in_nexus_from_a_party_call_names_the_host_that_arrived_first() {
+        // The reported case: standing in a realm, a friend pops a key in the
+        // Nexus and calls it, and the party call teleports us straight into that
+        // instance. The client connects to the instance's host *before* its
+        // MapInfo arrives, so the host is named first -- the hint has to survive
+        // until the entry it belongs to shows up.
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.nexus_marker = NexusMarker::InNexus;
+        // The hub host is named as the client reconnects...
+        panel.set_server_name("USMidWest".to_string());
+        // ...and the instance's MapInfo follows it.
+        panel.update_location("Davy Jones' Locker", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
+
+        // The hint is spent: the next dungeon entered from a realm keeps its own
+        // origin, and a hint that was used up by reaching the Nexus cannot leak
+        // into it either.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.set_server_name("USMidWest".to_string());
+        panel.update_location("Nexus", "Nexus", 0, 0);
+        panel.update_location("Realm of the Mad God", "NexusPortal.Zephyr", 0, 0);
+        panel.update_location("Davy Jones' Locker", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn opened_in_nexus_from_a_party_call_is_named_once_its_host_is_known() {
+        let _assets = crate::test_support::modifier_assets();
+        // The reported case: standing in a realm, a friend pops a key in the
+        // Nexus and calls it, and the party call teleports us straight into that
+        // instance. No Nexus map is ever loaded, so the only hint is the host we
+        // end up on: the hub is the one host RH can name, realm and dungeon
+        // backends are unmapped.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.nexus_marker = NexusMarker::InNexus;
+        // The dungeon's MapInfo follows the realm's directly (no portal of ours).
+        panel.update_location("Davy Jones' Locker", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake"),
+            "the host is only learned a beat later"
+        );
+
+        // The instance turns out to live on the USMidWest hub (18.221.120.59).
+        panel.set_server_name("USMidWest".to_string());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake in nexus"));
+
+        // Off by default: the same sequence names nothing.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.update_location("Davy Jones' Locker", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        panel.set_server_name("USMidWest".to_string());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // A named host that arrives outside a dungeon (the Nexus itself, or a
+        // later reconnect) never rewrites an entry.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.update_location("Sprite World", "NexusPortal.Zephyr", 0, 0);
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        panel.currently_in_dungeon = false;
+        panel.set_server_name("USMidWest".to_string());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // A dungeon keyed open inside another dungeon runs on that instance's
+        // host, which for a hub-opened parent is the hub: the host hint must not
+        // call the child a Nexus entry.
+        let mut panel = panel_in_realm("Zephyr", 20, 100);
+        panel.nexus_marker = NexusMarker::InNexus;
+        panel.update_location("Sprite World", "NexusPortal.Zephyr", 0, 0);
+        panel.left_from_dungeon = true;
+        panel.currently_in_dungeon = true;
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        panel.set_server_name("USMidWest".to_string());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn learned_event_mods_need_repeated_instances_it_stood_alone_in() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        // Only the option's own effect is observable, so turn it off. None of
+        // these mods are in the curated list: this is the learned path.
+        panel.call_event_mods = false;
+
+        // First two entries: not enough evidence yet, so the tag is called.
+        panel.push_dungeon(1, "Snake Pit", &["GENEROUS".to_string()], None);
+        panel.push_dungeon(2, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+
+        // Third entry: the pattern is now recognizable, so the call drops it.
+        panel.push_dungeon(3, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+        assert_eq!(panel.learned_event_mods("Snake Pit"), ["GENEROUS"]);
+
+        // Other dungeons are unaffected (nothing learned for them yet).
+        panel.push_dungeon(4, "Spider Den", &["GENEROUS".to_string()], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden generous"));
+
+        // A rolled mod alongside the event mod is still called.
+        panel.push_dungeon(
+            5,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "KEYFAIRY".to_string()],
+            None,
+        );
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake keyf"));
+    }
+
+    #[test]
+    fn repeated_map_info_packets_do_not_teach_event_mods() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+
+        // The client re-sends MapInfo for the same instance. Those are duplicates
+        // of one run, not evidence that the mod is applied to every instance this
+        // week, so they must not count towards the learning threshold.
+        for _ in 0..4 {
+            panel.push_dungeon(1, "Snake Pit", &["GENEROUS".to_string()], None);
+        }
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+
+        // Real instances still count: two more runs (new seeds) teach it.
+        panel.push_dungeon(2, "Snake Pit", &["GENEROUS".to_string()], None);
+        panel.push_dungeon(3, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(panel.learned_event_mods("Snake Pit"), ["GENEROUS"]);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn learned_event_mods_honor_the_configured_run_count() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        // Ask for four runs instead of the default three: three aren't enough.
+        panel.learn_event_mods_runs = 4;
+        for seed in [1, 2, 3] {
+            panel.push_dungeon(seed, "Snake Pit", &["GENEROUS".to_string()], None);
+        }
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+        panel.push_dungeon(4, "Snake Pit", &["GENEROUS".to_string()], None);
+        assert_eq!(panel.learned_event_mods("Snake Pit"), ["GENEROUS"]);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+    }
+
+    #[test]
+    fn learned_event_mods_can_be_switched_off() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        panel.learn_event_mods = false;
+        for seed in [1, 2, 3, 4] {
+            panel.push_dungeon(seed, "Snake Pit", &["GENEROUS".to_string()], None);
+        }
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake generous"));
+    }
+
+    #[test]
+    fn learned_event_mods_need_equal_tokens_across_runs() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.call_event_mods = false;
+        // Three runs where no single mod appears in all of them, so nothing is
+        // learned and every tag is still called. (None of these mods is in the
+        // curated event list, so only the learning path can drop one.)
+        panel.push_dungeon(
+            1,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "KEYFAIRY".to_string()],
+            None,
+        );
+        panel.push_dungeon(
+            2,
+            "Snake Pit",
+            &["KEYFAIRY".to_string(), "NILDROPS".to_string()],
+            None,
+        );
+        panel.push_dungeon(
+            3,
+            "Snake Pit",
+            &["GENEROUS".to_string(), "NILDROPS".to_string()],
+            None,
+        );
+        assert!(panel.learned_event_mods("Snake Pit").is_empty());
+        // Tags keep their reward-mod list order (Nildrops precedes Generous).
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake nildrop generous")
+        );
+    }
+
+    #[test]
+    fn realm_status_skips_party_joins_and_key_pops() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Medusa", 95, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
+        // No observed portal spawn -> a party-call join, which has no realm of
+        // its own to name.
+        panel.update_location("Spider Den", "NexusPortal.Medusa", 0, 0);
+        panel.push_dungeon(1, "Spider Den", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
+
+        // A key popped in a hub (no realm score) names nothing either.
+        let mut panel = LiveFeedPanel::new();
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Closing;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        panel.update_location("Spider Den", "NexusPortal.Medusa", 0, 0);
+        panel.push_dungeon(1, "Spider Den", &[], None);
+        assert_eq!(newest_callout(&panel).as_deref(), Some("sden"));
+    }
+
+    #[test]
+    fn realm_status_is_not_named_for_dungeons_opened_outside_a_realm() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+
+        // Realm -> Oryx's Castle: the realm score is only remembered from here on
+        // (the castle is not a realm), so a dungeon keyed open inside it names
+        // nothing even though the score is still known.
+        panel.update_location("Oryx's Castle", "NexusPortal.Medusa", 0, 0);
+        assert_eq!(
+            panel.get_score_percent(),
+            Some(74),
+            "the castle keeps the remembered score"
+        );
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "The Nest");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("nest"));
+
+        // Same for the rest of the Oryx endgame sequence.
+        for area in ["Oryx's Chamber", "Wine Cellar", "Oryx's Sanctuary"] {
+            let mut panel = panel_in_realm("Medusa", 74, 100);
+            panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+            panel.realm_status_threshold = 50;
+            panel.update_location(area, "NexusPortal.Medusa", 0, 0);
+            panel.pending_portal_spawn = Some(std::time::Instant::now());
+            enter_dungeon(&mut panel, 1, "The Nest");
+            assert_eq!(
+                newest_callout(&panel).as_deref(),
+                Some("nest"),
+                "{area} is not a realm entry"
+            );
+        }
+
+        // A dungeon entered from another dungeon (a key popped inside it) names
+        // nothing either, while the realm entry itself still does.
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake in 74% realm")
+        );
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 2, "The Nest");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("nest"));
+
+        // The Nexus clears the realm score outright, so a key popped there has
+        // nothing to name.
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.update_location("Nexus", "Nexus", -1, -1);
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "The Nest");
+        assert_eq!(newest_callout(&panel).as_deref(), Some("nest"));
+    }
+
+    #[test]
+    fn realm_status_drops_when_the_realm_is_left() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake in 74% realm")
+        );
+
+        // Leaving for another realm invalidates the captured score: a settings
+        // change must not re-append it to the old row.
+        panel.update_location("Realm of the Mad God", "NexusPortal.Hydra", 10, 100);
+        panel.recompute_dungeon_callouts();
+        assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
+
+        // Same realm (e.g. re-entering the dungeon) keeps it.
+        let mut panel = panel_in_realm("Medusa", 74, 100);
+        panel.realm_status = realmhound_core::settings::RealmStatusMode::Score;
+        panel.realm_status_threshold = 50;
+        panel.pending_portal_spawn = Some(std::time::Instant::now());
+        enter_dungeon(&mut panel, 1, "Snake Pit");
+        panel.recompute_dungeon_callouts();
+        assert_eq!(
+            newest_callout(&panel).as_deref(),
+            Some("snake in 74% realm")
+        );
+    }
+
     #[test]
     fn push_dungeon_anchors_countdown_to_portal_spawn() {
         let mut panel = LiveFeedPanel::new();
@@ -6555,6 +7743,118 @@ mod tests {
             }
             other => panic!("Expected Dungeon entry, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn auto_clipboard_copies_joinable_dungeon_callout() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
+            auto_clipboard_dungeon_calls: true,
+            ..Default::default()
+        });
+        panel.push_dungeon(7, "Snake Pit", &["LOOTING".to_string()], None);
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::Copy("/p snake 50 lb j".to_string()))
+        );
+        // The copy is handed over once; afterwards the panel only tracks the
+        // entry so it can release the clipboard later.
+        assert_eq!(panel.poll_clipboard(), None);
+    }
+
+    #[test]
+    fn auto_clipboard_is_off_by_default() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        assert_eq!(panel.poll_clipboard(), None);
+    }
+
+    #[test]
+    fn auto_clipboard_skips_dungeons_that_cannot_be_called() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
+            auto_clipboard_dungeon_calls: true,
+            ..Default::default()
+        });
+        // The Void is reachable only from inside another instance.
+        panel.push_dungeon(1, "The Void", &["DIMITUS".to_string()], None);
+        assert_eq!(panel.poll_clipboard(), None);
+    }
+
+    #[test]
+    fn auto_clipboard_clears_on_portal_switch() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
+            auto_clipboard_dungeon_calls: true,
+            ..Default::default()
+        });
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        let copied = match panel.poll_clipboard() {
+            Some(ClipboardWrite::Copy(text)) => text,
+            other => panic!("expected a copy, got {other:?}"),
+        };
+
+        // Leaving the dungeon (any non-dungeon map change) releases the copy.
+        panel.deactivate_active_dungeons();
+        // The clear carries the exact callout, so the app can tell it apart from
+        // anything the user copied since.
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::ClearIfUnchanged(copied))
+        );
+        // Nothing is held any more, so no further clear is queued.
+        assert_eq!(panel.poll_clipboard(), None);
+    }
+
+    #[test]
+    fn auto_clipboard_clears_on_realm_close() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
+            auto_clipboard_dungeon_calls: true,
+            ..Default::default()
+        });
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        let copied = match panel.poll_clipboard() {
+            Some(ClipboardWrite::Copy(text)) => text,
+            other => panic!("expected a copy, got {other:?}"),
+        };
+
+        panel.force_realm_closed();
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::ClearIfUnchanged(copied))
+        );
+    }
+
+    #[test]
+    fn auto_clipboard_clears_when_the_join_window_elapses() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
+            auto_clipboard_dungeon_calls: true,
+            ..Default::default()
+        });
+        panel.push_dungeon(1, "Snake Pit", &[], None);
+        let copied = match panel.poll_clipboard() {
+            Some(ClipboardWrite::Copy(text)) => text,
+            other => panic!("expected a copy, got {other:?}"),
+        };
+
+        // The countdown runs out on its own, with no map change.
+        for entry in panel.entries.iter_mut() {
+            if let FeedEntry::Dungeon(dungeon) = entry {
+                dungeon.deactivate();
+            }
+        }
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::ClearIfUnchanged(copied))
+        );
     }
 
     #[test]

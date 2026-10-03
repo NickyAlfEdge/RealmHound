@@ -13,7 +13,7 @@ use super::tracker::LootTracker;
 use crate::assets::get_asset_manager;
 
 /// Database schema version for migrations.
-const SCHEMA_VERSION: i32 = 23;
+const SCHEMA_VERSION: i32 = 24;
 
 /// Highest loot-history schema version this build can validate and open. Used by
 /// flat-layout migration to reject databases written by a newer build.
@@ -639,7 +639,44 @@ impl LootDatabase {
                 return Ok(());
             }
         }
+        // Migration from v23 to v24: rename Shatters hard-mode loot sources that
+        // were stored under the names hard mode reveals (Valen the Unbreakable,
+        // Nox the Wild Shadow, King Azamoth) back to the bosses' own names with
+        // the `(HM)` suffix. The revealed names are flavour for the fight card;
+        // Loot History keeps the boss name so searching a boss finds every bag it
+        // dropped. Idempotent: only the revealed spellings are rewritten.
+        if from_version < 24 {
+            self.rename_shatters_hm_sources()?;
+        }
         self.set_schema_version(SCHEMA_VERSION)?;
+        Ok(())
+    }
+
+    /// Rewrite Loot History rows stored under a Shatters boss's revealed
+    /// hard-mode name to the boss's own name plus the `(HM)` variant suffix,
+    /// keeping the two lookups consistent.
+    fn rename_shatters_hm_sources(&mut self) -> SqlResult<()> {
+        for object_type in [
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            crate::assets::SHATTERS_KING_TYPE,
+        ] {
+            let (Some(revealed), Some(original)) = (
+                crate::assets::shatters_hm_boss_name(object_type),
+                crate::assets::shatters_boss_name(object_type),
+            ) else {
+                continue;
+            };
+            self.conn.execute(
+                "UPDATE loot_drops SET mob_name = ?1
+                 WHERE dungeon = ?2 AND mob_name = ?3",
+                rusqlite::params![
+                    format!("{original} (HM)"),
+                    super::THE_SHATTERS_NAME,
+                    revealed
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -1670,6 +1707,7 @@ impl LootDatabase {
                 &b.items,
                 b.map_seed,
                 b.timestamp,
+                false,
             ) {
                 updates.push((b.id, t, n));
             }
@@ -3670,6 +3708,48 @@ mod tests {
         db.migrate(21).unwrap();
 
         assert_eq!(drop_source(&db, unknown), (0, "Unknown".to_string()));
+    }
+
+    #[test]
+    fn migration_v24_keeps_the_boss_name_for_hard_mode_loot() {
+        let mut db = LootDatabase::open_in_memory().unwrap();
+        let insert = |db: &mut LootDatabase, dungeon: &str, mob_type: i32, mob_name: &str| {
+            let mut player = create_test_player();
+            player.dungeon = dungeon.to_string();
+            db.insert_loot_drop(&NewLootDrop {
+                timestamp: 1_700_000_000_000,
+                player,
+                bag_type: LootBagType::White,
+                mob_type,
+                mob_name: mob_name.to_string(),
+                items: vec![NewLootItem {
+                    slot: 0,
+                    item_id: 14214,
+                    item_name: "Chrysalis of Eternity".to_string(),
+                    enchant_ids: vec![],
+                }],
+            })
+            .unwrap()
+        };
+        let shatters = super::super::THE_SHATTERS_NAME;
+        let king = insert(&mut db, shatters, 29039, "King Azamoth");
+        let valen = insert(&mut db, shatters, 29003, "Valen the Unbreakable");
+        let nox = insert(&mut db, shatters, 29021, "Nox the Wild Shadow");
+        let regular = insert(&mut db, shatters, 29039, "The Forgotten King");
+        let elsewhere = insert(&mut db, "Other Dungeon", 29039, "King Azamoth");
+
+        db.migrate(23).unwrap();
+
+        assert_eq!(db.get_schema_version(), SCHEMA_VERSION);
+        assert_eq!(drop_source(&db, king).1, "The Forgotten King (HM)");
+        assert_eq!(drop_source(&db, valen).1, "The Bridge Sentinel (HM)");
+        assert_eq!(drop_source(&db, nox).1, "Twilight Archmage (HM)");
+        // Regular drops and other dungeons are left alone, and re-running is a
+        // no-op because the revealed spellings are gone.
+        assert_eq!(drop_source(&db, regular).1, "The Forgotten King");
+        assert_eq!(drop_source(&db, elsewhere).1, "King Azamoth");
+        db.rename_shatters_hm_sources().unwrap();
+        assert_eq!(drop_source(&db, king).1, "The Forgotten King (HM)");
     }
 
     #[test]

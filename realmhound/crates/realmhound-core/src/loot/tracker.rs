@@ -898,6 +898,19 @@ impl LootTracker {
         map_seed: i32,
         now_ms: i64,
     ) -> Option<(i32, String)> {
+        // The Shatters hard mode first: its extra bags are emitted by an
+        // invisible spawner, so nothing below can identify them.
+        if let Some(hit) = Self::resolve_shatters_hm_bag(
+            &self.recent_boss_kills,
+            bag_type,
+            dungeon,
+            prior_mob_type,
+            map_seed,
+            now_ms,
+            self.attribution.hm_shatters_latched(map_seed),
+        ) {
+            return Some(hit);
+        }
         Self::resolve_boss_override_with(
             &self.recent_boss_kills,
             bag_type,
@@ -906,12 +919,62 @@ impl LootTracker {
             item_ids,
             map_seed,
             now_ms,
+            self.attribution.mv_umi_latched(map_seed),
         )
+    }
+
+    /// The Shatters hard mode: each HM boss drops an *extra* bag (Valen's second
+    /// bag, Nox the Wild Shadow's doubled bags, King Azamoth's two bags) from an
+    /// invisible spawner, seconds after the boss's death line closed the
+    /// attribution window. Those bags arrive Unknown and hold loot the drop-table
+    /// path cannot pin to one boss, so credit them to the boss the run just
+    /// fought -- Combat History's last kill in this instance -- under the boss's
+    /// own `(HM)`-suffixed name (see [`Self::resolve_mob_name`]).
+    fn resolve_shatters_hm_bag(
+        recent_boss_kills: &[RecentBossKill],
+        bag_type: LootBagType,
+        dungeon: &str,
+        prior_mob_type: i32,
+        map_seed: i32,
+        bag_time_ms: i64,
+        hm_shatters_latched: bool,
+    ) -> Option<(i32, String)> {
+        if dungeon != super::THE_SHATTERS_NAME || !hm_shatters_latched {
+            return None;
+        }
+        if matches!(bag_type, LootBagType::Brown | LootBagType::BoostedBrown) {
+            return None;
+        }
+        // Only bags proximity left unattributed: a bag pinned to a nearby entity
+        // already knows its source.
+        if prior_mob_type != 0 {
+            return None;
+        }
+        let (object_type, name) =
+            Self::select_last_boss_where(recent_boss_kills, map_seed, |kill| {
+                let lag = bag_time_ms - kill.ended_at_ms;
+                lag >= -KILL_CORRELATION_EARLY_TOLERANCE_MS && lag <= KILL_CORRELATION_MAX_LAG_MS
+            })?;
+        // Loot History keeps the boss's own name so searching a boss finds its
+        // hard-mode drops too; the revealed names live on the fight card only.
+        // The kill's name comes from Combat History, which carries the revealed
+        // name for these fights, so prefer the object's own name.
+        let name = get_asset_manager().object_name(object_type).unwrap_or(name);
+        let name = if name.ends_with("(HM)") {
+            name
+        } else {
+            format!("{name} (HM)")
+        };
+        Some((object_type, name))
     }
 
     /// Fight-correlation core of [`resolve_boss_override`], taking the recent
     /// boss kills explicitly so the legacy loot backfill can reuse the exact
     /// same attribution rules with kills sourced from recorded Combat History.
+    /// `mv_umi_latched` is the live "Kitsune Umi was engaged in this instance"
+    /// signal, which the recorded kills cannot provide (her fight only completes
+    /// *when* her loot is recorded); the backfill passes `false`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_boss_override_with(
         recent_boss_kills: &[RecentBossKill],
         bag_type: LootBagType,
@@ -920,6 +983,33 @@ impl LootTracker {
         item_ids: &[i32],
         map_seed: i32,
         now_ms: i64,
+        mv_umi_latched: bool,
+    ) -> Option<(i32, String)> {
+        let (object_type, name) = Self::attribute_bag_to_boss(
+            recent_boss_kills,
+            bag_type,
+            dungeon,
+            prior_mob_type,
+            item_ids,
+            map_seed,
+            now_ms,
+            mv_umi_latched,
+        )?;
+        Some((object_type, Self::loot_source_name(object_type, name)))
+    }
+
+    /// The boss a loot bag is attributed to, before the Loot History naming rule
+    /// is applied (see [`Self::loot_source_name`]).
+    #[allow(clippy::too_many_arguments)]
+    fn attribute_bag_to_boss(
+        recent_boss_kills: &[RecentBossKill],
+        bag_type: LootBagType,
+        dungeon: &str,
+        prior_mob_type: i32,
+        item_ids: &[i32],
+        map_seed: i32,
+        now_ms: i64,
+        mv_umi_latched: bool,
     ) -> Option<(i32, String)> {
         if matches!(bag_type, LootBagType::Brown | LootBagType::BoostedBrown) {
             return None;
@@ -978,6 +1068,29 @@ impl LootTracker {
             }
         }
 
+        // Moonlight Village: the three dancers go invulnerable and never die, and
+        // they never drop loot personally -- the invisible `MV Dungeon Complete`
+        // emitter pools the whole run's loot and hands it out once the dance is
+        // cleared. The dancers and the emitter stand on top of each other around
+        // the clear, so proximity pins each bag to whichever of them happens to
+        // be nearest at that instant, which is arbitrary. Re-resolve every bag
+        // proximity tied to a dancer or to a dropper: the run's pooled loot
+        // belongs to the boss fought last (the dancer defeated last is the card's
+        // "Main"), or to Kitsune Umi once her optional phase was engaged. Item
+        // signatures can't help here (the emitter pools the dungeon's loot), so we
+        // key off the fights, not the items. Runs before the `prior_mob_type != 0`
+        // early-out for the same reason as the Killer Bee Nest block above; the
+        // Challenge Gate's second bag is an Unknown bag and lands here too.
+        if dungeon == super::MOONLIGHT_VILLAGE_NAME
+            && super::is_mv_neutral_loot_source(prior_mob_type)
+        {
+            if let Some(hit) =
+                Self::resolve_mv_bag_with(recent_boss_kills, map_seed, now_ms, mv_umi_latched)
+            {
+                return Some(hit);
+            }
+        }
+
         // The remaining signals only recover bags proximity left as Unknown.
         if prior_mob_type != 0 {
             return None;
@@ -989,16 +1102,6 @@ impl LootTracker {
             if let Some((t, n)) = super::lair_of_draconis_dragon(item_ids) {
                 return Some((t, n.to_string()));
             }
-        }
-
-        // Moonlight Village bosses go invulnerable and never die; their loot is
-        // emitted at dungeon end by invisible dropper entities the player never
-        // hits, so every bag arrives Unknown. Attribute it to the last boss the
-        // player fought in this instance (the Challenge Gate's second bag is
-        // attributed the same way). Item signatures can't help here: the dropper
-        // pools the whole dungeon's loot, so we key off the fight, not the items.
-        if dungeon == super::MOONLIGHT_VILLAGE_NAME {
-            return Self::select_last_boss_in_instance(recent_boss_kills, map_seed);
         }
 
         // Spectral Penitentiary minibosses transform/despawn on death and emit
@@ -1269,14 +1372,69 @@ impl LootTracker {
         kills: &[RecentBossKill],
         map_seed: i32,
     ) -> Option<(i32, String)> {
+        Self::select_last_boss_where(kills, map_seed, |_| true)
+    }
+
+    /// [`Self::select_last_boss_in_instance`] with an extra per-kill filter, for
+    /// callers that can rule candidates out (e.g. a fight that began after the bag
+    /// it would otherwise claim landed).
+    fn select_last_boss_where(
+        kills: &[RecentBossKill],
+        map_seed: i32,
+        keep: impl Fn(&RecentBossKill) -> bool,
+    ) -> Option<(i32, String)> {
         if map_seed == 0 {
             return None;
         }
         kills
             .iter()
-            .filter(|k| k.object_type > 0 && k.map_seed == map_seed)
+            .filter(|k| k.object_type > 0 && k.map_seed == map_seed && keep(k))
             .max_by_key(|k| (k.ended_at_ms, k.started_at_ms))
             .map(|k| (k.object_type, k.name.clone()))
+    }
+
+    /// Resolve a Moonlight Village bag to the boss it belongs to. The dungeon
+    /// pools its loot in the invisible `MV Dungeon Complete` emitter, so the bag
+    /// belongs to the run's final boss rather than to whatever entity proximity
+    /// found nearest: Kitsune Umi when her optional phase was engaged in this
+    /// instance (her own dropper emits everything from then on), otherwise the
+    /// dancer fought last.
+    fn resolve_mv_bag_with(
+        recent_boss_kills: &[RecentBossKill],
+        map_seed: i32,
+        now_ms: i64,
+        mv_umi_latched: bool,
+    ) -> Option<(i32, String)> {
+        if mv_umi_latched {
+            let name = get_asset_manager()
+                .object_name(crate::assets::MV_UMI_TYPE)
+                .unwrap_or_else(|| super::MV_UMI_NAME.to_string());
+            return Some((crate::assets::MV_UMI_TYPE, name));
+        }
+        // Only fights already under way when the bag landed can own it. The live
+        // path sees the kills in real time so this is mostly a no-op there, but the
+        // history backfill has the whole instance at once -- and Kitsune Umi's
+        // phase (and the loot it drops) comes *after* the dancers' clear.
+        Self::select_last_boss_where(recent_boss_kills, map_seed, |k| k.started_at_ms <= now_ms)
+    }
+
+    /// The name Loot History stores a bag's source under. Hard mode's Shatters
+    /// bosses keep their own name plus the `(HM)` variant suffix there, so
+    /// searching a boss finds every bag it dropped; the revealed names are
+    /// flavour for the fight card only. Combat History names those fights after
+    /// the revealed boss, so that spelling is translated back here.
+    fn loot_source_name(object_type: i32, name: String) -> String {
+        let Some(revealed) = crate::assets::shatters_hm_boss_name(object_type) else {
+            return name;
+        };
+        if name != revealed && name != format!("{revealed} (HM)") {
+            return name;
+        }
+        let original = crate::assets::shatters_boss_name(object_type)
+            .map(str::to_string)
+            .or_else(|| get_asset_manager().object_name(object_type))
+            .unwrap_or_else(|| revealed.to_string());
+        format!("{original} (HM)")
     }
 
     /// Process bag items into resolved item list.
@@ -1309,6 +1467,10 @@ impl LootTracker {
             // Try to get base name and append suffix
             if let Some(base_name) = mgr.object_name(mob_type) {
                 if ov.ends_with("HM") {
+                    // Loot History keeps the boss's own name so searching a boss
+                    // finds its hard-mode drops too; the revealed hard-mode names
+                    // live on the fight card only. The suffix keeps the variants
+                    // apart, like "(True)" does for true-variant bosses.
                     return format!("{} (HM)", base_name);
                 } else if ov.ends_with("TR") {
                     return format!("{} (True)", base_name);
@@ -1648,6 +1810,197 @@ mod tests {
     }
 
     #[test]
+    fn shatters_hm_loot_keeps_the_boss_name_for_searching() {
+        let king = super::super::boss_ids::ACCURSED_KING;
+        // The fight card names these fights after the revealed boss; Loot
+        // History keeps the boss's own name plus the variant suffix.
+        assert_eq!(
+            LootTracker::loot_source_name(king, "King Azamoth".to_string()),
+            "The Forgotten King (HM)"
+        );
+        assert_eq!(
+            LootTracker::loot_source_name(king, "King Azamoth (HM)".to_string()),
+            "The Forgotten King (HM)"
+        );
+        // Regular spells and other bosses pass through untouched.
+        assert_eq!(
+            LootTracker::loot_source_name(king, "The Forgotten King".to_string()),
+            "The Forgotten King"
+        );
+        assert_eq!(
+            LootTracker::loot_source_name(
+                super::super::boss_ids::BRIDGE_SENTINEL,
+                "King Azamoth".to_string()
+            ),
+            "King Azamoth"
+        );
+        assert_eq!(
+            LootTracker::loot_source_name(0x8200, "Stone Idol".to_string()),
+            "Stone Idol"
+        );
+    }
+
+    #[test]
+    fn shatters_hm_extra_bag_credits_the_last_boss() {
+        // Valen's second bag is emitted by an invisible spawner seconds after
+        // his death line, so proximity leaves it Unknown.
+        let kills = vec![kill(
+            42,
+            super::super::boss_ids::BRIDGE_SENTINEL,
+            "The Bridge Sentinel",
+            1_000,
+        )];
+        let picked = LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            4_000,
+            true,
+        );
+        assert_eq!(
+            picked,
+            Some((
+                super::super::boss_ids::BRIDGE_SENTINEL,
+                "The Bridge Sentinel (HM)".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn shatters_hm_extra_bag_picks_the_most_recent_kill() {
+        // King Azamoth's two bags both belong to the King, not to the earlier
+        // Twilight Archmage killed in the same instance.
+        let kills = vec![
+            kill(
+                42,
+                super::super::boss_ids::TWILIGHT_ARCHMAGE,
+                "Twilight Archmage",
+                1_000,
+            ),
+            kill(
+                42,
+                super::super::boss_ids::ACCURSED_KING,
+                "The Forgotten King",
+                5_000,
+            ),
+        ];
+        let picked = LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::Red,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            6_000,
+            true,
+        );
+        assert_eq!(
+            picked,
+            Some((
+                super::super::boss_ids::ACCURSED_KING,
+                "The Forgotten King (HM)".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn shatters_extra_bag_needs_hard_mode_and_the_right_dungeon() {
+        let kills = vec![kill(
+            42,
+            super::super::boss_ids::BRIDGE_SENTINEL,
+            "The Bridge Sentinel",
+            1_000,
+        )];
+        // Not a Hard Mode run: the bag belongs to whatever proximity found.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            4_000,
+            false,
+        )
+        .is_none());
+        // Another dungeon's Unknown bag is not touched.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            "Spider Den",
+            0,
+            42,
+            4_000,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn shatters_hm_extra_bag_leaves_attributed_and_public_bags_alone() {
+        let kills = vec![kill(
+            42,
+            super::super::boss_ids::BRIDGE_SENTINEL,
+            "The Bridge Sentinel",
+            1_000,
+        )];
+        // A bag proximity already pinned to a source keeps that source.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            33280,
+            42,
+            4_000,
+            true,
+        )
+        .is_none());
+        // Brown bags are player/public bags.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::Brown,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            4_000,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn shatters_hm_extra_bag_ignores_distant_kills() {
+        // A bag landing long after the boss died is not his.
+        let kills = vec![kill(
+            42,
+            super::super::boss_ids::BRIDGE_SENTINEL,
+            "The Bridge Sentinel",
+            1_000,
+        )];
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            42,
+            1_000 + KILL_CORRELATION_MAX_LAG_MS + 1,
+            true,
+        )
+        .is_none());
+        // Nor is one from another instance.
+        assert!(LootTracker::resolve_shatters_hm_bag(
+            &kills,
+            LootBagType::White,
+            super::super::THE_SHATTERS_NAME,
+            0,
+            7,
+            4_000,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
     fn kbn_override_fires_over_taunt_controller_prior() {
         // The full override path must reclassify a taunt-controller-attributed
         // Realm bag even though prior_mob_type != 0.
@@ -1659,6 +2012,7 @@ mod tests {
             &[KBN_BLUE_QUIVER],
             42,
             1000,
+            false,
         );
         assert_eq!(
             picked,
@@ -1682,6 +2036,7 @@ mod tests {
             &[KBN_BLUE_QUIVER],
             42,
             1000,
+            false,
         );
         assert!(picked.is_none());
     }
@@ -1762,6 +2117,196 @@ mod tests {
             kill_span(42, 20450, "Sage Genji", 3000, 9000),
         ];
         let picked = LootTracker::select_last_boss_in_instance(&kills, 42);
+        assert_eq!(picked, Some((20450, "Sage Genji".to_string())));
+    }
+
+    #[test]
+    fn mv_bag_pinned_to_a_dancer_resolves_to_the_dancer_fought_last() {
+        // The dancers stand on top of the invisible `MV Dungeon Complete` emitter
+        // when the clear loot lands, so proximity pins each bag to whichever of
+        // them is nearest -- Miko here -- even though Genji was defeated last (the
+        // card's "Main"). MV pools the run's loot, so the bag is the last boss's.
+        let kills = vec![
+            kill_span(42, 20451, "Dancer Miko", 1000, 9000),
+            kill_span(42, 20452, "Drummer Kaguya", 2000, 9000),
+            kill_span(42, 20450, "Sage Genji", 3000, 9000),
+        ];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            20451,
+            &[],
+            42,
+            9100,
+            false,
+        );
+        assert_eq!(picked, Some((20450, "Sage Genji".to_string())));
+    }
+
+    #[test]
+    fn mv_clear_bag_pinned_to_miko_goes_to_genji_in_a_real_run_shape() {
+        // Timestamps and seeds of an actual 2026-09-28 run whose loot was recorded
+        // against Dancer Miko: Miko and Kaguya finished together, Genji's (the
+        // "Main") phase ran after them, and the two bags landed inside it while
+        // proximity still had Miko's lingering body nearest.
+        let seed = 2052648976;
+        let kills = vec![
+            kill_span(seed, 20452, "Drummer Kaguya", 1790627139431, 1790627387794),
+            kill_span(seed, 20451, "Dancer Miko", 1790627224865, 1790627387794),
+            kill_span(seed, 20450, "Sage Genji", 1790627389415, 1790627613617),
+        ];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            20451, // proximity pinned the bag to Miko
+            &[],
+            seed,
+            1790627594617, // 2026-09-28 20:33:14 UTC, 19s before Genji's clear
+            false,
+        );
+        assert_eq!(picked, Some((20450, "Sage Genji".to_string())));
+    }
+
+    #[test]
+    fn mv_bag_pinned_to_the_invisible_dropper_resolves_to_the_last_boss() {
+        // The dropper itself is not a meaning-bearing source either: a bag
+        // proximity-tagged to it is still the run's pooled loot.
+        let kills = vec![
+            kill_span(42, 20451, "Dancer Miko", 1000, 9000),
+            kill_span(42, 20450, "Sage Genji", 3000, 9000),
+        ];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            super::super::MV_DUNGEON_COMPLETE_OBJECT_TYPE,
+            &[],
+            42,
+            9100,
+            false,
+        );
+        assert_eq!(picked, Some((20450, "Sage Genji".to_string())));
+    }
+
+    #[test]
+    fn mv_bag_pinned_to_a_fishing_crate_keeps_its_source() {
+        // Fishing loot is its own crate, not the run's pooled boss loot: a bag
+        // proximity-attributed to the crate is left alone (fishing is available
+        // once the dancers are done, so the last-fought boss must not steal it).
+        let kills = vec![kill_span(42, 20450, "Sage Genji", 1000, 9000)];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            20789, // MV Fishing Loot 1
+            &[],
+            42,
+            9100,
+            false,
+        );
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn mv_fishing_bag_left_unknown_still_lands_on_its_crate() {
+        // The crate is the instance's latest kill when a fishing bag arrives, and
+        // that is exactly the signal that identifies it: an Unknown fishing bag
+        // must keep resolving to the crate, not to the dancer that cleared the run.
+        let kills = vec![
+            kill_span(42, 20450, "Sage Genji", 1000, 9000),
+            kill_span(42, 20791, "MV Fishing Loot 3", 10_000, 20_000),
+        ];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            0,
+            &[],
+            42,
+            20_100,
+            false,
+        );
+        assert_eq!(picked, Some((20791, "MV Fishing Loot 3".to_string())));
+    }
+
+    #[test]
+    fn mv_umi_latch_beats_the_last_dancer() {
+        // Kitsune Umi is engaged after the dancers, so her dropper's loot must be
+        // hers even though the dancers were completed (and the Umi fight is only
+        // completed *by* that loot, so it cannot be in the recorded kills yet).
+        let kills = vec![kill_span(42, 20450, "Sage Genji", 1000, 9000)];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            super::super::MV_UMI_COMPLETE_OBJECT_TYPE,
+            &[],
+            42,
+            9100,
+            true,
+        );
+        assert_eq!(picked.as_ref().map(|(t, _)| *t), Some(20493));
+    }
+
+    #[test]
+    fn mv_umi_with_a_recorded_fight_is_attributed_to_umi() {
+        // Escaped (or unfinished) Umi runs still have her fight on record in the
+        // instance; the last-boss rule alone would pick the last dancer.
+        let kills = vec![
+            kill_span(42, 20450, "Sage Genji", 1000, 9000),
+            kill_span(42, 20493, "Kitsune Umi", 10_000, 20_000),
+        ];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            0,
+            &[],
+            42,
+            20_100,
+            false,
+        );
+        assert_eq!(picked.as_ref().map(|(t, _)| *t), Some(20493));
+    }
+
+    #[test]
+    fn mv_bag_dropped_before_umi_was_engaged_stays_with_the_dancer() {
+        // The history backfill sees a whole instance at once, where Umi's recorded
+        // fight exists from the start. The dancers' clear loot predates her fight,
+        // so it must not be re-attributed to her.
+        let kills = vec![
+            kill_span(42, 20450, "Sage Genji", 1000, 9000),
+            kill_span(42, 20493, "Kitsune Umi", 30_000, 40_000),
+        ];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            0,
+            &[],
+            42,
+            9100, // the dancer clear, long before Umi
+            false,
+        );
+        assert_eq!(picked, Some((20450, "Sage Genji".to_string())));
+    }
+
+    #[test]
+    fn mv_umi_latch_does_not_leak_into_another_instance() {
+        // The latch is seed-scoped: a stale flag must not steal a later run's bag.
+        let kills = vec![kill_span(7, 20450, "Sage Genji", 1000, 9000)];
+        let picked = LootTracker::resolve_boss_override_with(
+            &kills,
+            LootBagType::White,
+            super::super::MOONLIGHT_VILLAGE_NAME,
+            20451,
+            &[],
+            7,
+            9100,
+            false,
+        );
         assert_eq!(picked, Some((20450, "Sage Genji".to_string())));
     }
 
@@ -2442,6 +2987,7 @@ mod tests {
             &[super::super::MARK_OF_THE_BARKEEP_ITEM_ID],
             0,
             0,
+            false,
         );
         assert_eq!(
             hit,
@@ -2463,6 +3009,7 @@ mod tests {
             &[super::super::MARK_OF_THE_BARKEEP_ITEM_ID],
             0,
             0,
+            false,
         );
         assert_eq!(
             hit.as_ref().map(|(t, _)| *t),

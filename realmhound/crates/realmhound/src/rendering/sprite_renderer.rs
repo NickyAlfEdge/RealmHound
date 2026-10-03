@@ -844,6 +844,17 @@ impl SpriteRenderer {
         true
     }
 
+    /// Like [`Self::draw_embedded_icon`] but scales the icon to fit `rect` while
+    /// preserving its aspect ratio, centered. Use for non-square icons (e.g. the
+    /// tall Moonlight Village spirit flame) that would otherwise be stretched to
+    /// the caller's rect shape.
+    pub fn draw_embedded_icon_fitted(&self, ui: &egui::Ui, icon: EmbeddedIcon, rect: Rect) -> bool {
+        let Some(fitted) = self.embedded_scaled_rect(ui, icon, rect) else {
+            return false;
+        };
+        self.draw_embedded_icon(ui, icon, fitted)
+    }
+
     /// Like [`Self::draw_embedded_icon`] but multiplies the icon by `tint`
     /// (alpha-masked), so callers can dim an embedded icon (e.g. a claimed
     /// mission's objective marker) without a covering rect.
@@ -1833,6 +1844,24 @@ impl SpriteRenderer {
         };
         let dpi = ui.ctx().pixels_per_point();
         (tw as f32) > rect.width() * dpi || (th as f32) > rect.height() * dpi
+    }
+
+    /// Draw a sprite into a fixed cell the way a boss portrait wants it: crisp
+    /// integer scaling while the art fits the cell, and the fractional,
+    /// aspect-preserving fit once the art is physically larger. Boss sheets vary
+    /// widely -- The Shattered Queen's statue art fills a 32x32 frame, most
+    /// bosses' trimmed art is about 20px -- so without this an oversized portrait
+    /// is drawn at 1x and spills over its row instead of matching the text height.
+    pub fn draw_outlined_sprite_fitting_cell(
+        &mut self,
+        ui: &egui::Ui,
+        item_id: i32,
+        rect: Rect,
+    ) -> bool {
+        if self.sprite_exceeds_cell(item_id, ui, rect) {
+            return self.draw_outlined_sprite_in_rect_filled(ui, item_id, rect);
+        }
+        self.draw_outlined_sprite_in_rect(ui, item_id, rect)
     }
 
     /// Logical size a sprite renders at for a `target` height, matching the

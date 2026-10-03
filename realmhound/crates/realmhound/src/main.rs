@@ -27,6 +27,7 @@ mod app;
 mod audio;
 mod capture_manager;
 mod client_process;
+mod clipboard;
 mod discovery;
 mod enchant_sound;
 mod event_log;

@@ -239,6 +239,11 @@ mod tests {
             killed: true,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
+            leisurely: false,
+            petless: false,
+            spectral_hm: false,
+            shatters_hm: false,
             participants: vec![sample_participant(Some(300))],
         }
     }

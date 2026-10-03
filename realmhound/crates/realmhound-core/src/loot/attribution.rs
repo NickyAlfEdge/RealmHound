@@ -10,16 +10,14 @@ use crate::protocol::data::WorldPosData;
 pub mod boss_ids {
     /// Kitsune Umi (Moonlight Village)
     pub const UMI_KITSUNE: i32 = 20493;
-    /// Dancer Miko (Moonlight Village)
-    pub const MIKO_DANCER: i32 = 20451;
     /// Void Entity (The Void)
     pub const VOID_ENTITY: i32 = 45076;
     /// Bridge Sentinel (The Shatters)
-    pub const BRIDGE_SENTINEL: i32 = 29003;
+    pub const BRIDGE_SENTINEL: i32 = crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE;
     /// Twilight Archmage (The Shatters)
-    pub const TWILIGHT_ARCHMAGE: i32 = 29021;
+    pub const TWILIGHT_ARCHMAGE: i32 = crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE;
     /// Accursed King (The Shatters)
-    pub const ACCURSED_KING: i32 = 29039;
+    pub const ACCURSED_KING: i32 = crate::assets::SHATTERS_KING_TYPE;
 }
 
 /// Variant suffixes for hard mode / true variant bosses.
@@ -75,6 +73,18 @@ pub struct LootAttributionManager {
 
     /// Fabricated entities created this tick for attribution
     fabricated_this_tick: Vec<LootEntity>,
+
+    /// Map seed of the instance in which Kitsune Umi was engaged (0 = none).
+    /// Her loot is emitted by the invisible `MV Umi Complete` dropper, but the
+    /// fight itself never completes until that loot is recorded, so the bag
+    /// cannot be resolved from recorded kills -- it is resolved from this latch.
+    mv_umi_instance: i32,
+
+    /// Map seed of the instance in which The Shatters was played in Hard Mode
+    /// (0 = none). Hard Mode is announced only by the renamed bosses' death
+    /// lines, and the *extra* bag each of them drops arrives from an invisible
+    /// spawner after those lines, so the bag cannot be resolved by proximity.
+    hm_shatters_instance: i32,
 }
 
 impl LootAttributionManager {
@@ -87,10 +97,13 @@ impl LootAttributionManager {
             remaining_ticks: 0,
             current_tick_seed: -1,
             fabricated_this_tick: Vec::new(),
+            mv_umi_instance: 0,
+            hm_shatters_instance: 0,
         }
     }
 
-    /// Clear all state (on map change).
+    /// Clear all state (on map change). The Kitsune Umi latch is per-instance
+    /// state too, so a new instance starts with it cleared.
     pub fn clear(&mut self) {
         self.next_tick_mob_id = -1;
         self.next_tick_seed = -1;
@@ -98,6 +111,8 @@ impl LootAttributionManager {
         self.remaining_ticks = 0;
         self.current_tick_seed = -1;
         self.fabricated_this_tick.clear();
+        self.mv_umi_instance = 0;
+        self.hm_shatters_instance = 0;
     }
 
     /// Handle a text packet to check for attribution triggers.
@@ -105,6 +120,18 @@ impl LootAttributionManager {
     ///
     pub fn handle_text_packet(&mut self, name: &str, text: &str, map_seed: i32) -> bool {
         if let Some(trigger) = Self::check_text_trigger(name, text) {
+            // Kitsune Umi announces her phase with this line, which is the only
+            // in-band signal that the optional secret boss was engaged. Latch the
+            // instance: everything her invisible dropper emits afterwards is hers.
+            if trigger.mob_id == boss_ids::UMI_KITSUNE && map_seed != 0 {
+                self.mv_umi_instance = map_seed;
+            }
+            // Hard-mode variants only exist in The Shatters, so an HM trigger
+            // latches the instance as a Hard Mode run. The extra bag each HM
+            // boss drops arrives later, from an invisible spawner.
+            if trigger.variant == Some(VariantSuffix::HardMode) && map_seed != 0 {
+                self.hm_shatters_instance = map_seed;
+            }
             self.open_window(trigger.mob_id, map_seed, trigger.ticks, trigger.variant);
             true
         } else {
@@ -112,21 +139,25 @@ impl LootAttributionManager {
         }
     }
 
+    /// Whether Kitsune Umi was engaged in the instance identified by `map_seed`.
+    pub fn mv_umi_latched(&self, map_seed: i32) -> bool {
+        map_seed != 0 && self.mv_umi_instance == map_seed
+    }
+
+    /// Whether The Shatters instance identified by `map_seed` was played in
+    /// Hard Mode (see [`Self::hm_shatters_instance`]).
+    pub fn hm_shatters_latched(&self, map_seed: i32) -> bool {
+        map_seed != 0 && self.hm_shatters_instance == map_seed
+    }
+
     /// Check if a text packet matches any attribution trigger.
     pub fn check_text_trigger(name: &str, text: &str) -> Option<AttributionTrigger> {
-        // Kitsune Umi (Moonlight Village)
+        // Kitsune Umi (Moonlight Village). The line is her phase's opening
+        // announcement, so the window opens as she is engaged; the persistent
+        // latch in `handle_text_packet` covers the loot that lands much later.
         if name == "#Kitsune Umi" && text == "This fully concludes the Moonlight Festival!" {
             return Some(AttributionTrigger {
                 mob_id: boss_ids::UMI_KITSUNE,
-                ticks: 2,
-                variant: None,
-            });
-        }
-
-        // Dancer Miko (Moonlight Village)
-        if name == "#Dancer Miko" && text == "Thank you all for coming tonight." {
-            return Some(AttributionTrigger {
-                mob_id: boss_ids::MIKO_DANCER,
                 ticks: 2,
                 variant: None,
             });
@@ -163,8 +194,11 @@ impl LootAttributionManager {
             });
         }
 
-        // Bridge Sentinel HM (Valen the Unbreakable)
-        if name == "#Valen the Unbreakable"
+        // Bridge Sentinel HM (Valen the Unbreakable). The renamed boss is the
+        // same object as the regular one, so the name it speaks under is the only
+        // signal; matching it tolerates the chat framing.
+        if crate::assets::shatters_hm_named_boss(name)
+            == Some(crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE)
             && text == "I see now... my strength could not have held against this growing power."
         {
             return Some(AttributionTrigger {
@@ -186,8 +220,9 @@ impl LootAttributionManager {
         }
 
         // Twilight Archmage HM (Nox the Wild Shadow)
-        if name == "#Nox the Wild Shadow" 
-            && text == "Unworthy as you are to know what hides beyond, I've had... an epiphany. So in case you've failed to realize..." 
+        if crate::assets::shatters_hm_named_boss(name)
+            == Some(crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE)
+            && text == "Unworthy as you are to know what hides beyond, I've had... an epiphany. So in case you've failed to realize..."
         {
             return Some(AttributionTrigger {
                 mob_id: boss_ids::TWILIGHT_ARCHMAGE,
@@ -208,7 +243,9 @@ impl LootAttributionManager {
         }
 
         // King Azamoth HM
-        if name == "#King Azamoth" && text == "This fate is mine to bear... not hers." {
+        if crate::assets::shatters_hm_named_boss(name) == Some(crate::assets::SHATTERS_KING_TYPE)
+            && text == "This fate is mine to bear... not hers."
+        {
             return Some(AttributionTrigger {
                 mob_id: boss_ids::ACCURSED_KING,
                 ticks: 2,
@@ -283,12 +320,10 @@ impl LootAttributionManager {
                 fab.loot_mob_id_override = Some(format!("{}{}", fab.object_type, suffix));
             }
         } else if self.fabricated_this_tick.len() > 1 {
-            // Multiple fabricated without forced variant = HM for Umi/Miko
+            // Multiple fabricated without forced variant = the hard-mode twin
             for fab in &mut self.fabricated_this_tick {
                 if fab.object_type == boss_ids::UMI_KITSUNE {
                     fab.loot_mob_id_override = Some("20493HM".to_string());
-                } else if fab.object_type == boss_ids::MIKO_DANCER {
-                    fab.loot_mob_id_override = Some("20451HM".to_string());
                 }
             }
         }
@@ -376,6 +411,35 @@ mod tests {
     }
 
     #[test]
+    fn hard_mode_shatters_latches_the_instance() {
+        let mut mgr = LootAttributionManager::new();
+        // Valen the Unbreakable's death line only happens on a Hard Mode run.
+        assert!(mgr.handle_text_packet(
+            "#Valen the Unbreakable",
+            "I see now... my strength could not have held against this growing power.",
+            12345
+        ));
+        assert!(mgr.hm_shatters_latched(12345));
+        assert!(!mgr.hm_shatters_latched(999));
+        assert!(!mgr.hm_shatters_latched(0));
+    }
+
+    #[test]
+    fn regular_shatters_does_not_latch_hard_mode() {
+        let mut mgr = LootAttributionManager::new();
+        assert!(mgr.handle_text_packet(
+            "#The Bridge Sentinel",
+            "I tried to protect you... I have failed.",
+            12345
+        ));
+        assert!(!mgr.hm_shatters_latched(12345));
+        // The latch is per-instance: leaving the dungeon clears it, as does
+        // re-entering.
+        mgr.clear();
+        assert!(!mgr.hm_shatters_latched(12345));
+    }
+
+    #[test]
     fn test_void_entity_trigger() {
         let trigger = LootAttributionManager::check_text_trigger(
             "#Void Entity",
@@ -405,6 +469,37 @@ mod tests {
         assert!(triggered);
         assert!(mgr.has_attribution_window());
         assert_eq!(mgr.attribution_mob_id(), Some(boss_ids::UMI_KITSUNE));
+        // Engaging Umi latches her instance: her dropper's loot lands long after
+        // the 2-tick window, and her fight is never completed before it.
+        assert!(mgr.mv_umi_latched(12345));
+        assert!(!mgr.mv_umi_latched(999));
+        assert!(!mgr.mv_umi_latched(0));
+    }
+
+    #[test]
+    fn umi_latch_is_per_instance() {
+        let mut mgr = LootAttributionManager::new();
+        mgr.handle_text_packet(
+            "#Kitsune Umi",
+            "This fully concludes the Moonlight Festival!",
+            12345,
+        );
+        assert!(mgr.mv_umi_latched(12345));
+
+        // A new instance (or a disconnect) starts with no Umi engagement.
+        mgr.clear();
+        assert!(!mgr.mv_umi_latched(12345));
+    }
+
+    #[test]
+    fn non_umi_triggers_do_not_latch_umi() {
+        let mut mgr = LootAttributionManager::new();
+        mgr.handle_text_packet(
+            "#Void Entity",
+            "You fools... You can never truly defeat me! I am in all of you! I AM all of you!",
+            12345,
+        );
+        assert!(!mgr.mv_umi_latched(12345));
     }
 
     #[test]

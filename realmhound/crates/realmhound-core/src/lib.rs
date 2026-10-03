@@ -39,6 +39,7 @@ pub mod account_stats;
 pub mod api;
 pub mod assets;
 pub mod capture;
+pub mod chat_ping;
 pub mod combat;
 pub mod crypto;
 pub mod dungeon_modifiers;

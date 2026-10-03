@@ -306,6 +306,28 @@ pub struct CompletedFight {
     /// Eyesmall), the number of distinct member instances seen in the world this
     /// run. `None` for ordinary boss fights. Drives the "xN" count on the row.
     pub aux_member_count: Option<i32>,
+    /// Moonlight Village spirits collected during this fight (0 for every other
+    /// boss, and for fights recorded before spirit tracking). Each spirit is one
+    /// `MV Total Counter` object released at the end of a dance/Umi phase; the
+    /// run total drives the dungeon's loot tier.
+    pub spirits: i32,
+    /// Whether the run was played in Moonlight Village's Leisurely Mode (the
+    /// group consumed a Tofu Delicacy), which shortens the phases and reduces
+    /// the loot. False for every other dungeon.
+    pub leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode (they
+    /// attacked the Challenge Gate, which pet-stasises them for the run). False
+    /// for every other dungeon.
+    pub petless: bool,
+    /// Whether this Spectral Penitentiary fight was hard mode: a mini-boss is
+    /// hard mode when it shouted its objective-cleared taunt, and Soulwarden
+    /// Murcian when both of the run's mini-bosses were. The dungeon is hard mode
+    /// exactly when Murcian's row is; false for every other dungeon.
+    pub spectral_hm: bool,
+    /// Whether this Shatters fight happened in hard mode, i.e. the group
+    /// destroyed the Stone Idol (or The Source) that unlocks the renamed
+    /// bosses. Only meaningful for The Shatters' main bosses; false otherwise.
+    pub shatters_hm: bool,
     /// Per-participant contributions, sorted by damage descending on finalize.
     pub participants: Vec<FightParticipant>,
 }

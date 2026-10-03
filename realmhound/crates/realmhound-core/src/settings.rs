@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Current settings file version for migration support.
-const SETTINGS_VERSION: u32 = 7;
+const SETTINGS_VERSION: u32 = 8;
 
 /// Rename an unparseable data file to a timestamped `.corrupt-<ts>.bak` sibling
 /// so a single bad field can't silently wipe the user's data on the next save.
@@ -312,10 +312,85 @@ pub struct LiveFeedSettings {
     #[serde(default)]
     pub xp_label: XpLabel,
 
+    /// Minimum loot bonus (percent) for a callout to include the loot tag.
+    /// Defaults to 5.
+    #[serde(default = "default_loot_threshold")]
+    pub loot_threshold: i32,
+
+    /// Minimum dust bonus (percent) for a callout to include the dust tag.
+    /// Defaults to 10.
+    #[serde(default = "default_dust_threshold")]
+    pub dust_threshold: i32,
+
+    /// Minimum XP bonus (percent) for a callout to include the XP tag.
+    /// Defaults to 10.
+    #[serde(default = "default_xp_threshold")]
+    pub xp_threshold: i32,
+
+    /// Whether callouts name the mods the game applies to an instance by itself
+    /// during a special event (see
+    /// [`is_event_preset_modifier`](crate::dungeon_modifiers::is_event_preset_modifier)),
+    /// e.g. `turrets off` on every Kogbold Steamworks run. Defaults to `true`;
+    /// turning it off drops those tags, since the group did not roll them (the
+    /// numeric loot/dust/xp bonuses they grant are still called).
+    #[serde(default = "default_true")]
+    pub call_event_mods: bool,
+
+    /// Whether to also recognize event mods from the dungeons the user enters:
+    /// a mod carried by the last [`Self::learn_event_mods_runs`] spawns of one
+    /// dungeon, in at least one of which it was the only mod, is treated as an
+    /// event mod for the rest of the session. This is how an event that shipped
+    /// no table update is picked up. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub learn_event_mods: bool,
+
+    /// How many consecutive spawns of one dungeon must carry a mod before
+    /// [`Self::learn_event_mods`] treats it as an event mod. Three tells an
+    /// event mod from a coincidence while still adapting within a session;
+    /// higher is stricter. Clamped to 2..=10. Defaults to 3.
+    #[serde(default = "default_learn_event_mods_runs")]
+    pub learn_event_mods_runs: u32,
+
+    /// How the realm a dungeon was entered from is named in its callout.
+    /// Defaults to [`RealmStatusMode::None`].
+    #[serde(default)]
+    pub realm_status: RealmStatusMode,
+
+    /// Minimum realm score (percent) for [`RealmStatusMode::Score`] to append
+    /// `in <n>% realm`. Defaults to 33.
+    #[serde(default = "default_realm_status_threshold")]
+    pub realm_status_threshold: i32,
+
+    /// What marks a dungeon call as opened in the Nexus (a key popped in the
+    /// Nexus, Vault, Guild Hall or Bazaar, or an instance joined into that runs on
+    /// the Nexus server). Defaults to [`NexusMarker::None`].
+    ///
+    /// Independent of [`Self::realm_status`], which covers portals used in a
+    /// realm; realm entries reached from a hub keep their own map names and are
+    /// never Nexus entries.
+    ///
+    /// Older files store this as the boolean `opened_in_nexus`, which the load
+    /// migration reads as `true` = [`NexusMarker::InNexus`].
+    #[serde(default)]
+    pub nexus_marker: NexusMarker,
+
+    /// Deprecated: superseded by [`Self::nexus_marker`], whose dropdown replaced
+    /// this boolean (on meant `in nex`). Read so an existing file keeps its
+    /// choice; never written again.
+    #[serde(default, skip_serializing)]
+    pub opened_in_nexus: bool,
+
     /// Whether loot/dust/xp callout values include the `%` sign. Defaults to
     /// `false` (e.g. `15 lb`).
     #[serde(default)]
     pub callout_percent: bool,
+
+    /// Whether entering a joinable dungeon copies its callout to the clipboard
+    /// by itself, without the user clicking the feed entry. The clipboard is
+    /// cleared again when the dungeon can no longer be joined, when the player
+    /// moves on, or when the realm closes. Defaults to `false`.
+    #[serde(default)]
+    pub auto_clipboard_dungeon_calls: bool,
 
     /// Whether event clipboard callouts use the curated short nickname or the
     /// full event name. Defaults to [`DungeonNameStyle::Short`].
@@ -641,7 +716,54 @@ pub enum DungeonNameStyle {
     Short,
     /// Use the full dungeon name, lowercased (e.g. `lost halls`).
     Full,
+    /// Omit the name entirely, calling only the reward/mod tags (for
+    /// dungeon-specific parties where the dungeon is already known).
+    None,
 }
+
+/// How the realm a dungeon was entered from is appended to its callout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RealmStatusMode {
+    /// Never mention the realm.
+    #[default]
+    None,
+    /// Append `in a closing realm` for dungeons entered from a realm that is
+    /// past [`CLOSING_REALM_PERCENT`].
+    Closing,
+    /// Append `in <n>% realm` for dungeons entered from a realm that is at or
+    /// past the configured threshold (see
+    /// [`LiveFeedSettings::realm_status_threshold`]).
+    Score,
+}
+
+/// The Nexus marker a dungeon call carries when it was opened in a hub space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NexusMarker {
+    /// Never mention the Nexus (the default).
+    #[default]
+    None,
+    /// Append `nex`.
+    Nex,
+    /// Append `in nexus`.
+    InNexus,
+}
+
+impl NexusMarker {
+    /// The text appended to the callout, or `None` when no marker is wanted.
+    pub fn text(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Nex => Some("nex"),
+            Self::InNexus => Some("in nexus"),
+        }
+    }
+}
+
+/// Realm completion (percent) from which a realm counts as closing.
+///
+/// Above this the realm can no longer be joined from the outside, which is what
+/// the "in a closing realm" callout warns about.
+pub const CLOSING_REALM_PERCENT: i32 = 90;
 
 /// How reward bonuses are labeled in the clipboard callout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -729,6 +851,39 @@ pub struct RewardModEntry {
 fn default_event_join() -> JoinPosition {
     JoinPosition::None
 }
+
+/// Default minimum loot bonus for a callout's loot tag (5%).
+fn default_loot_threshold() -> i32 {
+    5
+}
+
+/// Default minimum dust bonus for a callout's dust tag (10%).
+fn default_dust_threshold() -> i32 {
+    10
+}
+
+/// Default minimum XP bonus for a callout's XP tag (10%).
+fn default_xp_threshold() -> i32 {
+    10
+}
+
+/// Default minimum realm score for the `in <n>% realm` callout tag (33%).
+fn default_realm_status_threshold() -> i32 {
+    33
+}
+
+/// Default number of consecutive dungeon spawns compared when recognizing an
+/// event mod from the user's own runs (3).
+fn default_learn_event_mods_runs() -> u32 {
+    LEARN_EVENT_MOD_RUNS_DEFAULT
+}
+
+/// Shipped [`LiveFeedSettings::learn_event_mods_runs`].
+pub const LEARN_EVENT_MOD_RUNS_DEFAULT: u32 = 3;
+
+/// Bounds of [`LiveFeedSettings::learn_event_mods_runs`]: at least two runs are
+/// needed to see a pattern at all, and ten is as far back as a session keeps.
+pub const LEARN_EVENT_MOD_RUNS_RANGE: std::ops::RangeInclusive<u32> = 2..=10;
 
 /// The default reward-modifier callout tags, in emission order. Named tags are
 /// enabled; the rarely-called mods ship disabled with a blank call so users can
@@ -839,7 +994,18 @@ impl Default for LiveFeedSettings {
             loot_label: LootLabel::default(),
             dust_label: DustLabel::default(),
             xp_label: XpLabel::default(),
+            loot_threshold: default_loot_threshold(),
+            dust_threshold: default_dust_threshold(),
+            xp_threshold: default_xp_threshold(),
+            call_event_mods: true,
+            learn_event_mods: true,
+            learn_event_mods_runs: default_learn_event_mods_runs(),
+            realm_status: RealmStatusMode::default(),
+            realm_status_threshold: default_realm_status_threshold(),
+            nexus_marker: NexusMarker::None,
+            opened_in_nexus: false,
             callout_percent: false,
+            auto_clipboard_dungeon_calls: false,
             event_name_style: DungeonNameStyle::default(),
             event_add_upcoming: true,
             reward_mods: default_reward_mods(),
@@ -1927,6 +2093,25 @@ pub struct SoundSettings {
     #[serde(default)]
     pub trade: bool,
 
+    /// Play a ping when a chat message from another player mentions the local
+    /// character name (IGN) as a whole word. Only the message body is searched,
+    /// never the author or the whisper recipient. Off by default.
+    #[serde(default)]
+    pub ign_mention: bool,
+
+    /// Play a ping when a chat message contains the trigger text configured in
+    /// [`Self::custom_chat_text`] as a whole word. Off by default.
+    #[serde(default)]
+    pub custom_chat: bool,
+
+    /// Trigger text for the custom chat ping. Empty by default, so no custom
+    /// ping fires until the user sets a word (the settings field shows `abyss` as
+    /// its example). Matched case-insensitively against whole words, so it never
+    /// fires on a substring such as `abyssal`. Capped at
+    /// [`crate::chat_ping::CUSTOM_CHAT_TEXT_MAX`] characters by the settings UI.
+    #[serde(default)]
+    pub custom_chat_text: String,
+
     /// Play the Dimitus alert sound when entering a dungeon with the Dimitus
     /// modifier (golden outline). Off by default.
     #[serde(default)]
@@ -2214,6 +2399,10 @@ impl Default for SoundSettings {
             guild: false,
             pm: false,
             trade: false,
+            // Extra chat pings (IGN mention, custom trigger) are opt-in
+            ign_mention: false,
+            custom_chat: false,
+            custom_chat_text: String::new(),
             // Dimitus dungeon alert disabled by default
             dimitus_dungeon: false,
             // Bad-mod warning disabled by default
@@ -2396,6 +2585,13 @@ impl Settings {
             self.taskbar.mission_overrides.clear();
             self.taskbar.quest_overrides.clear();
         }
+        if self.version < 8 {
+            // The Nexus switch became a dropdown whose default is no marker at
+            // all: carry the old boolean across as the `in nexus` text it appended.
+            if self.live_feed.opened_in_nexus {
+                self.live_feed.nexus_marker = NexusMarker::InNexus;
+            }
+        }
         self.version = SETTINGS_VERSION;
     }
 
@@ -2547,6 +2743,33 @@ mod tests {
     }
 
     #[test]
+    fn chat_ping_sounds_default_off_and_survive_missing_json() {
+        // Both extra chat pings are opt-in and the trigger word starts empty.
+        let d = SoundSettings::default();
+        assert!(!d.ign_mention);
+        assert!(!d.custom_chat);
+        assert!(d.custom_chat_text.is_empty());
+
+        // Back-compat: configs saved before these options existed still load.
+        let legacy = r#"{ "volume": 0.5, "whitebag": true, "pm": true, "guild": true }"#;
+        let parsed: SoundSettings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.pm && parsed.guild);
+        assert!(!parsed.ign_mention);
+        assert!(!parsed.custom_chat);
+        assert!(parsed.custom_chat_text.is_empty());
+
+        // Round-trip preserves both toggles and the configured trigger.
+        let mut s = SoundSettings::default();
+        s.ign_mention = true;
+        s.custom_chat = true;
+        s.custom_chat_text = "abyss".into();
+        let back: SoundSettings =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.ign_mention && back.custom_chat);
+        assert_eq!(back.custom_chat_text, "abyss");
+    }
+
+    #[test]
     fn test_default_settings() {
         let settings = Settings::default();
         assert_eq!(settings.version, SETTINGS_VERSION);
@@ -2670,6 +2893,44 @@ mod tests {
     }
 
     #[test]
+    fn callout_extras_default_on_files_that_lack_them() {
+        // A file written before the callout options existed: every new field
+        // takes its shipped default rather than failing to load.
+        let old_json = r#"{
+            "version": 7,
+            "live_feed": { "loot_label": "Lb", "dust_label": "Db" }
+        }"#;
+        let loaded: Settings = serde_json::from_str(old_json).unwrap();
+        let lf = &loaded.live_feed;
+        assert_eq!(lf.loot_threshold, 5);
+        assert_eq!(lf.dust_threshold, 10);
+        assert_eq!(lf.xp_threshold, 10);
+        assert!(
+            lf.call_event_mods,
+            "event preset mods are called by default"
+        );
+        assert!(lf.learn_event_mods, "runs are learned from by default");
+        assert_eq!(lf.learn_event_mods_runs, 3);
+        assert_eq!(lf.realm_status, RealmStatusMode::None);
+        assert_eq!(lf.realm_status_threshold, 33);
+        assert!(
+            lf.nexus_marker == NexusMarker::None,
+            "dungeons opened in the nexus carry no marker by default"
+        );
+        assert!(
+            !lf.auto_clipboard_dungeon_calls,
+            "auto clipboard is off by default"
+        );
+        // The name-less dungeon style round-trips.
+        let json = serde_json::to_string(&DungeonNameStyle::None).unwrap();
+        assert_eq!(json, "\"None\"");
+        assert_eq!(
+            serde_json::from_str::<DungeonNameStyle>(&json).unwrap(),
+            DungeonNameStyle::None
+        );
+    }
+
+    #[test]
     fn v5_migration_disables_taskbar_tracking_for_hidden() {
         // Hidden missions/quests must have their Taskbar tracking turned off,
         // without clobbering an explicit prior choice.
@@ -2755,6 +3016,37 @@ mod tests {
             s.taskbar.quest_tracked("qX"),
             "override cleared, inherits on"
         );
+    }
+
+    #[test]
+    fn v8_migration_carries_the_nexus_switch_into_the_dropdown() {
+        // Files written before the dropdown store a boolean, where "on" meant the
+        // `in nex` text. Loading one keeps that choice as `in nexus`, and the next
+        // save writes only the new field.
+        let legacy = r#"{ "version": 7, "live_feed": { "opened_in_nexus": true } }"#;
+        let loaded = Settings::from_json(legacy).expect("legacy settings parse");
+        assert_eq!(loaded.live_feed.nexus_marker, NexusMarker::InNexus);
+        assert_eq!(loaded.version, SETTINGS_VERSION);
+
+        let off = r#"{ "version": 7, "live_feed": { "opened_in_nexus": false } }"#;
+        assert_eq!(
+            Settings::from_json(off).unwrap().live_feed.nexus_marker,
+            NexusMarker::None
+        );
+
+        let saved = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            !saved.contains("opened_in_nexus"),
+            "the deprecated boolean must not be written back: {saved}"
+        );
+        assert!(saved.contains("\"nexus_marker\":\"InNexus\""), "{saved}");
+    }
+
+    #[test]
+    fn nexus_marker_options_name_the_nexus() {
+        assert_eq!(NexusMarker::None.text(), None);
+        assert_eq!(NexusMarker::Nex.text(), Some("nex"));
+        assert_eq!(NexusMarker::InNexus.text(), Some("in nexus"));
     }
 
     #[test]

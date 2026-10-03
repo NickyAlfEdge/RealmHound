@@ -14,7 +14,7 @@ use super::types::{
 };
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 50;
+pub const SCHEMA_VERSION: i32 = 56;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -71,6 +71,27 @@ pub struct FightRecord {
     /// the number of distinct member instances seen this run; drives the "xN"
     /// count. `None` for ordinary boss fights and legacy rows.
     pub aux_member_count: Option<i32>,
+    /// Moonlight Village spirits collected during this fight (0 for other bosses
+    /// and for rows recorded before spirit tracking).
+    pub spirits: i32,
+    /// Whether the fight was played in Moonlight Village's Leisurely Mode (a
+    /// Tofu Delicacy was consumed). False for every other dungeon and for rows
+    /// recorded before the mode was tracked.
+    pub leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode (they
+    /// whacked the Challenge Gate, which pet-stasises them for the run). False
+    /// for every other dungeon and for rows recorded before the mode was
+    /// tracked.
+    pub petless: bool,
+    /// Whether this Spectral Penitentiary fight was hard mode (its mini-bosses'
+    /// objective-cleared taunts; Soulwarden Murcian only when both taunted).
+    /// False for every other dungeon and for rows recorded before the mode was
+    /// tracked.
+    pub spectral_hm: bool,
+    /// Whether the fight was a Shatters hard-mode variant (the renamed bosses
+    /// are revealed only in hard mode). False for every other dungeon and for
+    /// rows recorded before the mode was tracked.
+    pub shatters_hm: bool,
     /// Participants (sorted by damage descending as stored).
     pub participants: Vec<ParticipantRecord>,
 }
@@ -79,6 +100,11 @@ impl FightRecord {
     /// Fight duration in milliseconds.
     pub fn duration_ms(&self) -> i64 {
         (self.ended_at - self.started_at).max(0)
+    }
+
+    /// Total attributed damage across the fight's participants.
+    pub fn total_damage(&self) -> i64 {
+        self.participants.iter().map(|p| p.damage).sum()
     }
 }
 
@@ -113,6 +139,19 @@ pub struct EncounterRecord {
     pub ended_at: i64,
     /// Whether the anchor (or any phase) was killed.
     pub killed: bool,
+    /// Whether the run was played in Moonlight Village's Leisurely Mode (a Tofu
+    /// Delicacy was consumed). False for every other dungeon.
+    pub leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode (they
+    /// whacked the Challenge Gate). False for every other dungeon.
+    pub petless: bool,
+    /// Whether the run was played in The Shatters' hard mode. False for every
+    /// other dungeon.
+    pub shatters_hm: bool,
+    /// Whether the run was Spectral Penitentiary's hard mode: the dungeon only is
+    /// when Soulwarden Murcian was, so this mirrors his row. False for every
+    /// other dungeon, and for a run that escaped before reaching him.
+    pub spectral_hm: bool,
     /// Object type of the run anchor (last real boss) for the header icon.
     pub anchor_object_type: i32,
     /// Member phase fights, ordered by start time.
@@ -323,6 +362,24 @@ pub struct FightSummary {
     /// other detected teammate (with at least one other participant). Computed at
     /// read time from stored data.
     pub most_damage_taken: bool,
+    /// Whether the run was played in Moonlight Village's Leisurely Mode (a Tofu
+    /// Delicacy was consumed), which shortens the phases and reduces the loot.
+    /// False for every other dungeon; set for the whole run when any of its
+    /// phases recorded it.
+    pub leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode (they
+    /// whacked the Challenge Gate and lost their pet to a permanent stasis),
+    /// which makes the run harder. False for every other dungeon; set for the
+    /// whole run when any of its phases recorded it.
+    pub petless: bool,
+    /// Whether the run was Spectral Penitentiary's hard mode, which the dungeon
+    /// only is when Soulwarden Murcian was (both mini-bosses cleared every
+    /// objective). False for every other dungeon and for runs that never reached
+    /// him.
+    pub spectral_hm: bool,
+    /// Whether the run was played in The Shatters' hard mode. False for every
+    /// other dungeon; set for the whole run when any of its phases recorded it.
+    pub shatters_hm: bool,
 }
 
 impl FightSummary {
@@ -1225,6 +1282,81 @@ impl CombatDatabase {
             // the historical add cards.
             self.purge_fights_by_type(&[34465])?;
             self.conn.execute_batch("PRAGMA user_version = 50")?;
+        }
+        if from_version < 51 {
+            // v50 -> v51: per-fight Moonlight Village spirit count. Each spirit
+            // released at the end of a dance/Umi phase is one `MV Total Counter`
+            // object; the run total drives the dungeon's loot tier. Legacy rows
+            // default to 0 (the count was never captured for them).
+            if !self.column_exists("fights", "spirits")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN spirits INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 51")?;
+        }
+        if from_version < 52 {
+            // v51 -> v52: whether the fight was played in Moonlight Village's
+            // Leisurely Mode (a Tofu Delicacy was consumed), which shortens the
+            // dance phases and reduces the loot. Legacy rows default to 0 (the
+            // mode was never captured for them).
+            if !self.column_exists("fights", "leisurely")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN leisurely INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 52")?;
+        }
+        if from_version < 53 {
+            // v52 -> v53: whether the fight was a Shatters hard-mode variant. The
+            // mode is unlocked by destroying the Stone Idol / The Source, which
+            // rename The Bridge Sentinel, the Twilight Archmage and the Forgotten
+            // King. Legacy rows default to 0 (the mode was never captured).
+            if !self.column_exists("fights", "shatters_hm")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN shatters_hm INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 53")?;
+        }
+        if from_version < 54 {
+            // v53 -> v54: the game ships The Shattered Queen's object with no
+            // display name, so rows recorded for her carry the internal
+            // "Shatters A22" the catalog falls back to. Rename them to the name
+            // the card shows now (see `object_name_override`).
+            self.conn.execute(
+                "UPDATE fights SET boss_name = ?1 WHERE boss_object_type = ?2 AND boss_name <> ?1",
+                params![
+                    crate::assets::object_name_override(crate::assets::SHATTERS_QUEEN_TYPE)
+                        .unwrap_or("The Shattered Queen"),
+                    crate::assets::SHATTERS_QUEEN_TYPE
+                ],
+            )?;
+            self.conn.execute_batch("PRAGMA user_version = 54")?;
+        }
+        if from_version < 55 {
+            // v54 -> v55: whether the local player took Moonlight Village's
+            // Challenge Mode (they attacked the Challenge Gate, which pet-stasises
+            // them for the run). The card labels such a run "Petless". Legacy rows
+            // default to 0 (the mode was never captured).
+            if !self.column_exists("fights", "petless")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN petless INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 55")?;
+        }
+        if from_version < 56 {
+            // v55 -> v56: whether a Spectral Penitentiary fight was hard mode,
+            // which the dungeon is when Soulwarden Murcian's row is (both
+            // mini-bosses cleared every objective and taunted). Legacy rows
+            // default to 0 (the mode was never captured).
+            if !self.column_exists("fights", "spectral_hm")? {
+                self.conn.execute_batch(
+                    "ALTER TABLE fights ADD COLUMN spectral_hm INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            self.conn.execute_batch("PRAGMA user_version = 56")?;
         }
         Ok(())
     }
@@ -2196,7 +2328,12 @@ impl CombatDatabase {
                 local_close_calls INTEGER NOT NULL DEFAULT 0,
                 aux_member_count INTEGER,
                 reached_zero INTEGER NOT NULL DEFAULT 0,
-                joined_late INTEGER NOT NULL DEFAULT 0
+                joined_late INTEGER NOT NULL DEFAULT 0,
+                spirits INTEGER NOT NULL DEFAULT 0,
+                leisurely INTEGER NOT NULL DEFAULT 0,
+                petless INTEGER NOT NULL DEFAULT 0,
+                spectral_hm INTEGER NOT NULL DEFAULT 0,
+                shatters_hm INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS stat_awards (
@@ -2321,8 +2458,9 @@ impl CombatDatabase {
                (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
                 boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
                 encounter_id, encounter_run_id, boss_group, local_close_calls, aux_member_count,
-                dungeon_entered_at, reached_zero, joined_late)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"#,
+                dungeon_entered_at, reached_zero, joined_late, spirits, leisurely, petless, spectral_hm,
+                shatters_hm)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"#,
             params![
                 fight.started_at,
                 fight.ended_at,
@@ -2343,6 +2481,11 @@ impl CombatDatabase {
                 fight.dungeon_entered_at,
                 fight.reached_zero as i32,
                 fight.joined_late as i32,
+                fight.spirits,
+                fight.leisurely as i32,
+                fight.petless as i32,
+                fight.spectral_hm as i32,
+                fight.shatters_hm as i32,
             ],
         )?;
         let fight_id = tx.last_insert_rowid();
@@ -2424,7 +2567,8 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits,
+                      leisurely, petless, spectral_hm, shatters_hm
                FROM fights ORDER BY started_at DESC LIMIT ?1"#,
         )?;
         let rows = stmt.query_map(params![limit], |row| Self::map_fight_header(row))?;
@@ -2452,6 +2596,11 @@ impl CombatDatabase {
             local_close_calls: row.get(12)?,
             aux_member_count: row.get(13)?,
             dungeon_entered_at: row.get(14)?,
+            spirits: row.get(15)?,
+            leisurely: row.get::<_, i32>(16)? != 0,
+            petless: row.get::<_, i32>(17)? != 0,
+            spectral_hm: row.get::<_, i32>(18)? != 0,
+            shatters_hm: row.get::<_, i32>(19)? != 0,
             participants: Vec::new(),
         })
     }
@@ -2525,6 +2674,12 @@ impl CombatDatabase {
         if crate::assets::boss_group(&s.dungeon, s.boss_object_type, &s.boss_name)
             != Some(crate::assets::BossGroup::Exaltation)
         {
+            return Ok((false, false, false));
+        }
+        // Tracked mini-bosses of a dungeon whose markers are reserved for its
+        // main boss (Lost Halls' Agonized Titan, Cultist Hideout's sub-bosses)
+        // are not the fight these markers describe.
+        if !crate::assets::boss_earns_secret_stats(&s.dungeon, s.boss_object_type) {
             return Ok((false, false, false));
         }
         // Every fight in the card, flagged as a main-boss (anchor) phase.
@@ -2970,7 +3125,8 @@ impl CombatDatabase {
                          WHERE p.fight_id = f.id AND p.is_local = 1 LIMIT 1),
                       (SELECT p.end_status FROM fight_participants p
                          WHERE p.fight_id = f.id AND p.is_local = 1 LIMIT 1),
-                      f.map_seed, f.local_close_calls
+                      f.map_seed, f.local_close_calls, f.leisurely, f.petless, f.spectral_hm,
+                      f.shatters_hm
                FROM fights f"#,
         );
         let mut conds: Vec<String> = vec!["f.encounter_run_id IS NULL".to_string()];
@@ -3025,6 +3181,10 @@ impl CombatDatabase {
                 lone_fighter: false,
                 last_hero_standing: false,
                 most_damage_taken: false,
+                leisurely: row.get::<_, i32>(18)? != 0,
+                petless: row.get::<_, i32>(19)? != 0,
+                spectral_hm: row.get::<_, i32>(20)? != 0,
+                shatters_hm: row.get::<_, i32>(21)? != 0,
             })
         })?;
         rows.collect()
@@ -3037,20 +3197,33 @@ impl CombatDatabase {
     /// `(boss_object_type, boss_max_hp, boss_start_hp, killed)`.
     fn run_anchor(&self, run_id: &str) -> SqlResult<Option<(i32, i32, i32, bool)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT boss_object_type, boss_max_hp, boss_start_hp, killed, ended_at
+            "SELECT boss_object_type, boss_max_hp, boss_start_hp, killed, ended_at, started_at
              FROM fights WHERE encounter_run_id = ?1",
         )?;
-        let rows: Vec<PhaseStat> = stmt
+        let phase_rows: Vec<(PhaseStat, i64)> = stmt
             .query_map(params![run_id], |r| {
                 Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get::<_, i32>(3)? != 0,
-                    r.get(4)?,
+                    (
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get::<_, i32>(3)? != 0,
+                        r.get(4)?,
+                    ),
+                    r.get(5)?,
                 ))
             })?
             .collect::<SqlResult<_>>()?;
+        let rows: Vec<PhaseStat> = phase_rows.iter().map(|(phase, _)| *phase).collect();
+        if let Some(dancer) = mv_dancer_main(phase_rows.iter().map(|(p, start)| (p.0, *start))) {
+            if let Some(p) = rows.iter().filter(|p| p.0 == dancer).max_by_key(|p| p.4) {
+                let enc_id = rows
+                    .iter()
+                    .find_map(|p| crate::assets::encounter_for_boss_type(p.0))
+                    .map(|e| e.id);
+                return Ok(Some((p.0, p.1, p.2, run_killed(enc_id, &rows, p.3))));
+            }
+        }
         Ok(pick_anchor(&rows))
     }
 
@@ -3118,13 +3291,26 @@ impl CombatDatabase {
         let fight_sql = format!(
             "SELECT encounter_run_id, boss_object_type, boss_max_hp, boss_start_hp,
                     killed, ended_at, boss_name, local_char_id, started_at, map_seed,
-                    local_close_calls
+                    local_close_calls, spectral_hm, shatters_hm
              FROM fights WHERE encounter_run_id IN ({placeholders})"
         );
         let mut stmt = self.conn.prepare(&fight_sql)?;
         let mut fights_by_run: HashMap<
             String,
-            Vec<(i32, i32, i32, bool, i64, String, i32, i64, i32, i64)>,
+            Vec<(
+                i32,
+                i32,
+                i32,
+                bool,
+                i64,
+                String,
+                i32,
+                i64,
+                i32,
+                i64,
+                bool,
+                bool,
+            )>,
         > = HashMap::new();
         for row in stmt.query_map(rusqlite::params_from_iter(run_ids.iter()), |row| {
             Ok((
@@ -3139,6 +3325,8 @@ impl CombatDatabase {
                 row.get(8)?,
                 row.get(9)?,
                 row.get(10)?,
+                row.get::<_, i32>(11)? != 0,
+                row.get::<_, i32>(12)? != 0,
             ))
         })? {
             let (
@@ -3153,6 +3341,8 @@ impl CombatDatabase {
                 started_at,
                 map_seed,
                 close_calls,
+                spectral_hm,
+                shatters_hm,
             ) = row?;
             fights_by_run.entry(run_id).or_default().push((
                 otype,
@@ -3165,6 +3355,8 @@ impl CombatDatabase {
                 started_at,
                 map_seed,
                 close_calls,
+                spectral_hm,
+                shatters_hm,
             ));
         }
 
@@ -3196,13 +3388,55 @@ impl CombatDatabase {
             })?
             .collect::<SqlResult<_>>()?;
 
+        // Leisurely Mode and Challenge Mode's pet stasis are recorded per phase
+        // but apply to the whole run (each is activated once, before any boss), so
+        // a run is labelled when any of its phases carries it.
+        let leisurely_sql = format!(
+            "SELECT encounter_run_id, MAX(leisurely), MAX(petless) FROM fights
+             WHERE encounter_run_id IN ({placeholders})
+             GROUP BY encounter_run_id"
+        );
+        let mut stmt = self.conn.prepare(&leisurely_sql)?;
+        let leisurely_runs: HashMap<String, (bool, bool)> = stmt
+            .query_map(rusqlite::params_from_iter(run_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i32>(1)? != 0, row.get::<_, i32>(2)? != 0),
+                ))
+            })?
+            .collect::<SqlResult<_>>()?;
+
         let mut out = Vec::new();
         for (run_id, encounter_id, dungeon, started_at, ended_at, stored_killed) in runs {
+            let (leisurely, petless) = leisurely_runs.get(&run_id).copied().unwrap_or_default();
             let phases = fights_by_run.remove(&run_id).unwrap_or_default();
+            let shatters_hm = shatters_run_is_hard_mode(phases.iter().map(|p| (p.0, p.11)));
+            // Spectral Penitentiary is hard mode only when Murcian's own row is.
+            let spectral_hm = phases
+                .iter()
+                .any(|p| crate::assets::is_spectral_murcian(p.0) && p.10);
             let phase_stats: Vec<PhaseStat> =
                 phases.iter().map(|p| (p.0, p.1, p.2, p.3, p.4)).collect();
+            // Moonlight Village headlines on the dancer the dance ended on (see
+            // `mv_dancer_main`); its row is picked the same way as every other
+            // anchor so the HP bar and completion state come from that phase.
             let (mut boss_object_type, boss_max_hp, boss_start_hp, killed) =
-                pick_anchor(&phase_stats).unwrap_or((0, 0, 0, false));
+                mv_dancer_main(phases.iter().map(|p| (p.0, p.7)))
+                    .and_then(|dancer| {
+                        phase_stats
+                            .iter()
+                            .filter(|p| p.0 == dancer)
+                            .max_by_key(|p| p.4)
+                            .copied()
+                    })
+                    .map(|p| {
+                        let enc_id = phase_stats
+                            .iter()
+                            .find_map(|q| crate::assets::encounter_for_boss_type(q.0))
+                            .map(|e| e.id);
+                        (p.0, p.1, p.2, run_killed(enc_id, &phase_stats, p.3))
+                    })
+                    .unwrap_or_else(|| pick_anchor(&phase_stats).unwrap_or((0, 0, 0, false)));
             // A run-level `killed` completes the card only for loot-completable
             // encounters (Towering Perfection): a bag from a core that was never
             // seen dying, where the anchor phase stays escaped. Other cards ignore
@@ -3211,7 +3445,11 @@ impl CombatDatabase {
                 .iter()
                 .find_map(|p| crate::assets::encounter_for_boss_type(p.0))
                 .is_some_and(|e| crate::assets::encounter_supports_loot_completion(e.id));
-            let killed = killed || (loot_completable && stored_killed != 0);
+            let killed = killed
+                || (loot_completable && stored_killed != 0)
+                // Moonlight Village is cleared by its three dancers; the anchor
+                // can land on an escaped Kitsune Umi fought afterwards.
+                || mv_dancers_cleared(phases.iter().map(|p| (p.0, p.3)));
             let raw_phase_count = phases.len() as i64;
             // The card's phase count must match the collapsed detail view:
             // duplicate same-(type,name) phases of a dedup-prone boss (a
@@ -3336,6 +3574,10 @@ impl CombatDatabase {
                 lone_fighter: false,
                 last_hero_standing: false,
                 most_damage_taken: false,
+                leisurely,
+                petless,
+                spectral_hm,
+                shatters_hm,
             });
         }
         Ok(out)
@@ -3346,7 +3588,8 @@ impl CombatDatabase {
         let mut sql = String::from(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits,
+                      leisurely, petless, spectral_hm, shatters_hm
                FROM fights"#,
         );
         let mut conds: Vec<String> = Vec::new();
@@ -3374,7 +3617,8 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits,
+                      leisurely, petless, spectral_hm, shatters_hm
                FROM fights WHERE id = ?1"#,
         )?;
         let mut rows = stmt.query_map(params![fight_id], |row| Self::map_fight_header(row))?;
@@ -3416,7 +3660,8 @@ impl CombatDatabase {
         let mut stmt = self.conn.prepare(
             r#"SELECT id, started_at, ended_at, dungeon, map_seed, boss_object_type,
                       boss_name, boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
-                      local_close_calls, aux_member_count, dungeon_entered_at
+                      local_close_calls, aux_member_count, dungeon_entered_at, spirits,
+                      leisurely, petless, spectral_hm, shatters_hm
                FROM fights WHERE encounter_run_id = ?1 ORDER BY started_at ASC, id ASC"#,
         )?;
         let mut phases: Vec<FightRecord> = stmt
@@ -3434,7 +3679,11 @@ impl CombatDatabase {
             .iter()
             .find_map(|&t| crate::assets::encounter_for_boss_type(t))
             .is_some_and(|e| crate::assets::encounter_supports_loot_completion(e.id));
-        let killed = anchor_killed || (loot_completable && stored_killed);
+        let killed = anchor_killed
+            || (loot_completable && stored_killed)
+            // Moonlight Village is cleared by its three dancers; the anchor can
+            // land on an escaped Kitsune Umi fought afterwards.
+            || mv_dancers_cleared(phases.iter().map(|p| (p.boss_object_type, p.killed)));
         let display_name = if let Some(name) = realm_headline(&dungeon, &object_types) {
             name.to_string()
         } else if phases.len() > 1 {
@@ -3465,6 +3714,14 @@ impl CombatDatabase {
             started_at,
             ended_at,
             killed,
+            leisurely: phases.iter().any(|p| p.leisurely),
+            petless: phases.iter().any(|p| p.petless),
+            spectral_hm: phases
+                .iter()
+                .any(|p| crate::assets::is_spectral_murcian(p.boss_object_type) && p.spectral_hm),
+            shatters_hm: shatters_run_is_hard_mode(
+                phases.iter().map(|p| (p.boss_object_type, p.shatters_hm)),
+            ),
             anchor_object_type,
             phases,
             roster,
@@ -4419,6 +4676,11 @@ fn collapse_aux_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             } else {
                 Some(group.iter().map(|g| g.aux_member_count.unwrap_or(0)).sum())
             },
+            spirits: group.iter().map(|g| g.spirits).sum(),
+            leisurely: group.iter().any(|g| g.leisurely),
+            petless: group.iter().any(|g| g.petless),
+            spectral_hm: group.iter().any(|g| g.spectral_hm),
+            shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
         });
     }
@@ -4497,6 +4759,11 @@ fn collapse_duplicate_boss_phases(phases: &[FightRecord]) -> Vec<FightRecord> {
             killed: group.iter().any(|g| g.killed),
             local_close_calls: group.iter().map(|g| g.local_close_calls).sum(),
             aux_member_count: p.aux_member_count,
+            spirits: group.iter().map(|g| g.spirits).sum(),
+            leisurely: group.iter().any(|g| g.leisurely),
+            petless: group.iter().any(|g| g.petless),
+            spectral_hm: group.iter().any(|g| g.spectral_hm),
+            shatters_hm: group.iter().any(|g| g.shatters_hm),
             participants: aggregate_roster(&group),
         });
     }
@@ -4664,6 +4931,54 @@ fn run_killed(enc_id: Option<&str>, phases: &[PhaseStat], anchor_killed: bool) -
     }
 }
 
+/// Whether a Shatters run played in hard mode, which only holds when every main
+/// boss the run fought was a hard-mode variant. The Idol and The Source phases
+/// are objects hard mode unlocks, not bosses it renames, so they are ignored: a
+/// group that destroyed the Stone Idol (Valen) but never The Source fights a
+/// hard-mode first boss and a regular second one, and the card stays regular. A
+/// run escaped before reaching the next boss still counts while every boss
+/// fought until then was hard mode.
+fn shatters_run_is_hard_mode(phases: impl IntoIterator<Item = (i32, bool)>) -> bool {
+    let mut main_bosses = phases
+        .into_iter()
+        .filter(|(object_type, _)| crate::assets::is_shatters_main_boss(*object_type));
+    main_bosses.next().is_some_and(|(_, hm)| hm) && main_bosses.all(|(_, hm)| hm)
+}
+
+/// Whether a Moonlight Village run defeated every dancer. The dungeon is
+/// cleared by the three dancers alone; Kitsune Umi is an optional secret boss
+/// fought after them, so a run that escaped (or never found) her is still a
+/// clear. The dancers go invulnerable instead of dying on a partial run, so a
+/// dance abandoned midway stays Escaped.
+fn mv_dancers_cleared(phases: impl IntoIterator<Item = (i32, bool)>) -> bool {
+    let defeated: Vec<i32> = phases
+        .into_iter()
+        .filter(|(object_type, killed)| {
+            *killed && crate::assets::MV_DANCER_TYPES.contains(object_type)
+        })
+        .map(|(object_type, _)| object_type)
+        .collect();
+    crate::assets::MV_DANCER_TYPES
+        .iter()
+        .all(|t| defeated.contains(t))
+}
+
+/// Moonlight Village's main boss: the dancer the party was recording damage on
+/// last, as an object type.
+///
+/// Only one boss records damage at a time, so the last dancer to start a fight
+/// is the one the dance ended on -- the boss the run's loot and clear belong to,
+/// and the one whose row headlines the card. Finalization order can't be used:
+/// a suspended/re-detected earlier dancer can flush after the final one.
+/// Kitsune Umi is optional and never the main boss; runs without a dancer return
+/// `None` and fall through to the generic anchor rules.
+fn mv_dancer_main(phases: impl Iterator<Item = (i32, i64)>) -> Option<i32> {
+    phases
+        .filter(|(object_type, _)| crate::assets::MV_DANCER_TYPES.contains(object_type))
+        .max_by_key(|(_, started_at)| *started_at)
+        .map(|(object_type, _)| object_type)
+}
+
 /// Pick the anchor phase for a grouped run: the encounter's declared
 /// `anchor_type` when present, else the latest-ended real (non-aux) boss (tie:
 /// higher max HP), else any aux row. Returns `(object_type, max_hp, start_hp,
@@ -4814,6 +5129,11 @@ mod tests {
             encounter_run_id: None,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
+            leisurely: false,
+            petless: false,
+            spectral_hm: false,
+            shatters_hm: false,
             participants: vec![
                 FightParticipant {
                     object_id: 600,
@@ -4918,6 +5238,11 @@ mod tests {
             encounter_run_id: None,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
+            leisurely: false,
+            petless: false,
+            spectral_hm: false,
+            shatters_hm: false,
             participants,
         }
     }
@@ -5140,6 +5465,78 @@ mod tests {
             !list[0].lone_fighter,
             "another damage dealer disqualifies solo"
         );
+    }
+
+    #[test]
+    fn lone_fighter_skips_tracked_mini_bosses_of_a_main_boss_dungeon() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // A solo Lost Halls mini-boss: local finished it with a teammate who only
+        // died, which is exactly the shape the markers describe -- but it is not
+        // the dungeon's boss, so the card earns none of them.
+        db.insert_fight(&flawless_fight(
+            "Lost Halls",
+            0xb010,
+            vec![
+                secret_local_part(80_000, ParticipantEndStatus::Present),
+                flawless_part(
+                    600,
+                    "Alice",
+                    0,
+                    None,
+                    ParticipantEndStatus::Died { grave_type: 1830 },
+                ),
+            ],
+        ))
+        .unwrap();
+        // The same mini-boss type in an unrestricted dungeon keeps its marker.
+        db.insert_fight(&flawless_fight(
+            "Kogbold Steamworks",
+            0xc4ad,
+            vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+        ))
+        .unwrap();
+        // The dungeons' main bosses still earn them.
+        db.insert_fight(&flawless_fight(
+            "Lost Halls",
+            45073,
+            vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+        ))
+        .unwrap();
+        db.insert_fight(&flawless_fight(
+            "Cultist Hideout",
+            45231,
+            vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+        ))
+        .unwrap();
+
+        let list = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let card = |boss: i32| {
+            list.iter()
+                .find(|s| s.boss_object_type == boss)
+                .unwrap_or_else(|| panic!("card for {boss:#x}"))
+        };
+        let titan = card(0xb010);
+        assert_eq!(titan.dungeon, "Lost Halls");
+        assert!(
+            !titan.lone_fighter,
+            "a Lost Halls mini-boss is not a dungeon clear"
+        );
+        assert!(!titan.last_hero_standing && !titan.most_damage_taken);
+        assert!(
+            card(45073).lone_fighter,
+            "Marble Colossus is the fight the marker describes"
+        );
+        assert!(card(45231).lone_fighter, "Malus is Cultist Hideout's boss");
+        assert!(
+            card(0xc4ad).lone_fighter,
+            "other dungeons keep their mini-boss markers"
+        );
+
+        // The secret-stat filter agrees with the flags.
+        let mut query = FightQuery::default();
+        query.filter_lone_fighter = true;
+        let filtered = db.list_fights(&query, 50).unwrap();
+        assert!(!filtered.iter().any(|s| s.boss_object_type == 0xb010));
     }
 
     #[test]
@@ -6235,6 +6632,63 @@ mod tests {
     }
 
     #[test]
+    fn moonlight_village_clears_when_the_dancers_die_even_if_umi_escapes() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // The three dancers are cleared, then the optional secret boss Kitsune
+        // Umi is engaged and escaped when the group leaves: the card must stay
+        // Completed because the dungeon is scored on the dance alone.
+        let mut run = |object_type: i32, start: i64, end: i64, killed: bool| {
+            let mut f = flawless_fight("Moonlight Village", object_type, vec![]);
+            f.started_at = start;
+            f.ended_at = end;
+            f.killed = killed;
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some("mv-umi".to_string());
+            db.insert_fight(&f).unwrap();
+        };
+        run(20450, 1_000, 10_000, true); // Sage Genji
+        run(20451, 11_000, 20_000, true); // Dancer Miko
+        run(20452, 21_000, 30_000, true); // Drummer Kaguya
+        run(20493, 40_000, 50_000, false); // Kitsune Umi, escaped
+
+        let card = &db.list_fights(&FightQuery::default(), 50).unwrap()[0];
+        assert_eq!(
+            card.boss_object_type, 20452,
+            "the dance's final dancer headlines the run, never Umi"
+        );
+        assert!(card.killed, "escaping Umi keeps the card Completed");
+        assert!(
+            db.encounter_detail("mv-umi").unwrap().unwrap().killed,
+            "the Fight Card agrees with the list card",
+        );
+        assert_eq!(
+            db.encounter_detail("mv-umi")
+                .unwrap()
+                .unwrap()
+                .anchor_object_type,
+            20452,
+            "the Fight Card marks the final dancer as its main boss",
+        );
+
+        // A dance abandoned after two dancers stays Escaped: the dancers floor
+        // invulnerable, so only a full clear counts.
+        for (object_type, killed) in [(20450, true), (20451, true), (20452, false)] {
+            let mut f = flawless_fight("Moonlight Village", object_type, vec![]);
+            f.killed = killed;
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some("mv-partial".to_string());
+            db.insert_fight(&f).unwrap();
+        }
+        let cards = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let partial_card = cards
+            .iter()
+            .find(|c| c.encounter_run_id.as_deref() == Some("mv-partial"))
+            .expect("partial run card");
+        assert!(!partial_card.killed, "an unfinished dance stays Escaped");
+        assert!(!db.encounter_detail("mv-partial").unwrap().unwrap().killed);
+    }
+
+    #[test]
     fn flawless_marker_clear_when_every_finisher_took_damage_or_left() {
         let mut db = CombatDatabase::open_in_memory().unwrap();
         db.insert_fight(&flawless_fight(
@@ -7029,11 +7483,145 @@ mod tests {
     #[test]
     fn fight_detail_round_trip() {
         let mut db = CombatDatabase::open_in_memory().unwrap();
-        let id = db.insert_fight(&sample_fight()).unwrap();
+        let mut fight = sample_fight();
+        fight.spirits = 8;
+        let id = db.insert_fight(&fight).unwrap();
         let detail = db.fight_detail(id).unwrap().unwrap();
         assert_eq!(detail.participants.len(), 2);
         assert_eq!(detail.local_char_id, 777);
+        assert_eq!(detail.spirits, 8, "spirits persist through the DB");
         assert!(db.fight_detail(999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn leisurely_mode_persists_on_the_fight_and_its_run_card() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // A Moonlight Village run's phases all record the mode; the grouped card
+        // is labelled from it.
+        for (object_type, leisurely) in [(20450, true), (20451, false)] {
+            let mut f = flawless_fight("Moonlight Village", object_type, vec![]);
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some("mv-leisurely".to_string());
+            f.leisurely = leisurely;
+            db.insert_fight(&f).unwrap();
+        }
+        // An untouched dungeon is never labelled.
+        db.insert_fight(&flawless_fight("Fungal Cavern", 45712, vec![]))
+            .unwrap();
+
+        let cards = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let mv = cards
+            .iter()
+            .find(|c| c.dungeon == "Moonlight Village")
+            .expect("Moonlight Village card");
+        assert!(mv.leisurely, "any phase carrying the mode labels the run");
+        assert!(
+            cards
+                .iter()
+                .find(|c| c.dungeon == "Fungal Cavern")
+                .is_some_and(|c| !c.leisurely),
+            "other dungeons are not labelled",
+        );
+        assert!(
+            db.encounter_detail("mv-leisurely")
+                .unwrap()
+                .unwrap()
+                .leisurely
+        );
+        // Each phase keeps its own column value; the card aggregates them.
+        let stored: i64 = db
+            .conn
+            .query_row(
+                "SELECT leisurely FROM fights WHERE boss_object_type = 20451",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "a phase without the mode stores 0");
+    }
+
+    #[test]
+    fn shatters_hard_mode_labels_a_run_only_when_every_main_boss_was_hard_mode() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // A full hard-mode run: Valen, Nox and King Azamoth all recorded.
+        for object_type in [29003, 29021, 29039] {
+            let mut f = flawless_fight("The Shatters", object_type, vec![]);
+            f.encounter_id = Some("shtrs".to_string());
+            f.encounter_run_id = Some("shtrs-hm".to_string());
+            f.shatters_hm = true;
+            db.insert_fight(&f).unwrap();
+        }
+        // The Idol and The Source are objects, not renamed bosses, so they never
+        // carry the mode and must not veto the run card.
+        for object_type in [33280, 33346] {
+            let mut f = flawless_fight("The Shatters", object_type, vec![]);
+            f.encounter_id = Some("shtrs".to_string());
+            f.encounter_run_id = Some("shtrs-hm".to_string());
+            db.insert_fight(&f).unwrap();
+        }
+        // A run that unlocked the bridge but not The Source: hard-mode Valen,
+        // regular Twilight Archmage.
+        for (object_type, shatters_hm) in [(29003, true), (29021, false)] {
+            let mut f = flawless_fight("The Shatters", object_type, vec![]);
+            f.encounter_id = Some("shtrs".to_string());
+            f.encounter_run_id = Some("shtrs-bridge-only".to_string());
+            f.shatters_hm = shatters_hm;
+            db.insert_fight(&f).unwrap();
+        }
+        // A regular run.
+        let mut plain = flawless_fight("The Shatters", 29003, vec![]);
+        plain.encounter_id = Some("shtrs".to_string());
+        plain.encounter_run_id = Some("shtrs-plain".to_string());
+        db.insert_fight(&plain).unwrap();
+
+        let cards = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let card = |run: &str| {
+            cards
+                .iter()
+                .find(|c| c.encounter_run_id.as_deref() == Some(run))
+                .unwrap_or_else(|| panic!("card for {run}"))
+        };
+        assert!(card("shtrs-hm").shatters_hm, "every boss was hard mode");
+        assert!(
+            !card("shtrs-bridge-only").shatters_hm,
+            "a regular Archmage keeps the run card regular"
+        );
+        assert!(!card("shtrs-plain").shatters_hm);
+        assert!(
+            db.encounter_detail("shtrs-hm")
+                .unwrap()
+                .unwrap()
+                .shatters_hm,
+            "the run page agrees with the list card"
+        );
+        assert!(
+            !db.encounter_detail("shtrs-bridge-only")
+                .unwrap()
+                .unwrap()
+                .shatters_hm
+        );
+        // Per-phase values stay per-phase: the flag lives on the renamed boss.
+        let stored: i64 = db
+            .conn
+            .query_row(
+                "SELECT shatters_hm FROM fights WHERE encounter_run_id = 'shtrs-bridge-only'
+                 AND boss_object_type = 29021",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "the regular phase stores 0");
+        // A standalone (ungrouped) hard-mode fight carries its own flag.
+        let mut solo = flawless_fight("The Shatters", 29021, vec![]);
+        solo.shatters_hm = true;
+        db.insert_fight(&solo).unwrap();
+        assert!(
+            db.list_fights(&FightQuery::default(), 50)
+                .unwrap()
+                .iter()
+                .any(|c| c.encounter_run_id.is_none() && c.shatters_hm),
+            "an ungrouped hard-mode fight keeps the flag"
+        );
     }
 
     #[test]
@@ -9451,6 +10039,180 @@ mod tests {
     }
 
     #[test]
+    fn v54_to_v55_adds_the_petless_flag() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // A Moonlight Village fight recorded before Challenge Mode was tracked:
+        // the row predates the column, so it has to default to "not petless".
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group, leisurely, shatters_hm)
+              VALUES
+              (10, 40, 'Moonlight Village', 7, 20450, 'Kitsune Umi', 360000, 360000, 9, 55, 1, NULL, NULL, 1, 0);
+            "#,
+            )
+            .unwrap();
+
+        db.conn.execute_batch("PRAGMA user_version = 54").unwrap();
+        db.initialize(None).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let legacy = db.fight_detail(1).unwrap().expect("legacy row survives");
+        assert!(!legacy.petless, "legacy rows are not petless");
+        assert!(legacy.leisurely, "the rest of the row is untouched");
+
+        // The flag round-trips through a fresh insert.
+        let mut fight = sample_fight();
+        fight.dungeon = "Moonlight Village".to_string();
+        fight.petless = true;
+        let id = db.insert_fight(&fight).unwrap();
+        let read_back = db.fight_detail(id).unwrap().expect("inserted fight");
+        assert!(read_back.petless, "the petless flag persists");
+    }
+
+    #[test]
+    fn v55_to_v56_adds_the_spectral_hm_flag() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // A Spectral Penitentiary run recorded before hard mode was tracked: the
+        // row predates the column, so it has to default to "not hard mode".
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group, leisurely, petless, shatters_hm)
+              VALUES
+              (10, 40, 'Spectral Penitentiary', 7, 23681, 'Soulwarden Murcian', 400000, 400000, 9, 55, 1, NULL, NULL, 0, 0, 0);
+            "#,
+            )
+            .unwrap();
+
+        db.conn.execute_batch("PRAGMA user_version = 55").unwrap();
+        db.initialize(None).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let legacy = db.fight_detail(1).unwrap().expect("legacy row survives");
+        assert!(!legacy.spectral_hm, "legacy rows are not hard mode");
+
+        // The flag round-trips through a fresh insert.
+        let mut fight = sample_fight();
+        fight.dungeon = "Spectral Penitentiary".to_string();
+        fight.spectral_hm = true;
+        let id = db.insert_fight(&fight).unwrap();
+        let read_back = db.fight_detail(id).unwrap().expect("inserted fight");
+        assert!(read_back.spectral_hm, "the hard-mode flag persists");
+    }
+
+    #[test]
+    fn spectral_hard_mode_is_recorded_at_run_level() {
+        // A run where both mini-bosses taunted and Murcian was therefore hard
+        // mode, plus a second regular run: only the first is hard mode as read
+        // back for the fight card.
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut hm_mini = sample_fight();
+        hm_mini.dungeon = "Spectral Penitentiary".to_string();
+        hm_mini.map_seed = 7;
+        hm_mini.boss_object_type = 23659; // Griefkeeper Zole
+        hm_mini.boss_name = "Griefkeeper Zole".to_string();
+        hm_mini.spectral_hm = true;
+        let mut hm_final = hm_mini.clone();
+        hm_final.boss_object_type = 23681; // Soulwarden Murcian
+        hm_final.boss_name = "Soulwarden Murcian".to_string();
+        let mut regular = hm_mini.clone();
+        regular.map_seed = 8;
+        regular.boss_object_type = 23681;
+        regular.boss_name = "Soulwarden Murcian".to_string();
+        regular.spectral_hm = false;
+        for fight in [&hm_mini, &hm_final, &regular] {
+            db.insert_fight(fight).unwrap();
+        }
+
+        let summaries = db.recent_fights(10).unwrap();
+        let murcian = |seed: i32| {
+            summaries
+                .iter()
+                .find(|f| f.map_seed == seed && f.boss_name == "Soulwarden Murcian")
+                .expect("murcian row")
+        };
+        assert!(murcian(7).spectral_hm, "the hard-mode run reads back as HM");
+        assert!(!murcian(8).spectral_hm, "the regular run is untouched");
+        // The mini-boss row of the hard-mode run carries the mode too, so the
+        // card can tag it before Murcian is reached.
+        assert!(summaries
+            .iter()
+            .any(|f| f.boss_name == "Griefkeeper Zole" && f.spectral_hm));
+    }
+
+    #[test]
+    fn v53_to_v54_renames_the_shattered_queen() {
+        let mut db = CombatDatabase {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.initialize(None).unwrap();
+        // A hard-mode Shatters run recorded while the queen's object still fell
+        // back to its internal catalog name.
+        db.conn
+            .execute_batch(
+                r#"
+            INSERT INTO fights
+              (started_at, ended_at, dungeon, map_seed, boss_object_type, boss_name,
+               boss_max_hp, boss_start_hp, local_object_id, local_char_id, killed,
+               encounter_run_id, boss_group, shatters_hm)
+              VALUES
+              (10, 40, 'The Shatters', 7, 17494, 'Shatters A22', 100000, 100000, 9, 55, 1, NULL, NULL, 1),
+              (20, 35, 'The Shatters', 7, 29039, 'King Azamoth', 300000, 300000, 9, 55, 1, NULL, NULL, 1);
+            "#,
+            )
+            .unwrap();
+
+        db.conn.execute_batch("PRAGMA user_version = 53").unwrap();
+        db.initialize(None).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let queen: String = db
+            .conn
+            .query_row(
+                "SELECT boss_name FROM fights WHERE boss_object_type = 17494",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queen, "The Shattered Queen");
+        // Every other row keeps the name it was recorded with.
+        let king: String = db
+            .conn
+            .query_row(
+                "SELECT boss_name FROM fights WHERE boss_object_type = 29039",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(king, "King Azamoth");
+    }
+
+    #[test]
     fn v49_to_v50_purges_galleon_admiral() {
         let mut db = CombatDatabase {
             conn: Connection::open_in_memory().unwrap(),
@@ -9753,6 +10515,11 @@ mod tests {
             killed: true,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
+            leisurely: false,
+            petless: false,
+            spectral_hm: false,
+            shatters_hm: false,
             participants: vec![],
         }
     }
@@ -9827,6 +10594,60 @@ mod tests {
             .collect();
         let out = collapse_duplicate_boss_phases(&phases);
         assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn moonlight_village_main_boss_is_the_last_dancer_to_fight() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        // Only one boss records damage at a time, so the dancer the party was
+        // fighting last is the run's main boss -- even though Sage Genji (the
+        // first dancer) flushes last here, and Umi is fought after the dance.
+        let mut run = |object_type: i32, start: i64, end: i64| {
+            let mut f = flawless_fight("Moonlight Village", object_type, vec![]);
+            f.started_at = start;
+            f.ended_at = end;
+            f.killed = true;
+            f.encounter_id = Some("dungeon_run".to_string());
+            f.encounter_run_id = Some("mv-main".to_string());
+            db.insert_fight(&f).unwrap();
+        };
+        run(20450, 1_000, 50_000); // Sage Genji, flushed after the dance
+        run(20451, 11_000, 20_000); // Dancer Miko
+        run(20452, 21_000, 30_000); // Drummer Kaguya, the final dancer
+        run(20493, 60_000, 70_000); // Kitsune Umi, optional
+
+        let card = &db.list_fights(&FightQuery::default(), 50).unwrap()[0];
+        assert_eq!(
+            card.boss_object_type, 20452,
+            "the final dancer headlines, not the last row to finalize or Umi"
+        );
+        let detail = db.encounter_detail("mv-main").unwrap().unwrap();
+        assert_eq!(detail.anchor_object_type, 20452);
+        assert_eq!(detail.phases.len(), 4);
+        assert!(
+            detail.phases.iter().any(|p| p.boss_object_type == 20493),
+            "Umi stays a phase of the card"
+        );
+
+        // A dancer-only run (Umi never engaged) headlines the same way.
+        let mut only_dancers = flawless_fight("Moonlight Village", 20451, vec![]);
+        only_dancers.started_at = 5_000;
+        only_dancers.ended_at = 40_000;
+        only_dancers.encounter_id = Some("dungeon_run".to_string());
+        only_dancers.encounter_run_id = Some("mv-no-umi".to_string());
+        db.insert_fight(&only_dancers).unwrap();
+        let mut late_flush = flawless_fight("Moonlight Village", 20450, vec![]);
+        late_flush.started_at = 1_000;
+        late_flush.ended_at = 90_000;
+        late_flush.encounter_id = Some("dungeon_run".to_string());
+        late_flush.encounter_run_id = Some("mv-no-umi".to_string());
+        db.insert_fight(&late_flush).unwrap();
+        let cards = db.list_fights(&FightQuery::default(), 50).unwrap();
+        let no_umi = cards
+            .iter()
+            .find(|c| c.encounter_run_id.as_deref() == Some("mv-no-umi"))
+            .expect("dancer-only card");
+        assert_eq!(no_umi.boss_object_type, 20451);
     }
 
     #[test]

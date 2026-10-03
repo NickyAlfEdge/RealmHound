@@ -216,6 +216,54 @@ pub fn contains_modifier(tokens: &[String], canonical_key: &str) -> bool {
     tokens.iter().any(|t| canonical(t) == canonical_key)
 }
 
+/// Dungeon modifiers the game applies to an instance by itself rather than
+/// rolling them for the run: while a special event is live, every instance of a
+/// participating dungeon spawns with its signature mod, often as the *only* mod
+/// (e.g. `Steamworks Maintenance` on every Kogbold Steamworks run, so every
+/// call reads `turrets off` even though nothing was rolled; `Found Treasure!` on
+/// every Woodland Labyrinth run during its September 2026 event, where 38
+/// captured instances all carried it and 24 carried nothing else).
+///
+/// The game files cannot tell these apart from rolled mods -- all of them are
+/// labeled `ROLLABLE`, and some (Chef, Souvenir) even sit in the global
+/// `ANY,REWARD` pool -- so the table is curated from live observations: a mod
+/// belongs here when every instance of a dungeon carried it, including
+/// instances where it was the only mod. Mods that are also rolled normally
+/// (`Looting`, `Rewarding`) are listed because their event use is indistinguishable
+/// from a roll; leaving the option on (the default) calls them either way.
+///
+/// Excluded from callouts when
+/// [`LiveFeedSettings::call_event_mods`](crate::settings::LiveFeedSettings::call_event_mods)
+/// is off -- the numeric reward bonuses such a mod grants are still called,
+/// since the dungeon really does give them.
+pub const EVENT_PRESET_MODS: &[&str] = &[
+    // Steamworks event: Kogbold Steamworks / Advanced Kogbold Steamworks.
+    "STEAMWORKSMAINTENANCE",
+    // Woodland Labyrinth event (Sep 2026): Found Treasure!.
+    "FOOUNDTREASURE",
+    // Parasite Chambers, every observed instance.
+    "LOOTING",
+    // Dungeon-unique reward mods seen applied across whole dungeons.
+    "CRABRAVE",  // Deadwater Docks
+    "REWARDING", // The Void
+    "CHEF",      // Spider Den
+    "SOUVENIR",  // Deadwater Docks
+];
+
+/// Whether `token` is a modifier the game applies to an instance by itself
+/// during a special event (see [`EVENT_PRESET_MODS`]).
+pub fn is_event_preset_modifier(token: &str) -> bool {
+    let key = canonical(token);
+    !key.is_empty()
+        && EVENT_PRESET_MODS
+            .iter()
+            .any(|base| match key.strip_prefix(base) {
+                // Exact, or a numbered tier of it (`LOOTING` / `LOOTING_2`).
+                Some(suffix) => suffix.is_empty() || suffix.chars().all(|c| c.is_ascii_digit()),
+                None => false,
+            })
+}
+
 /// True if `labels` (a comma-separated list from `mods.xml`) contains `label` as
 /// an exact, case-insensitive token.
 fn has_label(labels: &str, label: &str) -> bool {
@@ -455,6 +503,32 @@ mod tests {
         assert_eq!(base_and_tier("Exposed IV"), ("EXPOSED".to_string(), 4));
         assert_eq!(base_and_tier("Berserk"), ("BERSERK".to_string(), 0));
         assert_eq!(base_and_tier("Weak I"), ("WEAK".to_string(), 1));
+    }
+
+    #[test]
+    fn event_preset_mods_match_their_wire_ids() {
+        // The wire id keeps its underscore; the canonical table entry does not.
+        assert!(is_event_preset_modifier("STEAMWORKS_MAINTENANCE"));
+        assert!(is_event_preset_modifier("steamworks maintenance"));
+        assert!(is_event_preset_modifier("LOOTING"));
+        // The mods an event has been observed applying to whole dungeons.
+        for token in [
+            "FOOUNDTREASURE", // Woodland Labyrinth event
+            "CRABRAVE",       // Deadwater Docks
+            "REWARDING",      // The Void
+            "CHEF",           // Spider Den
+            "SOUVENIR",       // Deadwater Docks
+        ] {
+            assert!(is_event_preset_modifier(token), "{token}");
+        }
+        // A numbered tier of a preset still matches.
+        assert!(is_event_preset_modifier("LOOTING_2"));
+        assert!(is_event_preset_modifier("SOUVENIR_1"));
+        // Rolled mods, prefix lookalikes and junk do not.
+        assert!(!is_event_preset_modifier("GENEROUS"));
+        assert!(!is_event_preset_modifier("LOOTINGPARTY"));
+        assert!(!is_event_preset_modifier("WEAKBOSS_3"));
+        assert!(!is_event_preset_modifier(""));
     }
 
     #[test]

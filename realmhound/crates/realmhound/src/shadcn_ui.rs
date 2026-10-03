@@ -970,6 +970,28 @@ impl Shadcn {
         .inner
     }
 
+    /// A compact square `x` button sized to the `small` text beside it, for
+    /// inline remove/cancel actions in list rows. Its height matches the small
+    /// font so it does not inflate the row or sit below the text.
+    pub fn btn_x(&self, ui: &mut Ui) -> Response {
+        let palette = &self.theme.palette;
+        ui.scope(|ui| {
+            ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+            ui.add(
+                egui::Button::new(
+                    egui::RichText::new("x")
+                        .small()
+                        .color(palette.secondary_foreground),
+                )
+                .fill(palette.secondary)
+                .stroke(egui::Stroke::new(1.0_f32, palette.border))
+                .corner_radius(4.0)
+                .min_size(egui::vec2(16.0, 16.0)),
+            )
+        })
+        .inner
+    }
+
     /// A themed destructive button (red, for irreversible actions).
     pub fn button_destructive(
         &self,
@@ -1177,6 +1199,69 @@ impl Shadcn {
         self.select_with_side(ui, id, selected, width, options, SelectSide::Top)
     }
 
+    /// Keep an open dropdown the only clickable layer.
+    ///
+    /// The crate paints its popup into a plain paint layer instead of an
+    /// [`egui::Area`], so egui never learns the popup covers the widgets below
+    /// it: a click on an option would also land on whatever sits underneath
+    /// (visibly, the next dropdown in the panel). Dropping a screen-covering
+    /// click-catcher into the top [`egui::Order::Debug`] layer while the popup
+    /// is open makes it the only clickable layer, while leaving the trigger
+    /// itself reachable so the dropdown still closes when it is clicked again.
+    ///
+    /// `open_key` keys the mirrored open state across frames; `reported` is
+    /// this frame's open-state change, when any.
+    fn maintain_select_blocker(
+        &self,
+        ui: &mut Ui,
+        open_key: egui::Id,
+        reported: Option<bool>,
+        trigger: egui::Rect,
+    ) {
+        let mut open = ui.data(|d| d.get_temp::<bool>(open_key).unwrap_or(false));
+        if let Some(is_open) = reported {
+            open = is_open;
+            ui.data_mut(|d| d.insert_temp(open_key, is_open));
+        }
+        if !open {
+            return;
+        }
+
+        let screen = ui.ctx().content_rect();
+        egui::Area::new(open_key.with("blocker"))
+            // The popup paints into a `Tooltip`-order layer, so the
+            // click-catcher goes one order higher: it can then never be painted
+            // over or reached from behind. It draws nothing.
+            .order(egui::Order::Debug)
+            .fixed_pos(screen.min)
+            .interactable(true)
+            .show(ui.ctx(), |ui| {
+                ui.set_clip_rect(screen);
+                // Give the area the full screen rect so egui treats the
+                // click-catcher layer as the top-most one even before the first
+                // click lands on it.
+                ui.set_min_size(screen.size());
+                // Four bands covering everything but the trigger.
+                let bands = [
+                    egui::Rect::from_min_max(screen.min, egui::pos2(screen.max.x, trigger.min.y)),
+                    egui::Rect::from_min_max(egui::pos2(screen.min.x, trigger.max.y), screen.max),
+                    egui::Rect::from_min_max(
+                        egui::pos2(screen.min.x, trigger.min.y),
+                        egui::pos2(trigger.min.x, trigger.max.y),
+                    ),
+                    egui::Rect::from_min_max(
+                        egui::pos2(trigger.max.x, trigger.min.y),
+                        egui::pos2(screen.max.x, trigger.max.y),
+                    ),
+                ];
+                for (index, band) in bands.into_iter().enumerate() {
+                    if band.width() > 0.5 && band.height() > 0.5 {
+                        ui.interact(band, open_key.with(("band", index)), egui::Sense::click());
+                    }
+                }
+            });
+    }
+
     fn select_with_side(
         &self,
         ui: &mut Ui,
@@ -1204,14 +1289,22 @@ impl Shadcn {
             })
             .fold(0.0_f32, f32::max);
         let width = width.max(max_label + 44.0);
-        let props = SelectProps::new(egui::Id::new(id), selected)
-            .size(SelectSize::Size2)
-            .width(width)
-            .side(side)
-            // The settings dialog renders at `Order::Tooltip`; raise the popup to
-            // the same order so it isn't hidden behind the dialog frame.
-            .container(SelectPortalContainer::Tooltip);
-        egui_shadcn::select::select_with_items(ui, &self.theme, props, &items)
+        let open_key = egui::Id::new((id, "rh_select_open"));
+        let mut reported: Option<bool> = None;
+        let response = {
+            let mut on_change = |is_open: bool| reported = Some(is_open);
+            let props = SelectProps::new(egui::Id::new(id), selected)
+                .size(SelectSize::Size2)
+                .width(width)
+                .side(side)
+                // The settings dialog renders at `Order::Tooltip`; raise the popup
+                // to the same order so it isn't hidden behind the dialog frame.
+                .container(SelectPortalContainer::Tooltip)
+                .on_open_change(&mut on_change);
+            egui_shadcn::select::select_with_items(ui, &self.theme, props, &items)
+        };
+        self.maintain_select_blocker(ui, open_key, reported, response.rect);
+        response
     }
 
     /// A panel select that respects the compact UI setting. Uses Size1 (24px)
@@ -1244,11 +1337,19 @@ impl Shadcn {
             })
             .fold(0.0_f32, f32::max);
         let width = width.max(max_label + 44.0);
-        let props = SelectProps::new(egui::Id::new(id), selected)
-            .size(size)
-            .width(width)
-            .container(SelectPortalContainer::Tooltip);
-        egui_shadcn::select::select_with_items(ui, &self.theme, props, &items)
+        let open_key = egui::Id::new((id, "rh_select_open"));
+        let mut reported: Option<bool> = None;
+        let response = {
+            let mut on_change = |is_open: bool| reported = Some(is_open);
+            let props = SelectProps::new(egui::Id::new(id), selected)
+                .size(size)
+                .width(width)
+                .container(SelectPortalContainer::Tooltip)
+                .on_open_change(&mut on_change);
+            egui_shadcn::select::select_with_items(ui, &self.theme, props, &items)
+        };
+        self.maintain_select_blocker(ui, open_key, reported, response.rect);
+        response
     }
 
     /// A horizontal row whose height is fixed up front so short labels stay

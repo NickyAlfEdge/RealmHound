@@ -310,6 +310,118 @@ fn fixed_cell<R>(
     .inner
 }
 
+/// The callable dungeon names a character-stats entry covers. Some legacy
+/// dungeons share one completion row in the stats list but are separate
+/// instances that get separate portal callouts:
+///
+/// - `Legacy Deadwater Docks & Grotto` -> `Legacy Deadwater Docks` + `Legacy Bilgewater's Grotto`
+/// - `Legacy Lair of Draconis & Ivory` -> `Legacy Lair of Draconis` + `The Ivory Wyvern`
+///
+/// Every other entry covers exactly one callable dungeon, so the slice is empty.
+fn legacy_callable_split(stats_name: &str) -> &'static [&'static str] {
+    match stats_name {
+        "Legacy Deadwater Docks & Grotto" => {
+            &["Legacy Deadwater Docks", "Legacy Bilgewater's Grotto"]
+        }
+        "Legacy Lair of Draconis & Ivory" => &["Legacy Lair of Draconis", "The Ivory Wyvern"],
+        _ => &[],
+    }
+}
+
+/// Width of the label column in the Dungeon Callouts card. Every field row
+/// reserves it so its dropdown starts at the same x no matter how long the
+/// label before it is.
+const CALLOUT_LABEL_WIDTH: f32 = 120.0;
+
+/// A bordered integer input matching the card's other text fields (e.g. the
+/// slang-name editor). `range` clamps a parsed value; `id` keys a persistent
+/// edit buffer so partial typing survives the frame, and the buffer re-syncs
+/// from `value` whenever the field is not focused. Returns whether the value
+/// changed.
+fn number_box(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    enabled: bool,
+    tip: &str,
+) -> bool {
+    let buf_id = egui::Id::new(id).with("number_box");
+    let mut buf: String = ui.data_mut(|d| d.get_temp(buf_id).unwrap_or_else(|| value.to_string()));
+    let response = ui.add_enabled(
+        enabled,
+        egui::TextEdit::singleline(&mut buf)
+            .desired_width(46.0)
+            .char_limit(4),
+    );
+    let mut changed = false;
+    if response.changed() {
+        if let Ok(n) = buf.trim().parse::<i32>() {
+            let n = n.clamp(*range.start(), *range.end());
+            if n != *value {
+                *value = n;
+                changed = true;
+            }
+        }
+    }
+    if !response.has_focus() {
+        buf = value.to_string();
+    }
+    if enabled {
+        response.hover_tip(tip);
+    } else {
+        response.disabled_hover_tip("This tag is not called (set to \"none\").");
+    }
+    ui.data_mut(|d| d.insert_temp(buf_id, buf));
+    changed
+}
+
+/// A callout threshold as the "Add to the call if [n] % or more" requirement:
+/// the minimum reward bonus (in percent) at which a tag is called. Greyed out
+/// when the tag it belongs to is set to `none`, so the field reads as inert
+/// rather than ignored. Returns whether the value changed.
+fn threshold_field(ui: &mut egui::Ui, id: &str, value: &mut i32, enabled: bool, tip: &str) -> bool {
+    ui.label(RichText::new("Add to the call if").weak());
+    let changed = number_box(ui, id, value, 0..=100, enabled, tip);
+    ui.label(RichText::new("% or more").weak());
+    changed
+}
+
+/// A bordered numeric field for how many of a dungeon's recent spawns are
+/// compared when recognizing an event mod from the user's own runs. Returns
+/// whether the value changed.
+fn run_count_field(ui: &mut egui::Ui, value: &mut u32) -> bool {
+    let buf_id = egui::Id::new("learn_event_mods_runs").with("number_box");
+    let mut buf: String = ui.data_mut(|d| d.get_temp(buf_id).unwrap_or_else(|| value.to_string()));
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut buf)
+            .desired_width(32.0)
+            .char_limit(2),
+    );
+    let mut changed = false;
+    if response.changed() {
+        if let Ok(n) = buf.trim().parse::<u32>() {
+            let n = n.clamp(
+                *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.start(),
+                *realmhound_core::settings::LEARN_EVENT_MOD_RUNS_RANGE.end(),
+            );
+            if n != *value {
+                *value = n;
+                changed = true;
+            }
+        }
+    }
+    if !response.has_focus() {
+        buf = value.to_string();
+    }
+    response.hover_tip(
+        "Select the number of dungeon runs based on which RealmHound will attempt to \
+         identify which dungeon mods are guaranteed for that dungeon this week.",
+    );
+    ui.data_mut(|d| d.insert_temp(buf_id, buf));
+    changed
+}
+
 /// Cache key for the projected Taskbar items. When every field matches the
 /// previous frame the cached `taskbar_items_cache` is reused instead of
 /// reprojecting missions/quests (and their tooltips) again.
@@ -667,6 +779,8 @@ pub struct RealmHoundApp {
     widget_widths: std::collections::HashMap<realmhound_core::settings::WidgetKind, f32>,
     /// Currently selected sub-tab within the Sound settings panel.
     sound_sub_tab: SoundSubTab,
+    /// Currently selected sub-tab within the Live Feed settings panel.
+    live_feed_sub_tab: LiveFeedSubTab,
     /// Account key of a pending switch confirmation.
     switch_confirm_target: Option<realmhound_core::account::AccountKey>,
     /// Cached registry entries for the profile list, refreshed on settings open.
@@ -694,6 +808,16 @@ enum SoundSubTab {
     LootBags,
     RealmBosses,
     Enchantments,
+}
+
+/// Sub-tabs of the Live Feed settings panel, splitting the previously crowded
+/// single view into focused sections.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum LiveFeedSubTab {
+    #[default]
+    NotificationsWarnings,
+    DungeonCallouts,
+    EncounterCallouts,
 }
 
 /// Where a dragged Widget Bar chip would be dropped: which row (0 = top,
@@ -1102,6 +1226,7 @@ impl RealmHoundApp {
             widget_drop: None,
             widget_widths: std::collections::HashMap::new(),
             sound_sub_tab: SoundSubTab::default(),
+            live_feed_sub_tab: LiveFeedSubTab::default(),
             switch_confirm_target: None,
             cached_registry_entries: Vec::new(),
             registry_cache_loaded: false,
@@ -1356,7 +1481,7 @@ impl RealmHoundApp {
     ///
     /// Returns `true` if the per-frame cap was hit (more may remain), so the
     /// caller can request another repaint to keep draining.
-    fn drain_ui_updates(&mut self, _ctx: &egui::Context) -> bool {
+    fn drain_ui_updates(&mut self, ctx: &egui::Context) -> bool {
         #[cfg(feature = "latency-diagnostics")]
         let frame_started = Instant::now();
         #[cfg(feature = "latency-diagnostics")]
@@ -1446,6 +1571,23 @@ impl RealmHoundApp {
                 minimized
             );
         }
+        // The Live Feed panel decides when its automatic dungeon callout has to
+        // be copied or cleared, but it only runs while its tab is open. The
+        // clipboard write therefore happens here, every frame.
+        if let Some(write) = self.live_feed_panel.poll_clipboard() {
+            match write {
+                crate::panels::live_feed::ClipboardWrite::Copy(text) => ctx.copy_text(text),
+                crate::panels::live_feed::ClipboardWrite::ClearIfUnchanged(copied) => {
+                    // Only drop the callout this panel copied. If the clipboard
+                    // holds anything else, the user copied something in the
+                    // meantime and it stays untouched.
+                    if crate::clipboard::still_holds(&copied) {
+                        ctx.copy_text(String::new());
+                    }
+                }
+            }
+        }
+
         applied == 4096
     }
 
@@ -2143,6 +2285,34 @@ impl RealmHoundApp {
                                                     .clicked()
                                                 {
                                                     self.sound_sub_tab = sub;
+                                                }
+                                                ui.add_space(2.0);
+                                            }
+                                        }
+
+                                        // Nested Live Feed sub-tabs (Discord-style)
+                                        // shown while the Live Feed tab is active.
+                                        if key == "live_feed" && active == "live_feed" {
+                                            for (sub, sub_label) in [
+                                                (
+                                                    LiveFeedSubTab::NotificationsWarnings,
+                                                    "Notifications & Warnings",
+                                                ),
+                                                (
+                                                    LiveFeedSubTab::DungeonCallouts,
+                                                    "Dungeon Callouts",
+                                                ),
+                                                (
+                                                    LiveFeedSubTab::EncounterCallouts,
+                                                    "Encounter Callouts",
+                                                ),
+                                            ] {
+                                                let sub_selected = self.live_feed_sub_tab == sub;
+                                                if shadcn
+                                                    .nav_subitem(ui, sub_label, sub_selected)
+                                                    .clicked()
+                                                {
+                                                    self.live_feed_sub_tab = sub;
                                                 }
                                                 ui.add_space(2.0);
                                             }
@@ -2936,8 +3106,12 @@ impl RealmHoundApp {
                         .map(|(v, l)| (v.as_str(), l.as_str()))
                         .collect();
                     let mut tier_sel = Some(current_settings.min_tiered_tier.to_string());
+                    // Open upward: the trigger is the last row of the last card
+                    // in the tab, so a downward popup has nowhere to go and gets
+                    // slid back over its own trigger (whose hover then scrolls
+                    // the list endlessly instead of letting a tier be picked).
                     if shadcn
-                        .select(ui, "min_tiered_tier", &mut tier_sel, 70.0, &option_refs)
+                        .select_up(ui, "min_tiered_tier", &mut tier_sel, 70.0, &option_refs)
                         .changed()
                     {
                         if let Some(parsed) =
@@ -3149,6 +3323,12 @@ impl RealmHoundApp {
     /// from the Trophy Hall dungeon list ([`ALL_DUNGEONS`]), so the dropdown
     /// matches the game's dungeon list exactly. Dungeons with no curated
     /// nickname get an empty default (still editable).
+    ///
+    /// The character-stats list folds some legacy dungeons into one combined row
+    /// (`Legacy Deadwater Docks & Grotto`, `Legacy Lair of Draconis & Ivory`)
+    /// because they share a completion entry. Calls are made for the instances
+    /// themselves, which are separate dungeons, so those rows are split into the
+    /// four callable names.
     fn dungeon_slang_entries() -> Vec<(String, String)> {
         realmhound_core::stats::ALL_DUNGEONS
             .iter()
@@ -3158,11 +3338,22 @@ impl RealmHoundApp {
                 !crate::panels::dungeon_callout::is_non_callable(d.name)
                     && !d.name.starts_with("Oryx's")
             })
-            .map(|d| {
-                let short = crate::panels::dungeon_callout::dungeon_nickname(d.name)
-                    .unwrap_or("")
-                    .to_string();
-                (d.name.to_string(), short)
+            .flat_map(|d| {
+                let split = legacy_callable_split(d.name);
+                let names: Vec<&str> = if split.is_empty() {
+                    vec![d.name]
+                } else {
+                    split.to_vec()
+                };
+                names
+                    .into_iter()
+                    .map(|name| {
+                        let short = crate::panels::dungeon_callout::dungeon_nickname(name)
+                            .unwrap_or("")
+                            .to_string();
+                        (name.to_string(), short)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -3271,7 +3462,7 @@ impl RealmHoundApp {
                         }
                         changed = true;
                     }
-                    if shadcn.btn_small(ui, "Done").clicked() {
+                    if shadcn.btn_small(ui, "Done").clicked() || shadcn.btn_x(ui).clicked() {
                         selected.clear();
                     }
                 });
@@ -3296,7 +3487,7 @@ impl RealmHoundApp {
                 ui.horizontal(|ui| {
                     self.render_picker_icon(ui, icon, &disp, 18.0);
                     ui.label(RichText::new(format!("{disp}  ->  {val}")).small());
-                    if shadcn.btn_small(ui, "x").clicked() {
+                    if shadcn.btn_x(ui).clicked() {
                         to_remove = Some(disp.clone());
                     }
                 });
@@ -3324,19 +3515,86 @@ impl RealmHoundApp {
         }
     }
 
+    /// Render the green "Preview:" block shown at the top of a settings group.
+    /// Each line is a callout the current settings would copy.
+    fn render_preview(ui: &mut egui::Ui, lines: &[String]) {
+        ui.label(RichText::new("Preview:").weak().small());
+        for line in lines {
+            ui.label(
+                RichText::new(line)
+                    .monospace()
+                    .color(Color32::from_rgb(120, 220, 120)),
+            );
+        }
+        ui.add_space(6.0);
+    }
+
+    /// The sample dungeon callout the Live Feed settings would copy, for the
+    /// preview block.
+    fn dungeon_callout_preview(current: &realmhound_core::settings::LiveFeedSettings) -> String {
+        let params = crate::panels::dungeon_callout::DungeonCalloutParams {
+            name_style: current.dungeon_name_style,
+            name_overrides: &current.dungeon_name_overrides,
+            loot_label: current.loot_label,
+            dust_label: current.dust_label,
+            xp_label: current.xp_label,
+            loot_threshold: current.loot_threshold,
+            dust_threshold: current.dust_threshold,
+            xp_threshold: current.xp_threshold,
+            call_event_mods: current.call_event_mods,
+            percent: current.callout_percent,
+            reward_mods: &current.reward_mods,
+            learned_event_mods: &[],
+            origin_status: None,
+        };
+        let tokens = [
+            "REWARDING".to_string(),
+            "GENEROUS".to_string(),
+            "KEYFAIRY".to_string(),
+        ];
+        let body =
+            crate::panels::dungeon_callout::dungeon_callout_for("The Shatters", &tokens, &params)
+                .unwrap_or_default();
+        Self::preview_with_join(&body, current.dungeon_join_position)
+    }
+
+    /// The sample encounter callout the Live Feed settings would copy, for the
+    /// preview block.
+    fn encounter_callout_preview(current: &realmhound_core::settings::LiveFeedSettings) -> String {
+        let body = crate::panels::event_call::event_call_body(
+            "Ravenous Rot",
+            current.event_name_style,
+            current.event_add_upcoming,
+            &current.event_name_overrides,
+        );
+        Self::preview_with_join(&body, current.event_join_position)
+    }
+
     /// Render the Live Feed settings panel.
     fn render_live_feed_settings(&mut self, ui: &mut egui::Ui, shadcn: &crate::shadcn_ui::Shadcn) {
         use realmhound_core::settings::{
-            DungeonNameStyle, DustLabel, JoinPosition, LootLabel, XpLabel,
+            DungeonNameStyle, DustLabel, JoinPosition, LootLabel, NexusMarker, RealmStatusMode,
+            XpLabel,
         };
 
         ui.add_space(10.0);
-        ui.heading("Live Feed");
+        let (heading, description) = match self.live_feed_sub_tab {
+            LiveFeedSubTab::NotificationsWarnings => (
+                "Notifications & Warnings",
+                "Choose what types of notifications and warnings appear in the Live Feed.",
+            ),
+            LiveFeedSubTab::DungeonCallouts => (
+                "Dungeon Callouts",
+                "Choose how quick dungeon callouts are formatted.",
+            ),
+            LiveFeedSubTab::EncounterCallouts => (
+                "Encounter Callouts",
+                "Choose how quick realm encounters callouts are formatted.",
+            ),
+        };
+        ui.heading(heading);
         ui.add_space(5.0);
-        ui.label(
-            RichText::new("Choose what appears in the Live Feed and how callouts are formatted.")
-                .weak(),
-        );
+        ui.label(RichText::new(description).weak());
         ui.add_space(15.0);
 
         let mut settings_changed = false;
@@ -3352,64 +3610,76 @@ impl RealmHoundApp {
         };
         let mut mod_tools_changed = false;
 
-        shadcn.card(ui, "lf_notifications", "Notifications", |ui| {
-            settings_changed |= shadcn
-                .switch(ui, &mut current.show_dm_in_live_feed, "Direct messages")
-                .hover_tip("Show incoming whispers as entries in the Live Feed.")
-                .changed();
-            ui.add_space(4.0);
-            settings_changed |= shadcn
-                .switch(ui, &mut current.show_dungeon_entries, "Dungeon entries")
-                .hover_tip("Show the callout entry created when you enter a dungeon.")
-                .changed();
-            ui.add_space(4.0);
-            settings_changed |= shadcn
-                .switch(ui, &mut current.show_boss_calls, "Realm event bosses")
-                .hover_tip(
-                    "Show realm event and boss announcements (e.g. Skull Shrine, Cube God, \
+        if self.live_feed_sub_tab == LiveFeedSubTab::NotificationsWarnings {
+            shadcn.card(ui, "lf_notifications", "Notifications", |ui| {
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.show_dm_in_live_feed, "Direct messages")
+                    .hover_tip("Show incoming whispers as entries in the Live Feed.")
+                    .changed();
+                ui.add_space(4.0);
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.show_dungeon_entries, "Dungeon entries")
+                    .hover_tip("Show the callout entry created when you enter a dungeon.")
+                    .changed();
+                ui.add_space(4.0);
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.show_boss_calls, "Realm event bosses")
+                    .hover_tip(
+                        "Show realm event and boss announcements (e.g. Skull Shrine, Cube God, \
                      Avatar of the Forgotten King).",
-                )
-                .changed();
-            ui.add_space(4.0);
-            settings_changed |= shadcn
-                .switch(ui, &mut current.show_key_pops, "Key pops")
-                .hover_tip(
-                    "Show nearby players popping dungeon keys. Click an entry to copy a \
-                     \"Thanks <name> for the key\" callout.",
-                )
-                .changed();
-            if current.show_key_pops {
-                ui.indent("lf_key_pop_tiers", |ui| {
-                    ui.label(
-                        RichText::new(
-                            "Only show these difficulty tiers (unknown ratings always show):",
-                        )
-                        .weak()
-                        .small(),
-                    );
-                    let f = &mut current.key_pop_tiers;
-                    ui.horizontal_wrapped(|ui| {
-                        settings_changed |= shadcn
-                            .switch(ui, &mut f.rookie, "Rookie")
-                            .hover_tip("Grave difficulty 2 or lower (e.g. Spider Den, The Hive).")
-                            .changed();
-                        settings_changed |= shadcn
-                            .switch(ui, &mut f.adept, "Adept")
-                            .hover_tip("Grave difficulty above 2 up to 4.5 (e.g. Snake Pit, Abyss of Demons).")
-                            .changed();
-                        settings_changed |= shadcn
-                            .switch(ui, &mut f.expert, "Expert")
-                            .hover_tip("Grave difficulty above 4.5 up to 6.5 (e.g. Lair of Draconis, Ocean Trench).")
-                            .changed();
-                        settings_changed |= shadcn
-                            .switch(ui, &mut f.exaltation, "Exaltation")
-                            .hover_tip("Grave difficulty above 6.5 (e.g. The Nest, Lost Halls, The Shatters).")
-                            .changed();
+                    )
+                    .changed();
+                ui.add_space(4.0);
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.show_key_pops, "Key pops")
+                    .hover_tip(
+                        "Show nearby players popping dungeon keys. Click an entry to copy a \
+                     \"Thanks <name> for the key!\" callout.",
+                    )
+                    .changed();
+                if current.show_key_pops {
+                    ui.indent("lf_key_pop_tiers", |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Only show these difficulty tiers (unknown ratings always show):",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        let f = &mut current.key_pop_tiers;
+                        ui.horizontal_wrapped(|ui| {
+                            settings_changed |= shadcn
+                                .switch(ui, &mut f.rookie, "Rookie")
+                                .hover_tip(
+                                    "Grave difficulty 2 or lower (e.g. Spider Den, The Hive).",
+                                )
+                                .changed();
+                            settings_changed |= shadcn
+                                .switch(ui, &mut f.adept, "Adept")
+                                .hover_tip(
+                                    "Grave difficulty above 2 up to 4.5 (e.g. Snake Pit, Abyss of \
+                                 Demons).",
+                                )
+                                .changed();
+                            settings_changed |= shadcn
+                                .switch(ui, &mut f.expert, "Expert")
+                                .hover_tip(
+                                    "Grave difficulty above 4.5 up to 6.5 (e.g. Lair of Draconis, \
+                                 Ocean Trench).",
+                                )
+                                .changed();
+                            settings_changed |= shadcn
+                                .switch(ui, &mut f.exaltation, "Exaltation")
+                                .hover_tip(
+                                    "Grave difficulty above 6.5 (e.g. The Nest, Lost Halls, The \
+                                 Shatters).",
+                                )
+                                .changed();
+                        });
                     });
-                });
-            }
-            ui.add_space(4.0);
-            settings_changed |= shadcn
+                }
+                ui.add_space(4.0);
+                settings_changed |= shadcn
                 .switch(ui, &mut current.show_area_unlocks, "Area unlocks")
                 .hover_tip(
                     "Show when nearby players pop area unlocks (Wine Cellar Incantation, Vial of \
@@ -3417,28 +3687,28 @@ impl RealmHoundApp {
                      \"Thanks ...\" callout.",
                 )
                 .changed();
-            ui.add_space(4.0);
-            settings_changed |= shadcn
+                ui.add_space(4.0);
+                settings_changed |= shadcn
                 .switch(ui, &mut current.show_who_roster, "Player list (/who)")
                 .hover_tip(
                     "Click to copy the list of players inside your location, A-Z, one name per \
                      line.",
                 )
                 .changed();
-            ui.add_space(4.0);
-            settings_changed |= shadcn
-                .switch(ui, &mut current.show_loot_drops, "Loot drops")
-                .hover_tip(
-                    "Show loot-drop entries (white/red/etc. bags) in the feed. Disabling only \
+                ui.add_space(4.0);
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.show_loot_drops, "Loot drops")
+                    .hover_tip(
+                        "Show loot-drop entries (white/red/etc. bags) in the feed. Disabling only \
                      removes them from Live Feed, they still show up in Loot History.",
-                )
-                .changed();
-        });
+                    )
+                    .changed();
+            });
 
-        ui.add_space(12.0);
+            ui.add_space(12.0);
 
-        shadcn.card(ui, "lf_warnings", "Warnings", |ui| {
-            settings_changed |= shadcn
+            shadcn.card(ui, "lf_warnings", "Warnings", |ui| {
+                settings_changed |= shadcn
                 .switch(
                     ui,
                     &mut current.show_realm_warnings,
@@ -3449,14 +3719,16 @@ impl RealmHoundApp {
                 )
                 .changed();
 
-            ui.add_space(4.0);
-            settings_changed |= shadcn
-                .switch(ui, &mut current.show_dust_full, "Dust cap full")
-                .hover_tip("Show a warning when enchanting dust of a certain type reaches its cap.")
-                .changed();
+                ui.add_space(4.0);
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.show_dust_full, "Dust cap full")
+                    .hover_tip(
+                        "Show a warning when enchanting dust of a certain type reaches its cap.",
+                    )
+                    .changed();
 
-            ui.add_space(4.0);
-            if shadcn
+                ui.add_space(4.0);
+                if shadcn
                 .switch(ui, &mut mod_tools, "Party moderation")
                 .hover_tip(
                     "Show a warning when a person from a banlist is in the party or requests to \
@@ -3467,19 +3739,19 @@ impl RealmHoundApp {
                 mod_tools_changed = true;
             }
 
-            ui.add_space(8.0);
-            ui.label(RichText::new("End-of-cycle warnings").strong());
-            ui.label(
-                RichText::new(
-                    "Pin a reminder to the top of the Live Feed on the final day before a reset. \
-                     Season and battlepass end dates populate automatically from live game data \
-                     when you refresh your account.",
-                )
-                .weak()
-                .small(),
-            );
-            ui.add_space(4.0);
-            settings_changed |= shadcn
+                ui.add_space(8.0);
+                ui.label(RichText::new("End-of-cycle warnings").strong());
+                ui.label(
+                    RichText::new(
+                        "Pin a reminder to the top of the Live Feed on the final day before a \
+                         reset. Season and battlepass end dates populate automatically from live \
+                         game data when you refresh your account.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(4.0);
+                settings_changed |= shadcn
                 .switch(
                     ui,
                     &mut current.season_warnings.daily_calendar_enabled,
@@ -3490,556 +3762,717 @@ impl RealmHoundApp {
                      your daily login calendar items.",
                 )
                 .changed();
-            ui.add_space(4.0);
-            settings_changed |= shadcn
-                .switch(
-                    ui,
-                    &mut current.season_warnings.battlepass_enabled,
-                    "Battlepass ending warning",
-                )
-                .hover_tip("Warns on the last day before the configured battlepass reset.")
-                .changed();
-            ui.add_space(4.0);
-            settings_changed |= shadcn
-                .switch(
-                    ui,
-                    &mut current.season_warnings.season_enabled,
-                    "Season ending warning",
-                )
-                .hover_tip(
-                    "Warns on the last day before the configured season reset, with a hover \
-                     tooltip explaining how seasonal storage transfers.",
-                )
-                .changed();
-        });
-
-        ui.add_space(12.0);
-
-        shadcn.card(ui, "lf_dungeon_callouts", "Dungeon Callouts", |ui| {
-            // Join marker placement (dungeon default: end).
-            shadcn.field_row(ui, |ui| {
-                ui.label("Join marker (j):");
-                let cur = match current.dungeon_join_position {
-                    JoinPosition::End => "end",
-                    JoinPosition::Beginning => "start",
-                    JoinPosition::None => "none",
-                };
-                let mut sel = Some(cur.to_string());
-                if shadcn
-                    .select(
+                ui.add_space(4.0);
+                settings_changed |= shadcn
+                    .switch(
                         ui,
-                        "dungeon_join_position",
-                        &mut sel,
-                        140.0,
-                        &[("start", "at start"), ("end", "at end"), ("none", "none")],
+                        &mut current.season_warnings.battlepass_enabled,
+                        "Battlepass ending warning",
                     )
-                    .hover_tip("Where the join marker \"j\" is placed in dungeon callouts.")
-                    .changed()
-                {
-                    current.dungeon_join_position = match sel.as_deref() {
-                        Some("start") => JoinPosition::Beginning,
-                        Some("none") => JoinPosition::None,
-                        _ => JoinPosition::End,
-                    };
-                    settings_changed = true;
-                }
+                    .hover_tip("Warns on the last day before the configured battlepass reset.")
+                    .changed();
+                ui.add_space(4.0);
+                settings_changed |= shadcn
+                    .switch(
+                        ui,
+                        &mut current.season_warnings.season_enabled,
+                        "Season ending warning",
+                    )
+                    .hover_tip(
+                        "Warns on the last day before the configured season reset, with a hover \
+                     tooltip explaining how seasonal storage transfers.",
+                    )
+                    .changed();
             });
+        }
 
-            ui.add_space(6.0);
+        if self.live_feed_sub_tab == LiveFeedSubTab::DungeonCallouts {
+            // Green preview at the top of every group in this tab.
+            let dungeon_preview = Self::dungeon_callout_preview(&current);
 
-            shadcn.field_row(ui, |ui| {
-                ui.label("Dungeon names:");
-                let cur = match current.dungeon_name_style {
-                    DungeonNameStyle::Short => "short",
-                    DungeonNameStyle::Full => "full",
-                };
-                let mut sel = Some(cur.to_string());
-                if shadcn
+            shadcn.card(ui, "lf_callout_structure", "Callout Structure", |ui| {
+                Self::render_preview(ui, std::slice::from_ref(&dungeon_preview));
+
+                settings_changed |= shadcn
+                    .switch(
+                        ui,
+                        &mut current.auto_clipboard_dungeon_calls,
+                        "Auto clipboard dungeon calls",
+                    )
+                    .hover_tip(
+                        "Copy a dungeon's callout to the clipboard as soon as you enter it, \
+                         without clicking its feed entry. The clipboard is cleared again when \
+                         the dungeon can no longer be joined, when you move on, or when the \
+                         realm closes.",
+                    )
+                    .changed();
+                ui.add_space(8.0);
+
+                // Short-name editing only applies while short names are in use; it
+                // is hidden for the full-name and name-less styles.
+                if matches!(current.dungeon_name_style, DungeonNameStyle::Short) {
+                    ui.label(RichText::new("Edit short dungeon names").strong());
+                    ui.label(
+                        RichText::new(
+                            "Search a dungeon, then override its short name. Leave blank to keep \
+                             the default (shown as a hint).",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    ui.add_space(4.0);
+                    {
+                        let entries = Self::dungeon_slang_entries();
+                        if self.render_slang_editor(
+                            ui,
+                            shadcn,
+                            "dungeon",
+                            "slang_dungeon",
+                            &entries,
+                            &mut current.dungeon_name_overrides,
+                            PickerIcon::Portal,
+                            "Type a dungeon name...",
+                        ) {
+                            settings_changed = true;
+                        }
+                    }
+                    ui.add_space(8.0);
+                }
+
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Dungeon names:");
+                    });
+                    let cur = match current.dungeon_name_style {
+                        DungeonNameStyle::Short => "short",
+                        DungeonNameStyle::Full => "full",
+                        DungeonNameStyle::None => "none",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
                     .select(
                         ui,
                         "dungeon_name_style",
                         &mut sel,
                         140.0,
-                        &[("short", "short (slang)"), ("full", "full names")],
+                        &[
+                            ("short", "short (slang)"),
+                            ("full", "full names"),
+                            ("none", "none"),
+                        ],
                     )
                     .hover_tip(
                         "Short uses curated nicknames (e.g. \"halls\"); Full uses the dungeon's \
-                         full name lowercased (e.g. \"lost halls\"). Only affects clipboard text.",
+                         full name lowercased (e.g. \"lost halls\"); None calls only the \
+                         reward/mod tags, for dungeon-specific parties where the dungeon is \
+                         already known. Only affects clipboard text.",
                     )
                     .changed()
                 {
                     current.dungeon_name_style = match sel.as_deref() {
                         Some("full") => DungeonNameStyle::Full,
+                        Some("none") => DungeonNameStyle::None,
                         _ => DungeonNameStyle::Short,
                     };
                     settings_changed = true;
                 }
-            });
-
-            ui.add_space(4.0);
-            ui.label(RichText::new("Edit slang names").strong());
-            ui.label(
-                RichText::new(
-                    "Search a dungeon, then override its short name. Leave blank to keep the \
-                     default (shown as a hint).",
-                )
-                .weak()
-                .small(),
-            );
-            ui.add_space(4.0);
-            {
-                let entries = Self::dungeon_slang_entries();
-                if self.render_slang_editor(
-                    ui,
-                    shadcn,
-                    "dungeon",
-                    "slang_dungeon",
-                    &entries,
-                    &mut current.dungeon_name_overrides,
-                    PickerIcon::Portal,
-                    "Type a dungeon name...",
-                ) {
-                    settings_changed = true;
-                }
-            }
-
-            ui.add_space(8.0);
-
-            // Reward-value label modes.
-            shadcn.field_row(ui, |ui| {
-                ui.label("Loot boost:");
-                let cur = match current.loot_label {
-                    LootLabel::Lb => "lb",
-                    LootLabel::Loot => "loot",
-                    LootLabel::None => "none",
-                };
-                let mut sel = Some(cur.to_string());
-                if shadcn
-                    .select(
-                        ui,
-                        "loot_label",
-                        &mut sel,
-                        120.0,
-                        &[("lb", "lb"), ("loot", "loot"), ("none", "none")],
-                    )
-                    .changed()
-                {
-                    current.loot_label = match sel.as_deref() {
-                        Some("loot") => LootLabel::Loot,
-                        Some("none") => LootLabel::None,
-                        _ => LootLabel::Lb,
-                    };
-                    settings_changed = true;
-                }
-            });
-
-            ui.add_space(6.0);
-
-            shadcn.field_row(ui, |ui| {
-                ui.label("Dust boost:");
-                let cur = match current.dust_label {
-                    DustLabel::Db => "db",
-                    DustLabel::Dust => "dust",
-                    DustLabel::None => "none",
-                };
-                let mut sel = Some(cur.to_string());
-                if shadcn
-                    .select(
-                        ui,
-                        "dust_label",
-                        &mut sel,
-                        120.0,
-                        &[("db", "db"), ("dust", "dust"), ("none", "none")],
-                    )
-                    .changed()
-                {
-                    current.dust_label = match sel.as_deref() {
-                        Some("dust") => DustLabel::Dust,
-                        Some("none") => DustLabel::None,
-                        _ => DustLabel::Db,
-                    };
-                    settings_changed = true;
-                }
-            });
-
-            ui.add_space(6.0);
-
-            shadcn.field_row(ui, |ui| {
-                ui.label("XP boost:");
-                let cur = match current.xp_label {
-                    XpLabel::Xp => "xp",
-                    XpLabel::None => "none",
-                };
-                let mut sel = Some(cur.to_string());
-                if shadcn
-                    .select(
-                        ui,
-                        "xp_label",
-                        &mut sel,
-                        120.0,
-                        &[("xp", "xp"), ("none", "none")],
-                    )
-                    .hover_tip("XP boosts are rarely called; off by default.")
-                    .changed()
-                {
-                    current.xp_label = match sel.as_deref() {
-                        Some("xp") => XpLabel::Xp,
-                        _ => XpLabel::None,
-                    };
-                    settings_changed = true;
-                }
-            });
-
-            ui.add_space(6.0);
-
-            settings_changed |= shadcn
-                .switch(
-                    ui,
-                    &mut current.callout_percent,
-                    "Include % sign in loot/dust/xp values",
-                )
-                .hover_tip(
-                    "When on, reward bonuses include the percent sign (e.g. \"15% lb\"). \
-                     Off by default (e.g. \"15 lb\").",
-                )
-                .changed();
-
-            ui.add_space(10.0);
-            ui.label(RichText::new("Reward mods").strong());
-            ui.label(
-                RichText::new(
-                    "These mods get a tag in callouts. Toggle one off to stop calling it, or edit \
-                     its short call. Use the search to add any other mod. Mods with a blank call \
-                     are never added.",
-                )
-                .weak()
-                .small(),
-            );
-            ui.add_space(4.0);
-            {
-                let revealed_id = egui::Id::new("reward_mods_revealed");
-                let mut revealed: Vec<String> =
-                    ui.data_mut(|d| d.get_temp(revealed_id).unwrap_or_default());
-
-                // Search box at the top: a scrollable floating picker of mods not
-                // already shown. Picking one enables + reveals it.
-                let candidates: Vec<(String, String)> = current
-                    .reward_mods
-                    .iter()
-                    .filter(|e| e.id != "DIMITUS" && !revealed.contains(&e.id))
-                    .map(|e| (e.id.clone(), e.name.clone()))
-                    .collect();
-                if let Some(id) = self.render_search_picker(
-                    ui,
-                    shadcn,
-                    "reward_mods_add",
-                    "Add mod:",
-                    "Type a reward or unique mod name...",
-                    PickerIcon::None,
-                    &candidates,
-                ) {
-                    if let Some(e) = current.reward_mods.iter_mut().find(|e| e.id == id) {
-                        e.enabled = true;
-                    }
-                    revealed.push(id);
-                    settings_changed = true;
-                }
+                });
 
                 ui.add_space(6.0);
 
-                // Dimitus leads the list and is always shown (even when off): its
-                // toggle governs the whole callout, so it needs a permanent home.
-                if let Some(dim) = current.reward_mods.iter_mut().find(|e| e.id == "DIMITUS") {
-                    ui.horizontal(|ui| {
-                        if shadcn.switch(ui, &mut dim.enabled, "").changed() {
-                            settings_changed = true;
-                        }
-                        fixed_cell(ui, 200.0, 24.0, |ui| {
-                            ui.label(RichText::new(&dim.name));
-                        });
-                        if shadcn
-                            .text_edit_counted(ui, &mut dim.short, 16, 110.0, Some("(no call)"))
-                            .changed()
-                        {
-                            settings_changed = true;
-                        }
-                        ui.label(RichText::new("\u{24d8}").weak()).on_hover_text(
-                            "OFF disables the whole dungeon callout that has this mod",
-                        );
+                // Join marker placement (dungeon default: end).
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Join marker (j):");
                     });
-                }
-
-                // Rows for mods that are on (auto-revealed so they persist even
-                // after being toggled off this session) plus any surfaced via
-                // search. Layout: toggle, full name, then short call.
-                for entry in current.reward_mods.iter_mut() {
-                    if entry.id == "DIMITUS" {
-                        continue;
+                    let cur = match current.dungeon_join_position {
+                        JoinPosition::End => "end",
+                        JoinPosition::Beginning => "start",
+                        JoinPosition::None => "none",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
+                        .select(
+                            ui,
+                            "dungeon_join_position",
+                            &mut sel,
+                            140.0,
+                            &[("start", "at start"), ("end", "at end"), ("none", "none")],
+                        )
+                        .hover_tip("Where the join marker \"j\" is placed in dungeon callouts.")
+                        .changed()
+                    {
+                        current.dungeon_join_position = match sel.as_deref() {
+                            Some("start") => JoinPosition::Beginning,
+                            Some("none") => JoinPosition::None,
+                            _ => JoinPosition::End,
+                        };
+                        settings_changed = true;
                     }
-                    if entry.enabled && !revealed.contains(&entry.id) {
-                        revealed.push(entry.id.clone());
-                    }
-                    if !revealed.contains(&entry.id) {
-                        continue;
-                    }
-                    ui.horizontal(|ui| {
-                        if shadcn.switch(ui, &mut entry.enabled, "").changed() {
-                            settings_changed = true;
-                        }
-                        fixed_cell(ui, 200.0, 24.0, |ui| {
-                            ui.label(RichText::new(&entry.name));
-                        });
-                        if shadcn
-                            .text_edit_counted(ui, &mut entry.short, 16, 110.0, Some("(no call)"))
-                            .changed()
-                        {
-                            settings_changed = true;
-                        }
-                    });
-                }
-
-                ui.data_mut(|d| {
-                    d.insert_temp(revealed_id, revealed);
                 });
-            }
 
-            ui.add_space(8.0);
-            // Live green preview mirroring a real clipboard callout.
-            let preview = {
-                let params = crate::panels::dungeon_callout::DungeonCalloutParams {
-                    name_style: current.dungeon_name_style,
-                    name_overrides: &current.dungeon_name_overrides,
-                    loot_label: current.loot_label,
-                    dust_label: current.dust_label,
-                    xp_label: current.xp_label,
-                    percent: current.callout_percent,
-                    reward_mods: &current.reward_mods,
-                };
-                let tokens = [
-                    "REWARDING".to_string(),
-                    "GENEROUS".to_string(),
-                    "KEYFAIRY".to_string(),
-                ];
-                let body = crate::panels::dungeon_callout::dungeon_callout_for(
-                    "The Shatters",
-                    &tokens,
-                    &params,
-                )
-                .unwrap_or_default();
-                Self::preview_with_join(&body, current.dungeon_join_position)
-            };
-            ui.label(RichText::new("Preview:").weak().small());
-            ui.label(
-                RichText::new(preview)
-                    .monospace()
-                    .color(Color32::from_rgb(120, 220, 120)),
-            );
-        });
+                ui.add_space(8.0);
 
-        ui.add_space(12.0);
-
-        shadcn.card(ui, "lf_event_callouts", "Event Callouts", |ui| {
-            shadcn.field_row(ui, |ui| {
-                ui.label("Join marker (j):");
-                let cur = match current.event_join_position {
-                    JoinPosition::End => "end",
-                    JoinPosition::Beginning => "start",
-                    JoinPosition::None => "none",
-                };
-                let mut sel = Some(cur.to_string());
-                if shadcn
-                    .select(
+                // Reward-value label modes, each with the minimum bonus it takes to
+                // call the value (the field only matters when the tag is called).
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Loot boost:");
+                    });
+                    let cur = match current.loot_label {
+                        LootLabel::Lb => "lb",
+                        LootLabel::Loot => "loot",
+                        LootLabel::None => "none",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
+                        .select(
+                            ui,
+                            "loot_label",
+                            &mut sel,
+                            120.0,
+                            &[("lb", "lb"), ("loot", "loot"), ("none", "none")],
+                        )
+                        .changed()
+                    {
+                        current.loot_label = match sel.as_deref() {
+                            Some("loot") => LootLabel::Loot,
+                            Some("none") => LootLabel::None,
+                            _ => LootLabel::Lb,
+                        };
+                        settings_changed = true;
+                    }
+                    settings_changed |= threshold_field(
                         ui,
-                        "event_join_position",
-                        &mut sel,
-                        140.0,
-                        &[("start", "at start"), ("end", "at end"), ("none", "none")],
+                        "loot_threshold",
+                        &mut current.loot_threshold,
+                        !matches!(current.loot_label, LootLabel::None),
+                        "Only call the loot boost when it is at least this much.",
+                    );
+                });
+
+                ui.add_space(6.0);
+
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Dust boost:");
+                    });
+                    let cur = match current.dust_label {
+                        DustLabel::Db => "db",
+                        DustLabel::Dust => "dust",
+                        DustLabel::None => "none",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
+                        .select(
+                            ui,
+                            "dust_label",
+                            &mut sel,
+                            120.0,
+                            &[("db", "db"), ("dust", "dust"), ("none", "none")],
+                        )
+                        .changed()
+                    {
+                        current.dust_label = match sel.as_deref() {
+                            Some("dust") => DustLabel::Dust,
+                            Some("none") => DustLabel::None,
+                            _ => DustLabel::Db,
+                        };
+                        settings_changed = true;
+                    }
+                    settings_changed |= threshold_field(
+                        ui,
+                        "dust_threshold",
+                        &mut current.dust_threshold,
+                        !matches!(current.dust_label, DustLabel::None),
+                        "Only call the dust boost when it is at least this much.",
+                    );
+                });
+
+                ui.add_space(6.0);
+
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("XP boost:");
+                    });
+                    let cur = match current.xp_label {
+                        XpLabel::Xp => "xp",
+                        XpLabel::None => "none",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
+                        .select(
+                            ui,
+                            "xp_label",
+                            &mut sel,
+                            120.0,
+                            &[("xp", "xp"), ("none", "none")],
+                        )
+                        .hover_tip("XP boosts are rarely called; off by default.")
+                        .changed()
+                    {
+                        current.xp_label = match sel.as_deref() {
+                            Some("xp") => XpLabel::Xp,
+                            _ => XpLabel::None,
+                        };
+                        settings_changed = true;
+                    }
+                    settings_changed |= threshold_field(
+                        ui,
+                        "xp_threshold",
+                        &mut current.xp_threshold,
+                        matches!(current.xp_label, XpLabel::Xp),
+                        "Only call the XP boost when it is at least this much.",
+                    );
+                });
+
+                ui.add_space(6.0);
+
+                settings_changed |= shadcn
+                    .switch(
+                        ui,
+                        &mut current.callout_percent,
+                        "Include % sign in loot/dust/xp values",
                     )
-                    .hover_tip("Where the join marker \"j\" is placed in event callouts.")
+                    .hover_tip(
+                        "When on, reward bonuses include the percent sign (e.g. \"15% lb\"). \
+                     Off by default (e.g. \"15 lb\").",
+                    )
+                    .changed();
+
+                ui.add_space(6.0);
+
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Realm status:");
+                    });
+                    let cur = match current.realm_status {
+                        RealmStatusMode::None => "none",
+                        RealmStatusMode::Closing => "closing",
+                        RealmStatusMode::Score => "score",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    // The score option is named after the configured minimum, so it
+                    // tracks the number field as the user edits it.
+                    let score_label = format!("in {}% realm", current.realm_status_threshold);
+                    let opts = [
+                        ("none", "none".to_string()),
+                        ("closing", "in a closing realm".to_string()),
+                        ("score", score_label),
+                    ];
+                    let opts_ref: Vec<(&str, &str)> =
+                        opts.iter().map(|(v, l)| (*v, l.as_str())).collect();
+                    if shadcn
+                    .select(ui, "realm_status", &mut sel, 170.0, &opts_ref)
+                    .hover_tip(
+                        "Appended to calls for dungeons entered through a realm portal (a party \
+                         join has no realm of its own). \"in a closing realm\" covers realms past \
+                         90%; the score option names the realm score the dungeon was entered at.",
+                    )
                     .changed()
                 {
-                    current.event_join_position = match sel.as_deref() {
-                        Some("start") => JoinPosition::Beginning,
-                        Some("end") => JoinPosition::End,
-                        _ => JoinPosition::None,
+                    current.realm_status = match sel.as_deref() {
+                        Some("closing") => RealmStatusMode::Closing,
+                        Some("score") => RealmStatusMode::Score,
+                        _ => RealmStatusMode::None,
                     };
                     settings_changed = true;
                 }
-            });
+                    // The threshold only applies to the score option, so the box
+                    // appears with that option instead of sitting greyed out.
+                    if matches!(current.realm_status, RealmStatusMode::Score) {
+                        settings_changed |= threshold_field(
+                            ui,
+                            "realm_status_threshold",
+                            &mut current.realm_status_threshold,
+                            true,
+                            "Call the realm score from this percentage up.",
+                        );
+                    }
+                });
 
-            ui.add_space(6.0);
+                ui.add_space(6.0);
 
-            shadcn.field_row(ui, |ui| {
-                ui.label("Event names:");
-                let cur = match current.event_name_style {
-                    DungeonNameStyle::Short => "short",
-                    DungeonNameStyle::Full => "full",
-                };
-                let mut sel = Some(cur.to_string());
-                if shadcn
-                    .select(
-                        ui,
-                        "event_name_style",
-                        &mut sel,
-                        140.0,
-                        &[("short", "short (slang)"), ("full", "full names")],
-                    )
-                    .hover_tip("Only affects clipboard text. The feed always shows full names.")
-                    .changed()
-                {
-                    current.event_name_style = match sel.as_deref() {
-                        Some("full") => DungeonNameStyle::Full,
-                        _ => DungeonNameStyle::Short,
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Opened in Nexus:");
+                    });
+                    let cur = match current.nexus_marker {
+                        NexusMarker::None => "none",
+                        NexusMarker::Nex => "nex",
+                        NexusMarker::InNexus => "in nexus",
                     };
-                    settings_changed = true;
-                }
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
+                        .select(
+                            ui,
+                            "nexus_marker",
+                            &mut sel,
+                            140.0,
+                            &[("none", "none"), ("nex", "nex"), ("in nexus", "in nexus")],
+                        )
+                        .hover_tip(
+                            "Adds a Nexus marker to the call for the dungeons opened via keys in \
+                             Nexus/Vault/Guild Hall/Bazaar.",
+                        )
+                        .changed()
+                    {
+                        current.nexus_marker = match sel.as_deref() {
+                            Some("nex") => NexusMarker::Nex,
+                            Some("in nexus") => NexusMarker::InNexus,
+                            _ => NexusMarker::None,
+                        };
+                        settings_changed = true;
+                    }
+                });
             });
-
-            ui.add_space(4.0);
-            ui.label(RichText::new("Edit slang names").strong());
-            ui.label(
-                RichText::new(
-                    "Search an event, then override its short name. Leave blank to keep the \
-                     default (shown as a hint).",
-                )
-                .weak()
-                .small(),
-            );
-            ui.add_space(4.0);
-            {
-                let entries = Self::event_slang_entries();
-                if self.render_slang_editor(
-                    ui,
-                    shadcn,
-                    "event",
-                    "slang_event",
-                    &entries,
-                    &mut current.event_name_overrides,
-                    PickerIcon::Encounter,
-                    "Type an event boss name...",
-                ) {
-                    settings_changed = true;
-                }
-            }
-
-            ui.add_space(8.0);
-
-            settings_changed |= shadcn
-                .switch(
-                    ui,
-                    &mut current.event_add_upcoming,
-                    "Add upcoming dungeons to event calls",
-                )
-                .hover_tip(
-                    "Appends the dungeon an event is about to drop (e.g. \"rav rot, halls soon\").",
-                )
-                .changed();
-
-            ui.add_space(8.0);
-            let preview = {
-                let body = crate::panels::event_call::event_call_body(
-                    "Ravenous Rot",
-                    current.event_name_style,
-                    current.event_add_upcoming,
-                    &current.event_name_overrides,
-                );
-                Self::preview_with_join(&body, current.event_join_position)
-            };
-            ui.label(RichText::new("Preview:").weak().small());
-            ui.label(
-                RichText::new(preview)
-                    .monospace()
-                    .color(Color32::from_rgb(120, 220, 120)),
-            );
 
             ui.add_space(12.0);
-            shadcn.full_width_separator(ui);
-            ui.add_space(8.0);
-            ui.label(RichText::new("Alien Invasion callouts").strong());
-            ui.label(
-                RichText::new(
-                    "Each wave is called as \"<template> <wave number>\". Edit the template text; \
-                     the wave number is appended automatically.",
-                )
-                .weak()
-                .small(),
-            );
-            ui.add_space(4.0);
-            shadcn.field_row(ui, |ui| {
-                ui.label("Adept template:");
-                if shadcn
-                    .text_edit_counted(
-                        ui,
-                        &mut current.alien_adept_prefix,
-                        24,
-                        160.0,
-                        Some("adept wave"),
+
+            shadcn.card(ui, "lf_unique_reward_mods", "Unique & Reward mods", |ui| {
+                Self::render_preview(ui, std::slice::from_ref(&dungeon_preview));
+                ui.label(
+                    RichText::new(
+                        "These mods get a tag in callouts. Toggle one off to stop calling it, or \
+                         edit its short call. Use the search to add any other mod. Mods with a \
+                         blank call are never added.",
                     )
-                    .changed()
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(4.0);
                 {
-                    settings_changed = true;
+                    let revealed_id = egui::Id::new("reward_mods_revealed");
+                    let mut revealed: Vec<String> =
+                        ui.data_mut(|d| d.get_temp(revealed_id).unwrap_or_default());
+
+                    // Search box at the top: a scrollable floating picker of mods not
+                    // already shown. Picking one enables + reveals it.
+                    let candidates: Vec<(String, String)> = current
+                        .reward_mods
+                        .iter()
+                        .filter(|e| e.id != "DIMITUS" && !revealed.contains(&e.id))
+                        .map(|e| (e.id.clone(), e.name.clone()))
+                        .collect();
+                    if let Some(id) = self.render_search_picker(
+                        ui,
+                        shadcn,
+                        "reward_mods_add",
+                        "Add mod:",
+                        "Type a reward or unique mod name...",
+                        PickerIcon::None,
+                        &candidates,
+                    ) {
+                        if let Some(e) = current.reward_mods.iter_mut().find(|e| e.id == id) {
+                            e.enabled = true;
+                        }
+                        revealed.push(id);
+                        settings_changed = true;
+                    }
+
+                    ui.add_space(6.0);
+
+                    // Dimitus leads the list and is always shown (even when off): its
+                    // toggle governs the whole callout, so it needs a permanent home.
+                    if let Some(dim) = current.reward_mods.iter_mut().find(|e| e.id == "DIMITUS") {
+                        ui.horizontal(|ui| {
+                            if shadcn.switch(ui, &mut dim.enabled, "").changed() {
+                                settings_changed = true;
+                            }
+                            fixed_cell(ui, 200.0, 24.0, |ui| {
+                                ui.label(RichText::new(&dim.name));
+                            });
+                            if shadcn
+                                .text_edit_counted(ui, &mut dim.short, 16, 110.0, Some("(no call)"))
+                                .changed()
+                            {
+                                settings_changed = true;
+                            }
+                            ui.label(RichText::new("\u{24d8}").weak()).on_hover_text(
+                                "OFF disables the whole dungeon callout that has this mod",
+                            );
+                        });
+                    }
+
+                    // Rows for mods that are on (auto-revealed so they persist even
+                    // after being toggled off this session) plus any surfaced via
+                    // search. Layout: toggle, full name, then short call.
+                    for entry in current.reward_mods.iter_mut() {
+                        if entry.id == "DIMITUS" {
+                            continue;
+                        }
+                        if entry.enabled && !revealed.contains(&entry.id) {
+                            revealed.push(entry.id.clone());
+                        }
+                        if !revealed.contains(&entry.id) {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            if shadcn.switch(ui, &mut entry.enabled, "").changed() {
+                                settings_changed = true;
+                            }
+                            fixed_cell(ui, 200.0, 24.0, |ui| {
+                                ui.label(RichText::new(&entry.name));
+                            });
+                            if shadcn
+                                .text_edit_counted(
+                                    ui,
+                                    &mut entry.short,
+                                    16,
+                                    110.0,
+                                    Some("(no call)"),
+                                )
+                                .changed()
+                            {
+                                settings_changed = true;
+                            }
+                        });
+                    }
+
+                    ui.data_mut(|d| {
+                        d.insert_temp(revealed_id, revealed);
+                    });
                 }
             });
-            shadcn.field_row(ui, |ui| {
-                ui.label("Veteran template:");
-                if shadcn
-                    .text_edit_counted(
-                        ui,
-                        &mut current.alien_veteran_prefix,
-                        24,
-                        160.0,
-                        Some("veteran wave"),
+
+            ui.add_space(12.0);
+
+            shadcn.card(ui, "lf_dungeon_event_mods", "Dungeon Event Mods", |ui| {
+                Self::render_preview(ui, std::slice::from_ref(&dungeon_preview));
+                ui.label(
+                    RichText::new(
+                        "Unique and reward mods guaranteed by Deca's scheduled dungeon events",
                     )
-                    .changed()
-                {
-                    settings_changed = true;
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(4.0);
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.call_event_mods, "Always call event mods")
+                    .hover_tip(
+                        "Toggle this off to identify and exclude guaranteed event mods from quick \
+                     calls based on your logged dungeon runs. Loot, dust and XP derived from \
+                     guaranteed event mods will still be called out according to their settings.",
+                    )
+                    .changed();
+
+                // Identifying event mods is what replaces always-called ones, so the
+                // option only appears (and is only meaningful) while the switch above
+                // is off.
+                if !current.call_event_mods {
+                    if !current.learn_event_mods {
+                        current.learn_event_mods = true;
+                        settings_changed = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Identify event mods from");
+                        settings_changed |= run_count_field(ui, &mut current.learn_event_mods_runs);
+                        ui.label("logged runs of the same dungeon");
+                    });
                 }
             });
-            ui.add_space(4.0);
-            settings_changed |= shadcn
-                .switch(
-                    ui,
-                    &mut current.alien_wave4_boss,
-                    "Add upcoming boss to wave 4 callout",
-                )
-                .hover_tip(
-                    "Appends the incoming boss on the final wave: \"UFO soon\" for Adept, \
+        }
+
+        if self.live_feed_sub_tab == LiveFeedSubTab::EncounterCallouts {
+            // Green preview at the top of every group in this tab.
+            let encounter_preview = Self::encounter_callout_preview(&current);
+            let alien_previews = [
+                Self::preview_with_join(
+                    &crate::panels::event_call::alien_wave_call_body(
+                        false,
+                        4,
+                        &current.alien_adept_prefix,
+                        &current.alien_veteran_prefix,
+                        current.alien_wave4_boss,
+                    ),
+                    current.event_join_position,
+                ),
+                Self::preview_with_join(
+                    &crate::panels::event_call::alien_wave_call_body(
+                        true,
+                        4,
+                        &current.alien_adept_prefix,
+                        &current.alien_veteran_prefix,
+                        current.alien_wave4_boss,
+                    ),
+                    current.event_join_position,
+                ),
+            ];
+
+            shadcn.card(ui, "lf_encounter_callouts", "Encounter Callouts", |ui| {
+                Self::render_preview(ui, std::slice::from_ref(&encounter_preview));
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Join marker (j):");
+                    });
+                    let cur = match current.event_join_position {
+                        JoinPosition::End => "end",
+                        JoinPosition::Beginning => "start",
+                        JoinPosition::None => "none",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
+                        .select(
+                            ui,
+                            "event_join_position",
+                            &mut sel,
+                            140.0,
+                            &[("start", "at start"), ("end", "at end"), ("none", "none")],
+                        )
+                        .hover_tip("Where the join marker \"j\" is placed in event callouts.")
+                        .changed()
+                    {
+                        current.event_join_position = match sel.as_deref() {
+                            Some("start") => JoinPosition::Beginning,
+                            Some("end") => JoinPosition::End,
+                            _ => JoinPosition::None,
+                        };
+                        settings_changed = true;
+                    }
+                });
+
+                ui.add_space(6.0);
+
+                shadcn.field_row(ui, |ui| {
+                    fixed_cell(ui, CALLOUT_LABEL_WIDTH, 36.0, |ui| {
+                        ui.label("Encounter names:");
+                    });
+                    let cur = match current.event_name_style {
+                        DungeonNameStyle::Short => "short",
+                        DungeonNameStyle::Full => "full",
+                        DungeonNameStyle::None => "none",
+                    };
+                    let mut sel = Some(cur.to_string());
+                    if shadcn
+                        .select(
+                            ui,
+                            "event_name_style",
+                            &mut sel,
+                            140.0,
+                            &[
+                                ("short", "short (slang)"),
+                                ("full", "full names"),
+                                ("none", "none"),
+                            ],
+                        )
+                        .hover_tip(
+                            "Only affects clipboard text. The feed always shows full names. None \
+                         omits the encounter name from the callout.",
+                        )
+                        .changed()
+                    {
+                        current.event_name_style = match sel.as_deref() {
+                            Some("full") => DungeonNameStyle::Full,
+                            Some("none") => DungeonNameStyle::None,
+                            _ => DungeonNameStyle::Short,
+                        };
+                        settings_changed = true;
+                    }
+                });
+
+                if matches!(current.event_name_style, DungeonNameStyle::Short) {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Edit short encounter names").strong());
+                    ui.label(
+                        RichText::new(
+                            "Search an encounter, then override its short name. Leave blank to \
+                             keep the default (shown as a hint).",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    ui.add_space(4.0);
+                    {
+                        let entries = Self::event_slang_entries();
+                        if self.render_slang_editor(
+                            ui,
+                            shadcn,
+                            "event",
+                            "slang_event",
+                            &entries,
+                            &mut current.event_name_overrides,
+                            PickerIcon::Encounter,
+                            "Type a realm boss name...",
+                        ) {
+                            settings_changed = true;
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+
+                settings_changed |= shadcn
+                    .switch(ui, &mut current.event_add_upcoming, "Add upcoming dungeons")
+                    .hover_tip(
+                        "Appends the dungeon an encounter is about to drop (e.g. \"rav rot, halls \
+                     soon\").",
+                    )
+                    .changed();
+            });
+
+            ui.add_space(12.0);
+
+            shadcn.card(
+                ui,
+                "lf_alien_invasion_callouts",
+                "Alien Invasion Callouts",
+                |ui| {
+                    Self::render_preview(ui, &alien_previews);
+                    ui.label(
+                        RichText::new(
+                            "Each wave is called as \"<template> <wave number>\". Edit the \
+                             template text; the wave number is appended automatically.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    ui.add_space(4.0);
+                    shadcn.field_row(ui, |ui| {
+                        ui.label("Adept template:");
+                        if shadcn
+                            .text_edit_counted(
+                                ui,
+                                &mut current.alien_adept_prefix,
+                                24,
+                                160.0,
+                                Some("adept wave"),
+                            )
+                            .changed()
+                        {
+                            settings_changed = true;
+                        }
+                    });
+                    shadcn.field_row(ui, |ui| {
+                        ui.label("Veteran template:");
+                        if shadcn
+                            .text_edit_counted(
+                                ui,
+                                &mut current.alien_veteran_prefix,
+                                24,
+                                160.0,
+                                Some("veteran wave"),
+                            )
+                            .changed()
+                        {
+                            settings_changed = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    settings_changed |= shadcn
+                        .switch(
+                            ui,
+                            &mut current.alien_wave4_boss,
+                            "Add upcoming boss to wave 4 callout",
+                        )
+                        .hover_tip(
+                            "Appends the incoming boss on the final wave: \"UFO soon\" for Adept, \
                      \"calbrik soon\" for Veteran.",
-                )
-                .changed();
-            ui.add_space(6.0);
-            let alien_adept_preview = Self::preview_with_join(
-                &crate::panels::event_call::alien_wave_call_body(
-                    false,
-                    4,
-                    &current.alien_adept_prefix,
-                    &current.alien_veteran_prefix,
-                    current.alien_wave4_boss,
-                ),
-                current.event_join_position,
+                        )
+                        .changed();
+                },
             );
-            let alien_vet_preview = Self::preview_with_join(
-                &crate::panels::event_call::alien_wave_call_body(
-                    true,
-                    4,
-                    &current.alien_adept_prefix,
-                    &current.alien_veteran_prefix,
-                    current.alien_wave4_boss,
-                ),
-                current.event_join_position,
-            );
-            ui.label(RichText::new("Preview:").weak().small());
-            ui.label(
-                RichText::new(alien_adept_preview)
-                    .monospace()
-                    .color(Color32::from_rgb(120, 220, 120)),
-            );
-            ui.label(
-                RichText::new(alien_vet_preview)
-                    .monospace()
-                    .color(Color32::from_rgb(120, 220, 120)),
-            );
-        });
+        }
 
         if settings_changed || mod_tools_changed {
             let mut party_after = None;
@@ -4630,6 +5063,17 @@ impl RealmHoundApp {
                     ui.end_row();
 
                     settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.ign_mention, "IGN mention")
+                        .hover_tip(
+                            "Plays when another player's chat message mentions your \
+                             character name (IGN). Matches whole words only, and never \
+                             plays for your own messages.",
+                        )
+                        .changed();
+                    settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::IgnMention, current_settings);
+                    ui.end_row();
+
+                    settings_changed |= shadcn
                         .switch(ui, &mut current_settings.party, "Party message")
                         .hover_tip("Plays when a party member sends a party chat message.")
                         .changed();
@@ -4641,6 +5085,38 @@ impl RealmHoundApp {
                         .hover_tip("Plays when a guild member sends a guild chat message.")
                         .changed();
                     settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::Guild, current_settings);
+                    ui.end_row();
+
+                    settings_changed |= shadcn
+                        .switch(ui, &mut current_settings.custom_chat, "Custom chat")
+                        .hover_tip(
+                            "Plays when any chat message contains your trigger word. \
+                             Whole words only: a trigger of \"abyss\" does not play for \
+                             \"abyssal\". Set the word on the line below.",
+                        )
+                        .changed();
+                    settings_changed |= self.render_sound_row_controls(ui, shadcn, SoundType::CustomChat, current_settings);
+                    ui.end_row();
+
+                    // The trigger word gets its own line under its toggle so the
+                    // ping controls stay aligned with every other row.
+                    ui.label("Trigger word:");
+                    if shadcn
+                        .text_edit_counted(
+                            ui,
+                            &mut current_settings.custom_chat_text,
+                            realmhound_core::chat_ping::CUSTOM_CHAT_TEXT_MAX,
+                            150.0,
+                            Some("abyss"),
+                        )
+                        .on_hover_text(
+                            "Word or phrase that triggers the Custom chat ping. Max 50 \
+                             characters, matched case-insensitively as whole words.",
+                        )
+                        .changed()
+                    {
+                        settings_changed = true;
+                    }
                     ui.end_row();
 
                     settings_changed |= shadcn
@@ -9186,5 +9662,45 @@ mod reader_tests {
             AppStartError::Reader(detail) => assert!(detail.starts_with("loot")),
             other => panic!("expected a reader error, got {other}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod slang_tests {
+    use super::{legacy_callable_split, RealmHoundApp};
+
+    #[test]
+    fn combined_legacy_rows_split_into_callable_instances() {
+        assert_eq!(
+            legacy_callable_split("Legacy Deadwater Docks & Grotto"),
+            ["Legacy Deadwater Docks", "Legacy Bilgewater's Grotto"]
+        );
+        assert_eq!(
+            legacy_callable_split("Legacy Lair of Draconis & Ivory"),
+            ["Legacy Lair of Draconis", "The Ivory Wyvern"]
+        );
+        // Every other dungeon is its own call.
+        assert!(legacy_callable_split("Snake Pit").is_empty());
+        assert!(legacy_callable_split("Deadwater Docks").is_empty());
+    }
+
+    #[test]
+    fn slang_editor_lists_the_split_names_with_their_defaults() {
+        let entries = RealmHoundApp::dungeon_slang_entries();
+        let short_of = |name: &str| {
+            entries
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, short)| short.as_str())
+        };
+        // The combined stats names are gone; the callable instances are listed.
+        assert_eq!(short_of("Legacy Deadwater Docks & Grotto"), None);
+        assert_eq!(short_of("Legacy Lair of Draconis & Ivory"), None);
+        assert_eq!(short_of("Legacy Deadwater Docks"), Some("leg ddocks"));
+        assert_eq!(short_of("Legacy Bilgewater's Grotto"), Some("grotto"));
+        assert_eq!(short_of("Legacy Lair of Draconis"), Some("leg LOD"));
+        assert_eq!(short_of("The Ivory Wyvern"), Some("ivory"));
+        // The legacy block keeps its curated default.
+        assert_eq!(short_of("Legacy The Shatters"), Some("leg shatts"));
     }
 }

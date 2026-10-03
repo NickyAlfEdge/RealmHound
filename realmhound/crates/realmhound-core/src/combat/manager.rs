@@ -254,9 +254,17 @@ impl CombatManager {
     /// A loot bag was attributed to a mob. Realm events whose core boss can drop
     /// its bag without ever being seen dying (Towering Perfection) latch their
     /// card to Completed on the bag, even when only the segments were damaged.
-    pub fn on_boss_loot(&mut self, mob_type: i32, map_seed: i32) {
+    ///
+    /// Moonlight Village is the same shape: its bosses floor invulnerable, so a
+    /// bag recorded in the instance is what clears them (or Kitsune Umi, for her
+    /// dropper's loot). The finalized fights are persisted here.
+    pub fn on_boss_loot(&mut self, mob_type: i32, map_seed: i32, time_ms: i64) {
         if map_seed == 0 {
             return;
+        }
+        let mv_finished = self.tracker.on_instance_loot(mob_type, map_seed, time_ms);
+        if !mv_finished.is_empty() {
+            self.persist(mv_finished);
         }
         if let Some(enc_id) = crate::assets::encounter_loot_completes(mob_type) {
             self.pending_loot_completions.insert((map_seed, enc_id));
@@ -265,6 +273,13 @@ impl CombatManager {
             // loot-before-persist ordering, re-applied on the next persist.
             self.apply_pending_loot_completions();
         }
+    }
+
+    /// The group activated Moonlight Village's Leisurely Mode by consuming a Tofu
+    /// Delicacy (announced with a server notification). The run's fights are
+    /// labelled with it on the card.
+    pub fn on_mv_leisurely_mode(&mut self) {
+        self.tracker.on_mv_leisurely_mode();
     }
 
     /// Latch `killed` on every persisted encounter run matching a buffered
@@ -315,8 +330,14 @@ impl CombatManager {
     /// A boss taunt (`TextPacket` from the boss's own object id) arrived. Drives
     /// the Marble Colossus survival-phase split off its authoritative
     /// second-coming taunt, persisting the finalized pre-survival segment.
-    pub fn on_boss_text(&mut self, object_id: i32, text: &str, time_ms: i64) {
-        let finished = self.tracker.on_boss_text(object_id, text, time_ms);
+    pub fn on_boss_text(
+        &mut self,
+        object_id: i32,
+        speaker: Option<&str>,
+        text: &str,
+        time_ms: i64,
+    ) {
+        let finished = self.tracker.on_boss_text(object_id, speaker, text, time_ms);
         self.persist(finished);
     }
 
@@ -639,6 +660,11 @@ mod tests {
             encounter_run_id: None,
             local_close_calls: 0,
             aux_member_count: None,
+            spirits: 0,
+            leisurely: false,
+            petless: false,
+            spectral_hm: false,
+            shatters_hm: false,
             participants,
         }
     }

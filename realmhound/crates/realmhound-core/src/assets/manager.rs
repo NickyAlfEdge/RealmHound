@@ -179,6 +179,7 @@ const CURATED_BOSS_TYPES: &[i32] = &[
     29023, // DS Golden Rat -- Toxic Sewers wandering loot piñata that drops loot directly -- ENEMY,MINION,MINION_STRONG
     33018, // Oryxmas Realm Present (realm treasure crate) -- ENEMY,MINION,MINION_STRONG
     33280, // Shatters Stone Idol (secret hardmode boss) -- GOD,CONSTRUCT, 25k HP, no boss label
+    34551, // Demonic Effigy (Hero of Oryx realm set-piece) -- no labels, 9k HP (below the fallback)
     42255, // The Hemomancer (special boss) -- no labels
     42371, // Jotunn (special boss) -- no labels
     44020, // The Glitch (special boss) -- ENEMY,MINION,CUBE,GOD,MINION_STRONG
@@ -292,7 +293,10 @@ const CURATED_NON_BOSS_TYPES: &[i32] = &[
     34546, // World's Pearl -- World's Oyster add, routed to the pearl row
     34547, // World's Oyster Coral (Spawner) -- World's Oyster add, no labels
     34552, // Goblin Patriarch Villager ("Goblin Villager") -- Goblin Patriarch Adept Encounter minion, event-scaled HP, no labels
+    34554, // Goblin Outpost -- Goblin Patriarch Adept Encounter set-piece, 15k HP, no labels
+    34555, // Goblin Shaman ("Goblin Priest") -- Goblin Patriarch Adept Encounter minion, event-scaled HP, no labels
     34556, // Goblin Villager -- Goblin Patriarch Adept Encounter minion, event-scaled HP, no labels
+    34557, // Goblin Patriarch Fire ("Goblin Fire") -- Goblin Patriarch add, event-scaled HP, no labels
     34583, // White Blood Cell -- Bloodroot Heart add, no labels, event-scaled >10k HP
     34587, // Lich King Grave -- The Lich King add, 5k HP, no boss labels
     34604, // Angry Hornet -- Hornet's Nest add, routed to the aggregated hornet row
@@ -376,6 +380,7 @@ const CURATED_NON_BOSS_TYPES: &[i32] = &[
     52658, // Retro Woodland Ultimate Squirrel ("Mecha Squirrel")
     52659, // Retro Woodland Goblin Mage ("Forest Goblin Necromancer")
     52660, // Retro Woodland Goblin ("Forest Goblin Bruiser")
+    53007, // Beacon Guardian Carboniferous Minion ("Legion Soldier") -- realm beacon set-piece add, no labels, event-scaled HP
     53017, // Legion Missionary Holy Orb -- Legion Missionary add, no labels, 12.5k HP
     53018, // Legion Missionary Chaos Orb -- Legion Missionary add, no labels, 17.5k HP
 ];
@@ -589,6 +594,7 @@ const OPTIONAL_SECONDARY_BOSS_TYPES: &[i32] = &[
     43924, // Cursed Phantom (Cursed Library) -- Avalon the Archivist is main
     46385, // Infested Janus the Doorwarden (Oryx's Castle) -- Stone Guardians are main
     47387, // Calamity Crab (Deadwater Docks) -- Bilgewater is main
+    20493, // Kitsune Umi (Moonlight Village) -- the dancers are main
 ];
 
 /// Whether `id` is a dungeon's optional secondary boss ([`OPTIONAL_SECONDARY_BOSS_TYPES`])
@@ -608,14 +614,195 @@ pub fn prismimic_display_name(id: i32) -> Option<&'static str> {
 }
 
 /// Whether `id` is an invulnerable-finish boss: one that never reaches 0 HP but
-/// is instead scored by a completion marker spawning (a Moonlight Village dancer
-/// or Umi, or a Legacy Lair of Draconis dragon whose loot balloon chest marks
-/// it done). The combat tracker suspends these by type so a re-detection or the
-/// self-destruct despawn folds into one fight scored when its marker fires.
+/// is instead scored by the encounter's completion (a Moonlight Village dancer
+/// or Umi, whose run is cleared by its loot, or a Legacy Lair of Draconis dragon
+/// whose loot balloon chest marks it done). The combat tracker suspends these by
+/// type so a re-detection or the self-destruct despawn folds into one fight.
 pub fn is_invuln_finish_boss(id: i32) -> bool {
-    COMPLETION_MARKER_MAP
+    is_mv_boss(id)
+        || COMPLETION_MARKER_MAP
+            .iter()
+            .any(|(_, targets)| targets.contains(&id))
+}
+
+/// Whether `id` is a Moonlight Village mechanics boss: the three dancers (Sage
+/// Genji 20450, Dancer Miko 20451, Drummer Kaguya 20452) or the secret boss
+/// Kitsune Umi (20493).
+///
+/// Their XML `MaxHitPoints` is only a nominal figure -- they floor invulnerable
+/// instead of dying, and the run is cleared by its completion (the dancers'
+/// concluding line, or the loot their droppers emit) -- so the HP they carry is
+/// not a real damage pool. The combat engine must not cap damage to it (the
+/// party's overkill is really absorbed by an effectively-infinite pool) and the
+/// UI must express each player's share of the party's tracked total rather than
+/// a fraction of that fake pool.
+pub fn is_mv_boss(id: i32) -> bool {
+    MV_DANCER_TYPES.contains(&id) || id == MV_UMI_TYPE
+}
+
+/// Moonlight Village dancers, in the order the encounter is fought.
+pub const MV_DANCER_TYPES: &[i32] = &[20450, 20451, 20452];
+/// Moonlight Village's optional secret boss, Kitsune Umi.
+pub const MV_UMI_TYPE: i32 = 20493;
+
+/// The object whose sprite the card draws for Kitsune Umi's spirit tally:
+/// "Concentrated Soul Fire" (0x513C). Umi's spirits are her own, so they get
+/// their own flame instead of the dancers' shared spirit icon.
+pub const MV_UMI_SPIRIT_TYPE: i32 = 0x513C;
+
+/// The Moonlight Village loot tier a spirit total earns (4 is the best), or
+/// `None` when no spirits were collected at all.
+///
+/// RealmEye / issue #30: the dance is scored out of 88 spirits (Tier 4 from 78,
+/// Tier 3 from 58, Tier 2 from 40, Tier 1 from 2), while Kitsune Umi's shorter
+/// fight -- and a Leisurely Mode dance, which shares her thresholds -- is scored
+/// out of 56 (Tier 4 from 48, Tier 3 from 36, Tier 2 from 24, Tier 1 from 2).
+pub fn mv_spirit_tier(spirits: i32, leisurely: bool, umi: bool) -> Option<u8> {
+    if spirits <= 0 {
+        return None;
+    }
+    let thresholds: [(i32, u8); 4] = if umi || leisurely {
+        [(48, 4), (36, 3), (24, 2), (2, 1)]
+    } else {
+        [(78, 4), (58, 3), (40, 2), (2, 1)]
+    };
+    thresholds
         .iter()
-        .any(|(_, targets)| targets.contains(&id))
+        .find(|(minimum, _)| spirits >= *minimum)
+        .map(|(_, tier)| *tier)
+}
+
+/// Which Moonlight Village bosses a recorded loot bag clears. The invisible
+/// `MV Dungeon Complete` (0x50B2) and `MV Umi Complete` (0xC0BB) objects spawn
+/// around the start of the encounter (which is fine -- it is *not* a completion
+/// signal) and emit the dungeon's loot and XP when the run is cleared. Kitsune
+/// Umi's loot (or her dropper) clears only her; anything else in the instance is
+/// the dancers' loot, which pools the whole run and is therefore never resolved
+/// to a single dancer.
+pub fn mv_loot_completion_targets(mob_type: i32) -> &'static [i32] {
+    if mob_type == MV_UMI_TYPE || mob_type == 0xC0BB {
+        &[MV_UMI_TYPE]
+    } else {
+        MV_DANCER_TYPES
+    }
+}
+
+/// The line the dancers say when the Moonlight Village dance concludes. Emitted
+/// just before the clear loot lands, so it is the earliest completion signal.
+pub fn is_mv_dance_concluded_text(text: &str) -> bool {
+    text == "This concludes the Moonlight Dance."
+}
+
+/// The notification the game raises when a Moonlight Village group consumes a
+/// Tofu Delicacy and turns the run into Leisurely Mode: the phases are shorter
+/// and the loot is reduced, so the run is labelled apart from a normal clear.
+/// The payload is a JSON blob (the server message key carries the effect name
+/// and the initiating player's name), so match on the effect name inside it.
+pub fn is_mv_leisurely_mode_notification(message: &str) -> bool {
+    message.contains("Leisurely mode was initiated")
+}
+
+/// Moonlight Village's Challenge Gate ("MV Reward Shrine", 0x5049): the golden
+/// bell past the spawn room's hidden path. Attacking it starts the run's
+/// Challenge Mode, which permanently pet-stasises the player who rang it. The
+/// object has boss-tier HP but is never a fight, so the tracker only uses the
+/// hit to label the run "Petless".
+pub const MV_CHALLENGE_GATE_TYPE: i32 = 0x5049;
+
+/// Spectral Penitentiary's mini-bosses, by the catalog name their fight rows
+/// carry. Two of them guard every run, and both must be hard mode for the run
+/// to be (see [`SPECTRAL_HM_TAUNTS`] and [`is_spectral_murcian`]).
+pub const SPECTRAL_ZOLE_NAME: &str = "Griefkeeper Zole";
+pub const SPECTRAL_LOBOTOMIK_NAME: &str = "Doctor Lobotomik";
+pub const SPECTRAL_OCULON_NAME: &str = "Overseer Oculon";
+pub const SPECTRAL_GRETCH_NAME: &str = "Groundskeeper Gretch";
+
+/// Spectral Penitentiary's boss roster, and the taunt each mini-boss shouts when
+/// the group cleared *every* objective of its wing -- which the game only lets
+/// happen in the dungeon's hard mode. The taunts arrive verbatim as dialogue
+/// (`Text` packets) from the boss, so they are matched by text; the boss names
+/// are the catalog names the fight rows carry.
+///
+/// Verified against captured traffic (`.rhcap` replay): each string below was
+/// observed as an incoming `Text` packet from the boss in question.
+pub const SPECTRAL_HM_TAUNTS: &[(&str, &str)] = &[
+    (
+        SPECTRAL_ZOLE_NAME,
+        "RRRAAAGGH! Isn't it a bit too early for you to be causing a riot? You just got here!",
+    ),
+    (
+        SPECTRAL_LOBOTOMIK_NAME,
+        "WAIT WAIT WAIT! How did you deactivate all of those pylons so quickly?",
+    ),
+    (
+        SPECTRAL_OCULON_NAME,
+        "FINE, I'LL MOVE UP YOUR APPOINTMENT ON MY LIST. MAKE YOUR WAY TOWARDS MY OFFICE THIS INSTANT, AND PLEASE STOP DESTROYING MY EYELONS.",
+    ),
+    (
+        SPECTRAL_GRETCH_NAME,
+        "Calm yourselves, new souls! Come hither, and I will make sure your restlessness is properly handled...",
+    ),
+];
+
+/// The Spectral Penitentiary boss that shouted its hard-mode taunt, or `None`
+/// when `text` is any other line.
+pub fn spectral_hm_taunt_boss(text: &str) -> Option<&'static str> {
+    let line = text.trim();
+    SPECTRAL_HM_TAUNTS
+        .iter()
+        .find(|(_, taunt)| taunt.eq_ignore_ascii_case(line))
+        .map(|(boss, _)| *boss)
+}
+
+/// The object types each taunting mini-boss fights as. A fight is keyed by the
+/// type of the object it tracked, and only some of these carry a usable catalog
+/// name, so the taunt is tied to the boss's own card by type.
+///
+/// Types are the real ones seen in the combat history of the dungeon, including
+/// Doctor Lobotomik's separate transformation forms and the types the loot
+/// tracker attributes to Griefkeeper Zole.
+pub const SPECTRAL_HM_BOSS_TYPES: &[(&str, &[i32])] = &[
+    (
+        SPECTRAL_ZOLE_NAME,
+        &[23659, 23915, 23916, 41482, 44410, 44411],
+    ),
+    (
+        SPECTRAL_LOBOTOMIK_NAME,
+        &[23920, 23934, 23935, 23958, 23959, 23960, 23961],
+    ),
+    (SPECTRAL_OCULON_NAME, &[24071]),
+    (SPECTRAL_GRETCH_NAME, &[23819]),
+];
+
+/// The taunting Spectral Penitentiary mini-boss that fights as `object_type`, or
+/// `None` for any other object (see [`SPECTRAL_HM_BOSS_TYPES`]).
+pub fn spectral_hm_taunt_boss_of_type(object_type: i32) -> Option<&'static str> {
+    SPECTRAL_HM_BOSS_TYPES
+        .iter()
+        .find(|(_, types)| types.contains(&object_type))
+        .map(|(boss, _)| *boss)
+}
+
+/// Spectral Penitentiary's final boss, Soulwarden Murcian. He has no hard-mode
+/// taunt of his own: the dungeon is hard mode exactly when both of the run's
+/// mini-bosses were (which the game then applies to him too).
+pub const SPECTRAL_MURCIAN_TYPE: i32 = 23681;
+
+/// Whether `id` is Spectral Penitentiary's final boss (see
+/// [`SPECTRAL_MURCIAN_TYPE`]).
+pub fn is_spectral_murcian(id: i32) -> bool {
+    id == SPECTRAL_MURCIAN_TYPE
+}
+
+/// Moonlight Village spirit object ("MV Total Counter"). One instance spawns per
+/// spirit released at the end of a dance (or Umi) phase -- always in pairs and
+/// up to 8 per phase -- so the number of distinct instances observed in a run is
+/// the spirit total that drives the dungeon's loot tier.
+pub const MV_SPIRIT_TYPE: i32 = 0x5026;
+
+/// Whether `id` is the Moonlight Village spirit object (see [`MV_SPIRIT_TYPE`]).
+pub fn is_mv_spirit(id: i32) -> bool {
+    id == MV_SPIRIT_TYPE
 }
 
 /// Towering Perfection (Sprite Forest realm event) types. The tower repeatedly
@@ -645,13 +832,15 @@ pub fn is_dedup_prone_boss(id: i32) -> bool {
 /// a marker spawns the engine marks the mapped boss types as completed for the
 /// current run. Each tuple is `(marker_type, &[boss_type, ...])`.
 const COMPLETION_MARKER_MAP: &[(i32, &[i32])] = &[
-    // MV Dungeon Complete -> the three dancers (Sage Genji, Dancer Miko, Drummer Kaguya).
-    (20658, &[20450, 20451, 20452]),
-    // MV Umi Complete -> Kitsune Umi (secret boss).
-    (49339, &[20493]),
     // Legacy Lair of Draconis dragons self-destruct on defeat and spawn a loot
     // balloon chest; the dragon's HP never reaches 0, so it would otherwise log
     // as Escaped. Each chest spawn marks its dragon Completed.
+    //
+    // Moonlight Village is deliberately absent: its `MV Dungeon Complete` /
+    // `MV Umi Complete` objects spawn at the *start* of the encounter and only
+    // drop loot when the run is cleared, so the completion signal there is the
+    // loot (or the dancers' concluding line), not the spawn. See
+    // [`mv_loot_completion_targets`] and [`is_mv_dance_concluded_text`].
     (30009, &[29849]), // Blue chest -> Nikao (blue)
     (30049, &[29978]), // Black chest -> Feargus (black)
     (30035, &[30017]), // Green chest -> Limoz (green)
@@ -704,6 +893,136 @@ pub const LEGACY_LOD_IVORY_BOSS: i32 = 30026;
 /// Whether `object_type` is the Legacy Lair of Draconis Ivory Wyvern final boss.
 pub fn is_legacy_lod_ivory_boss(object_type: i32) -> bool {
     object_type == LEGACY_LOD_IVORY_BOSS
+}
+
+/// The Shatters hard mode: the object types whose hard-mode behaviour the
+/// tracker has to know about, plus the names hard mode reveals the bosses as.
+///
+/// Hard mode is unlocked in stages and renames the boss *entity* rather than
+/// its object type, so the fight card has to carry the revealed name itself:
+///
+/// - The Stone Idol (`0x8200`) is invincible until the Void Phantasm is absorbed
+///   next to it; damaging it means the run is in hard mode, and its defeat turns
+///   The Bridge Sentinel into **Valen the Unbreakable**.
+/// - The Source (`0x8242`, `Shatters Experimental Generator`) is the secret
+///   object destroyed in the Alchemy Lab wing; it is spawned only in hard mode,
+///   and destroying it turns the Twilight Archmage into **Nox the Wild Shadow**
+///   and carries through to the Forgotten King, who becomes **King Azamoth**.
+pub const SHATTERS_STONE_IDOL_TYPE: i32 = 0x8200;
+/// The Bridge Sentinel (The Shatters boss 1).
+pub const SHATTERS_BRIDGE_SENTINEL_TYPE: i32 = 29003;
+/// The Twilight Archmage (The Shatters boss 2).
+pub const SHATTERS_TWILIGHT_ARCHMAGE_TYPE: i32 = 29021;
+/// The Forgotten King (The Shatters boss 3, final).
+pub const SHATTERS_KING_TYPE: i32 = 29039;
+/// The Source -- the secret hard-mode object destroyed in the Alchemy Lab.
+pub const SHATTERS_THE_SOURCE_TYPE: i32 = 0x8242;
+/// The Shattered Queen, the hard-mode phase that spawns in place of the last
+/// stretch of the Forgotten King's fight (when Nox ended with 2 fire + 2 ice
+/// generators locked in) and reveals him as King Azamoth. The game ships her
+/// object without a display name at all -- its id name is the internal
+/// "Shatters A22" -- so her name comes from [`OBJECT_NAME_OVERRIDES`].
+pub const SHATTERS_QUEEN_TYPE: i32 = 0x4456;
+
+/// Tempest, the phoenix the hard-mode Twilight Archmage summons (internal id
+/// "Shatters A17"). It is the late stage's own hard-mode evidence, for a run
+/// whose Source was destroyed before we ever saw it.
+///
+/// The type comes from the game files: Tempest is the only member of the
+/// `Archmage Phoenixes` group without a display name -- the other two are the
+/// named `shtrs Blizzard` (0x729e) and `shtrs Inferno` (0x729d) -- and its 15k
+/// pool matches the 135k/9 the fight card sums for it. Its "hard mode only"
+/// nature is from the game's own behaviour rather than captured traffic: no
+/// hard-mode run has been recorded with us attached yet.
+pub const SHATTERS_TEMPEST_TYPE: i32 = 0x4452;
+
+/// The name the UI shows for object types the catalog names internally or not at
+/// all, overriding the catalog name. The Shattered Queen is the only one so far:
+/// she has no `DisplayId` in the game files (deliberate on Deca's part -- her
+/// name is only revealed in the fight's dialogue), which would otherwise leave
+/// the fight card reading "Shatters A22".
+const OBJECT_NAME_OVERRIDES: &[(i32, &str)] = &[(SHATTERS_QUEEN_TYPE, "The Shattered Queen")];
+
+/// The display name overriding the catalog name for `id`, or `None` to use the
+/// catalog's. See [`OBJECT_NAME_OVERRIDES`].
+pub fn object_name_override(id: i32) -> Option<&'static str> {
+    OBJECT_NAME_OVERRIDES
+        .iter()
+        .find(|(object_type, _)| *object_type == id)
+        .map(|(_, name)| *name)
+}
+
+/// The name hard mode reveals a Shatters boss as, or `None` for bosses hard mode
+/// does not rename (or for any other object).
+pub fn shatters_hm_boss_name(id: i32) -> Option<&'static str> {
+    match id {
+        SHATTERS_BRIDGE_SENTINEL_TYPE => Some("Valen the Unbreakable"),
+        SHATTERS_TWILIGHT_ARCHMAGE_TYPE => Some("Nox the Wild Shadow"),
+        SHATTERS_KING_TYPE => Some("King Azamoth"),
+        _ => None,
+    }
+}
+
+/// The Shatters boss whose hard-mode name `speaker` is, or `None`.
+///
+/// A renamed boss *speaks* under its new name, which is how the client learns it
+/// at all (the object type is unchanged, so the name cannot come from the XML);
+/// the line is therefore distinctive evidence that this very boss was in hard
+/// mode. The chat framing is not part of the name, so a leading `#`, surrounding
+/// brackets and case are ignored.
+pub fn shatters_hm_named_boss(speaker: &str) -> Option<i32> {
+    let name = speaker
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    [
+        SHATTERS_BRIDGE_SENTINEL_TYPE,
+        SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+        SHATTERS_KING_TYPE,
+    ]
+    .into_iter()
+    .find(|&id| shatters_hm_boss_name(id).is_some_and(|n| n.eq_ignore_ascii_case(name)))
+}
+
+/// The name a Shatters boss fights under in its regular form, or `None` for any
+/// other object. Mirrors the bosses' display names in the game catalog so
+/// callers that must not depend on the assets (Loot History naming, the loot
+/// database's rename migration) stay deterministic.
+pub fn shatters_boss_name(id: i32) -> Option<&'static str> {
+    match id {
+        SHATTERS_BRIDGE_SENTINEL_TYPE => Some("The Bridge Sentinel"),
+        SHATTERS_TWILIGHT_ARCHMAGE_TYPE => Some("Twilight Archmage"),
+        SHATTERS_KING_TYPE => Some("The Forgotten King"),
+        _ => None,
+    }
+}
+
+/// Whether `id` is one of the three Shatters bosses the run is scored on (the
+/// card is labelled hard mode when every one fought was a hard-mode variant).
+pub fn is_shatters_main_boss(id: i32) -> bool {
+    matches!(
+        id,
+        SHATTERS_BRIDGE_SENTINEL_TYPE | SHATTERS_TWILIGHT_ARCHMAGE_TYPE | SHATTERS_KING_TYPE
+    )
+}
+
+/// Sprite sheet hard mode draws the Forgotten King's revealed form from.
+pub const SHATTERS_HM_KING_SHEET: &str = "theShattersChars32x32";
+/// Frame of [`SHATTERS_HM_KING_SHEET`] King Azamoth is drawn from. Hard mode
+/// reveals the King rather than swapping in another object, so the revealed
+/// sprite is one of the extra frames his own object references.
+pub const SHATTERS_HM_KING_FRAME: i32 = 15;
+
+/// The sprite hard mode swaps a Shatters boss to, as `(sheet, frame)`, or `None`
+/// for the bosses whose hard-mode form keeps the object's own sprite.
+pub fn shatters_hm_boss_sprite(id: i32) -> Option<(&'static str, i32)> {
+    match id {
+        SHATTERS_KING_TYPE => Some((SHATTERS_HM_KING_SHEET, SHATTERS_HM_KING_FRAME)),
+        _ => None,
+    }
 }
 
 /// The boss object types a completion marker signals as cleared, or `None` when
@@ -992,11 +1311,11 @@ const ENCOUNTERS: &[Encounter] = &[
         // The Archmage plus his three "Archmage Phoenix" bird spawns and the
         // arena generators, so their aggregated summaries group into this card.
         member_types: &[
-            29021, // Twilight Archmage (anchor)
-            29341, // Inferno (bird, summary representative)
-            29342, // Blizzard (bird, summary representative)
-            17490, // Tempest (bird, hardmode; summary representative)
-            33054, // Generator (summary representative)
+            29021,                 // Twilight Archmage (anchor)
+            29341,                 // Inferno (bird, summary representative)
+            29342,                 // Blizzard (bird, summary representative)
+            SHATTERS_TEMPEST_TYPE, // Tempest (bird, hard mode; summary representative)
+            33054,                 // Generator (summary representative)
         ],
     },
     // Legacy The Shatters: the Twilight Archmage plus his two "Retro Archmage
@@ -1525,11 +1844,11 @@ const AUX_TARGETS: &[(&[i32], AuxTarget)] = &[
         },
     ),
     (
-        &[17490],
+        &[SHATTERS_TEMPEST_TYPE],
         AuxTarget {
             category: "archmage_tempest",
             display_name: "Tempest",
-            repr_type: 17490,
+            repr_type: SHATTERS_TEMPEST_TYPE,
         },
     ),
     (
@@ -2262,6 +2581,9 @@ impl AssetManager {
     /// `id_name` has a " xN" suffix but `display_name` does not, the
     /// `id_name` is used so the stack count is visible.
     pub fn object_name(&self, id: i32) -> Option<String> {
+        if let Some(name) = object_name_override(id) {
+            return Some(name.to_string());
+        }
         self.try_load();
         self.objects.read().unwrap().as_ref().and_then(|list| {
             let obj = list.get(id)?;
@@ -4021,6 +4343,18 @@ mod tests {
     }
 
     #[test]
+    fn mv_leisurely_notification_matches_the_server_message() {
+        // The game raises this server message (a JSON blob keyed by effect name)
+        // when the group consumes the Tofu Delicacy; the player name varies.
+        let message = r#"{"k":"s.something_by_player","t":{"name":"Leisurely mode was initiated","player":"KinSoy"}}"#;
+        assert!(is_mv_leisurely_mode_notification(message));
+        assert!(!is_mv_leisurely_mode_notification(
+            r#"{"k":"s.something_by_player","t":{"name":"Kalek's Trial was initiated"}}"#
+        ));
+        assert!(!is_mv_leisurely_mode_notification(""));
+    }
+
+    #[test]
     fn valid_drop_source_accepts_curated_crates_without_assets() {
         // Curated crates/bosses short-circuit before the catalog lookup, so a
         // known crate is a valid source even when no assets are loaded.
@@ -4252,6 +4586,11 @@ mod tests {
             assert!(is_curated_non_boss_type(prop)); // SpecPen switch / gravestone props
         }
         assert!(is_curated_non_boss_type(34547)); // World's Oyster Coral (add)
+        assert!(is_curated_non_boss_type(34557)); // Goblin Fire (Goblin Patriarch event add)
+        assert!(is_curated_non_boss_type(34555)); // Goblin Priest (Goblin Patriarch event add)
+        assert!(is_curated_non_boss_type(34556)); // Goblin Villager (Goblin Patriarch event add)
+        assert!(is_curated_non_boss_type(34554)); // Goblin Outpost (Goblin Patriarch event set-piece)
+        assert!(is_curated_non_boss_type(53007)); // Legion Soldier (Beacon Guardian add)
         assert!(is_curated_non_boss_type(34583)); // White Blood Cell (Bloodroot Heart add)
         assert!(is_curated_non_boss_type(51080)); // Bramblethorn Bud (Corrupted Bramblethorn add)
         assert!(is_curated_non_boss_type(45408)); // LH Spawn Pillar (Lost Halls spawner)
@@ -4533,6 +4872,51 @@ mod tests {
     }
 
     #[test]
+    fn spectral_hm_taunts_map_to_the_bosses_own_fight_types() {
+        // Every taunt line names a boss, and every boss fights as at least one
+        // of the types we know, so a latched taunt can be tied to the boss's own
+        // card (the card is keyed by object type).
+        for (boss, taunt) in SPECTRAL_HM_TAUNTS {
+            assert_eq!(spectral_hm_taunt_boss(taunt), Some(*boss));
+            assert!(
+                SPECTRAL_HM_BOSS_TYPES.iter().any(|(name, _)| name == boss),
+                "{boss} has no fight types"
+            );
+        }
+        // The types the combat history of the dungeon carries, including
+        // Lobotomik's transformation forms.
+        assert_eq!(
+            spectral_hm_taunt_boss_of_type(23659),
+            Some(SPECTRAL_ZOLE_NAME)
+        );
+        assert_eq!(
+            spectral_hm_taunt_boss_of_type(24071),
+            Some(SPECTRAL_OCULON_NAME)
+        );
+        assert_eq!(
+            spectral_hm_taunt_boss_of_type(23819),
+            Some(SPECTRAL_GRETCH_NAME)
+        );
+        for form in [23920, 23958, 23959, 23960, 23961, 23934, 23935] {
+            assert_eq!(
+                spectral_hm_taunt_boss_of_type(form),
+                Some(SPECTRAL_LOBOTOMIK_NAME)
+            );
+        }
+        // Murcian has no taunt: he is hard mode only through the others.
+        assert!(!SPECTRAL_HM_TAUNTS.iter().any(|(_, t)| t.is_empty()));
+        assert_eq!(spectral_hm_taunt_boss_of_type(SPECTRAL_MURCIAN_TYPE), None);
+        // Unrelated objects are never mistaken for a taunting mini-boss.
+        assert_eq!(spectral_hm_taunt_boss_of_type(23509), None); // Eyesmall
+        assert_eq!(spectral_hm_taunt_boss_of_type(23804), None); // Spectral Key
+                                                                 // Case and surrounding whitespace in the dialogue are tolerated.
+        assert_eq!(
+            spectral_hm_taunt_boss(&SPECTRAL_HM_TAUNTS[1].1.to_uppercase()),
+            Some(SPECTRAL_LOBOTOMIK_NAME)
+        );
+    }
+
+    #[test]
     fn ice_citadel_groups_esben_forms() {
         let enc = encounter_by_id("ice_citadel").expect("ice citadel encounter");
         assert_eq!(enc.display_name, "Esben the Neurotic");
@@ -4561,7 +4945,7 @@ mod tests {
         let cases: &[(i32, &str, &str)] = &[
             (29341, "archmage_inferno", "Inferno"),
             (29342, "archmage_blizzard", "Blizzard"),
-            (17490, "archmage_tempest", "Tempest"),
+            (SHATTERS_TEMPEST_TYPE, "archmage_tempest", "Tempest"),
             (33054, "archmage_generators", "Twilight Archmage Generators"),
             (33072, "archmage_generators", "Twilight Archmage Generators"),
         ];
@@ -4579,6 +4963,143 @@ mod tests {
         // The Stone Idol is a curated standalone boss (no encounter grouping).
         assert!(is_curated_boss_type(33280));
         assert!(encounter_for_boss_type(33280).is_none());
+    }
+
+    #[test]
+    fn mv_spirit_tiers_follow_the_published_thresholds() {
+        // Dancers: scored out of 88 spirits.
+        for (spirits, tier) in [
+            (88, 4),
+            (78, 4),
+            (77, 3),
+            (76, 3),
+            (58, 3),
+            (56, 2),
+            (40, 2),
+            (38, 1),
+            (2, 1),
+        ] {
+            assert_eq!(
+                mv_spirit_tier(spirits, false, false),
+                Some(tier),
+                "{spirits} spirits"
+            );
+        }
+        // Umi (and any Leisurely Mode dance): scored out of 56.
+        for (spirits, tier) in [
+            (56, 4),
+            (48, 4),
+            (47, 3),
+            (46, 3),
+            (36, 3),
+            (34, 2),
+            (24, 2),
+            (22, 1),
+            (2, 1),
+        ] {
+            assert_eq!(
+                mv_spirit_tier(spirits, false, true),
+                Some(tier),
+                "Umi at {spirits} spirits"
+            );
+            assert_eq!(
+                mv_spirit_tier(spirits, true, false),
+                Some(tier),
+                "Leisurely dance at {spirits} spirits"
+            );
+        }
+        // A Leisurely dance is never scored on the dancers' 88-spirit scale.
+        assert_eq!(mv_spirit_tier(60, true, false), Some(4));
+        assert_eq!(mv_spirit_tier(60, false, false), Some(3));
+        // No tally means no tier.
+        assert_eq!(mv_spirit_tier(0, false, false), None);
+        assert_eq!(mv_spirit_tier(0, true, false), None);
+        assert_eq!(mv_spirit_tier(0, false, true), None);
+        assert_eq!(mv_spirit_tier(-3, false, false), None);
+    }
+
+    #[test]
+    fn catalog_name_overrides_only_fix_unnamed_objects() {
+        // The queen ships with no DisplayId, so the catalog's fallback is her
+        // internal id name; the UI shows the name the fight reveals instead.
+        assert_eq!(SHATTERS_QUEEN_TYPE, 0x4456);
+        assert_eq!(
+            object_name_override(SHATTERS_QUEEN_TYPE),
+            Some("The Shattered Queen")
+        );
+        // Named bosses and unrelated objects are untouched.
+        assert_eq!(object_name_override(SHATTERS_KING_TYPE), None);
+        assert_eq!(object_name_override(33280), None);
+        assert_eq!(object_name_override(0), None);
+        // The manager serves the override without needing the game assets (the
+        // lookup happens before `try_load`), so cards rename even on a fresh
+        // install.
+        assert_eq!(
+            get_asset_manager()
+                .object_name(SHATTERS_QUEEN_TYPE)
+                .as_deref(),
+            Some("The Shattered Queen")
+        );
+    }
+
+    #[test]
+    fn mv_spirit_sprite_ids_are_the_umi_flame() {
+        assert_eq!(MV_UMI_SPIRIT_TYPE, 0x513C);
+        assert!(MV_DANCER_TYPES.contains(&20450) && MV_DANCER_TYPES.contains(&20452));
+        assert_eq!(MV_UMI_TYPE, 20493);
+    }
+
+    #[test]
+    fn shatters_hard_mode_sprite_is_the_revealed_king_only() {
+        // Hard mode renames bosses in place, so only the King has a swapped
+        // sprite; the other two keep their object's own art.
+        assert_eq!(
+            shatters_hm_boss_sprite(SHATTERS_KING_TYPE),
+            Some((SHATTERS_HM_KING_SHEET, SHATTERS_HM_KING_FRAME))
+        );
+        assert_eq!(shatters_hm_boss_sprite(SHATTERS_BRIDGE_SENTINEL_TYPE), None);
+        assert_eq!(
+            shatters_hm_boss_sprite(SHATTERS_TWILIGHT_ARCHMAGE_TYPE),
+            None
+        );
+        assert_eq!(shatters_hm_boss_sprite(33280), None);
+
+        // The named sheet/frame pair and the revealed names describe the same
+        // three bosses.
+        for id in [
+            SHATTERS_BRIDGE_SENTINEL_TYPE,
+            SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            SHATTERS_KING_TYPE,
+        ] {
+            assert!(is_shatters_main_boss(id));
+            assert!(shatters_hm_boss_name(id).is_some());
+        }
+
+        // A hard-mode boss speaks under its revealed name, in the framing the
+        // chat uses: matching tolerates the `#` prefix, brackets and case.
+        assert_eq!(
+            shatters_hm_named_boss("#Valen the Unbreakable"),
+            Some(SHATTERS_BRIDGE_SENTINEL_TYPE)
+        );
+        assert_eq!(
+            shatters_hm_named_boss("[Valen the Unbreakable]"),
+            Some(SHATTERS_BRIDGE_SENTINEL_TYPE)
+        );
+        assert_eq!(
+            shatters_hm_named_boss("  nox the wild shadow "),
+            Some(SHATTERS_TWILIGHT_ARCHMAGE_TYPE)
+        );
+        assert_eq!(
+            shatters_hm_named_boss("King Azamoth"),
+            Some(SHATTERS_KING_TYPE)
+        );
+        // The regular names prove nothing, and neither does anything else.
+        assert_eq!(shatters_hm_named_boss("#The Bridge Sentinel"), None);
+        assert_eq!(shatters_hm_named_boss("#The Accursed King"), None);
+        assert_eq!(shatters_hm_named_boss(""), None);
+        assert_eq!(shatters_hm_named_boss("#Griefkeeper Zole"), None);
+        assert!(!is_shatters_main_boss(33280)); // the Stone Idol is an unlock object
+        assert!(!is_shatters_main_boss(SHATTERS_THE_SOURCE_TYPE));
     }
 
     #[test]

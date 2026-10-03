@@ -187,6 +187,13 @@ struct PetTrack {
 /// Max distance (tiles) between a pet and a player for a proximity vote to count.
 const PET_ASSOC_MAX_DIST: f32 = 8.0;
 
+/// How many Spectral Penitentiary mini-bosses must have taunted (cleared every
+/// objective) for Soulwarden Murcian -- and therefore the dungeon -- to be in
+/// hard mode. His fight is hard mode only when both of the run's mini-bosses
+/// were: one is not enough, so a single hard-mode mini-boss leaves the run
+/// regular.
+const SPECTRAL_HM_BOSSES_REQUIRED: usize = 2;
+
 /// Soft cap on buffered enemy projectiles awaiting a local `PlayerHit`. Enemy
 /// bullets that never hit the local player are only freed on map change, so the
 /// buffer is cleared once it grows past this (a damage-taken estimate tolerates
@@ -279,6 +286,10 @@ struct TrackedObject {
     /// Whether an Attack stat has been observed for this object (so the local
     /// player's damage multiplier is not computed from a zero default).
     attack_seen: bool,
+    /// Whether an HP stat has been observed for this object. An object whose
+    /// pool the server never reports keeps the zero default, which must not be
+    /// read as a destroyed (or damaged) one.
+    hp_seen: bool,
     /// Whether a Defense stat has been observed (so the local player's damage
     /// taken is not estimated from a zero default).
     defense_seen: bool,
@@ -321,6 +332,7 @@ impl Default for TrackedObject {
             dexterity: 0,
             wisdom_seen: false,
             attack_seen: false,
+            hp_seen: false,
             defense_seen: false,
             last_seen: 0,
             last_x: 0.0,
@@ -533,6 +545,9 @@ struct FightState {
     /// begun (boss below full HP on first sight), so remote observed damage is
     /// only a partial figure. Never set for heal-back / aux segments.
     joined_late: bool,
+    /// Moonlight Village spirits released during this fight. Each spirit is one
+    /// `MV Total Counter` object spawned at the end of a dance/Umi phase.
+    spirits: i32,
 }
 
 /// Run-scoped tally of one aux category's member instances (object id -> highest
@@ -716,6 +731,58 @@ pub struct CombatTracker {
     /// onto the next fight started this run so a pre-boss dip still shows on the
     /// run card. Reset on map change.
     run_pending_fight_close_calls: i32,
+    /// Object ids of Moonlight Village spirits (`MV Total Counter`) already
+    /// counted this map instance. The server re-adds an object repeatedly as it
+    /// re-enters view, so deduping by id keeps the tally at one per spirit.
+    /// Cleared on map change / disconnect.
+    mv_spirit_ids: HashSet<i32>,
+    /// Spirits released while no Moonlight Village boss fight was live (the
+    /// release can race the fight's finalize); carried onto the next such fight
+    /// started this run. Reset on map change / disconnect.
+    pending_mv_spirits: i32,
+    /// Whether a Moonlight Village dancer/Umi fight has been engaged this run.
+    /// Until then the run is in the boss-less tutorial lantern phases, whose
+    /// releases must not be scored as spirits.
+    mv_boss_engaged: bool,
+    /// Whether this run was switched to Moonlight Village's Leisurely Mode (a
+    /// Tofu Delicacy was consumed). Latched onto the run's fights so the card
+    /// can label the run -- the mode shortens the phases and cuts the loot, so
+    /// the run is not comparable with a normal clear. Reset on map change.
+    mv_leisurely: bool,
+    /// Whether the local player took Moonlight Village's Challenge Mode this run
+    /// (they whacked the Challenge Gate, which pet-stasises them permanently).
+    /// Latched onto the run's fights so the card labels the run "Petless". The
+    /// gate itself is a curated non-boss and never becomes a fight, so this latch
+    /// is the only trace it leaves. Reset on map change.
+    mv_petless: bool,
+    /// The Spectral Penitentiary mini-bosses that shouted their hard-mode taunt
+    /// this instance (the taunt only plays when every objective of their wing was
+    /// cleared). Kept per instance: the dungeon is hard mode only when both of
+    /// the run's mini-bosses were, which then applies to Soulwarden Murcian too.
+    /// Reset on map change.
+    spectral_hm_bosses: HashSet<&'static str>,
+    /// The Shatters hard mode, stage: the Stone Idol only becomes damageable
+    /// once the Void Phantasm was absorbed next to it, so real HP loss on it
+    /// means the run is in hard mode and the Bridge Sentinel will be Valen the
+    /// Unbreakable. Reset on map change.
+    shatters_hm_bridge: bool,
+    /// The Shatters hard mode, late stage: The Source is the secret object in
+    /// the Alchemy Lab wing, which is only ever spawned in hard mode; destroying
+    /// it makes the Twilight Archmage Nox the Wild Shadow and carries through to
+    /// the Forgotten King, who becomes King Azamoth. Reset on map change.
+    shatters_hm_late: bool,
+    /// Whether the local player has reached The Bridge Sentinel at all this
+    /// instance. Hard mode can be "wasted" by pulling the first boss before the
+    /// Stone Idol is destroyed, so evidence read once the bridge fight is under
+    /// way describes the bosses after it, never the Sentinel itself. Reset on map
+    /// change.
+    shatters_bridge_engaged: bool,
+    /// The Shatters bosses this instance heard speak under their hard-mode name
+    /// (see [`Self::on_boss_text`]). Per boss rather than per stage, because that
+    /// is exactly what the reveal proves: the boss that spoke was renamed, and
+    /// each of the run's bosses is labelled from its own evidence. Reset on map
+    /// change.
+    shatters_hm_named: HashSet<i32>,
 }
 
 impl Default for CombatTracker {
@@ -770,6 +837,16 @@ impl CombatTracker {
             local_low_hp_active: false,
             pending_close_calls: 0,
             run_pending_fight_close_calls: 0,
+            mv_spirit_ids: HashSet::new(),
+            pending_mv_spirits: 0,
+            mv_boss_engaged: false,
+            mv_leisurely: false,
+            mv_petless: false,
+            spectral_hm_bosses: HashSet::new(),
+            shatters_hm_bridge: false,
+            shatters_hm_late: false,
+            shatters_bridge_engaged: false,
+            shatters_hm_named: HashSet::new(),
         }
     }
 
@@ -865,6 +942,16 @@ impl CombatTracker {
         // state resets so the first dip in the new map always counts.
         self.local_low_hp_active = false;
         self.run_pending_fight_close_calls = 0;
+        self.mv_spirit_ids.clear();
+        self.pending_mv_spirits = 0;
+        self.mv_boss_engaged = false;
+        self.mv_leisurely = false;
+        self.mv_petless = false;
+        self.spectral_hm_bosses.clear();
+        self.shatters_hm_bridge = false;
+        self.shatters_hm_late = false;
+        self.shatters_bridge_engaged = false;
+        self.shatters_hm_named.clear();
         finished
     }
 
@@ -904,6 +991,16 @@ impl CombatTracker {
         self.reset_local_mitigation_windows();
         self.local_low_hp_active = false;
         self.run_pending_fight_close_calls = 0;
+        self.mv_spirit_ids.clear();
+        self.pending_mv_spirits = 0;
+        self.mv_boss_engaged = false;
+        self.mv_leisurely = false;
+        self.mv_petless = false;
+        self.spectral_hm_bosses.clear();
+        self.shatters_hm_bridge = false;
+        self.shatters_hm_late = false;
+        self.shatters_bridge_engaged = false;
+        self.shatters_hm_named.clear();
         finished
     }
 
@@ -962,6 +1059,72 @@ impl CombatTracker {
         }
         let spawn_max_hp = self.objects.get(&object_id).map(|o| o.max_hp).unwrap_or(0);
         self.note_aux_instance(object_id, object_type, spawn_max_hp);
+        // The Bridge Sentinel coming into view means the local player reached the
+        // bridge arena, so any hard-mode evidence read from here on describes the
+        // *next* bosses, not this one (see `note_shatters_hm_unlock_object`).
+        if object_type == crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE {
+            self.shatters_bridge_engaged = true;
+        }
+        // Tempest, the phoenix the hard-mode Twilight Archmage summons. It is the
+        // only evidence for the late stage that does not depend on us having
+        // caught The Source before it was destroyed.
+        if object_type == crate::assets::SHATTERS_TEMPEST_TYPE {
+            self.confirm_shatters_hm_late("Tempest in view");
+        }
+        // The Idol's pool may already be damaged when we first see it (a run we
+        // arrived late to), and The Source needs no HP reading at all: the object
+        // itself proves hard mode.
+        self.note_shatters_hm_unlock_object(object_id, 0);
+        // A Moonlight Village spirit released at the end of a dance/Umi phase.
+        // The server re-adds the same object as it re-enters view, so count each
+        // id once per run and credit it to the fight that released it. The
+        // dungeon's opening tutorial (three boss-less lantern mini-phases, see
+        // `MV Tutorial Lantern*` objects) precedes the dance and scores no
+        // spirits, so nothing counts until a dancer/Umi fight has been engaged.
+        if crate::assets::is_mv_spirit(object_type) && self.mv_spirit_ids.insert(object_id) {
+            if self.mv_boss_engaged {
+                self.note_mv_spirit();
+            }
+        }
+    }
+
+    /// Credit one collected Moonlight Village spirit to the fight that released
+    /// it: the most recently active dancer/Umi fight. When no such fight is live
+    /// (a phase-end release can race the fight's finalize), hold the spirit until
+    /// the next one starts this run; if the run ends first, [`Self::finalize_all`]
+    /// credits it to the run's last MV fight so the run total stays exact.
+    fn note_mv_spirit(&mut self) {
+        // Ties in `last_activity` (e.g. the burst landing between two phases) are
+        // broken by start time then object id so the pick is deterministic --
+        // `fights` is a HashMap, so its iteration order is not.
+        let live = self
+            .fights
+            .iter()
+            .filter(|(_, f)| crate::assets::is_mv_boss(f.boss_object_type))
+            .max_by_key(|(&id, f)| (f.last_activity, f.started_at, id))
+            .map(|(&id, _)| id);
+        if let Some(id) = live {
+            if let Some(fight) = self.fights.get_mut(&id) {
+                fight.spirits += 1;
+            }
+            return;
+        }
+        // The dancer left view between phases, so its fight is suspended. Credit
+        // the suspension rather than dropping the burst: it is the same run.
+        let dormant = self
+            .dormant_fights
+            .iter()
+            .filter(|(_, f)| crate::assets::is_mv_boss(f.boss_object_type))
+            .max_by_key(|(&ty, f)| (f.last_activity, f.started_at, ty))
+            .map(|(&ty, _)| ty);
+        match dormant {
+            Some(ty) => {
+                if let Some(fight) = self.dormant_fights.get_mut(&ty) {
+                    fight.spirits += 1;
+                }
+            }
+            None => self.pending_mv_spirits += 1,
+        }
     }
 
     /// Update an existing object's stats (from a `NewTick` status, which does not
@@ -985,11 +1148,26 @@ impl CombatTracker {
         } else {
             0
         };
-        let (new_hp, obj_type, obj_max_hp) = {
+        let (new_hp, obj_type, obj_max_hp, previous_hp) = {
             let entry = self.objects.entry(object_id).or_default();
+            let previous_hp = entry.hp as i64;
             apply_stats(entry, status, time_ms);
-            (entry.hp as i64, entry.object_type, entry.max_hp)
+            (
+                entry.hp as i64,
+                entry.object_type,
+                entry.max_hp,
+                previous_hp,
+            )
         };
+        // The Shatters hard mode is unlocked by two objects the group has to
+        // destroy, and both are invulnerable or unreachable until then:
+        //   - the Stone Idol cannot be damaged until the Void Phantasm is
+        //     absorbed next to it, which turns The Bridge Sentinel into Valen the
+        //     Unbreakable;
+        //   - The Source only exists in hard mode, and destroying it turns the
+        //     Twilight Archmage into Nox the Wild Shadow and the Forgotten King
+        //     into King Azamoth.
+        self.note_shatters_hm_unlock_object(object_id, previous_hp);
         self.note_aux_instance(object_id, obj_type, obj_max_hp);
         // Rogue Lethal Strike: the buff starts when the local player
         // exits sneak, so open a window on the Invisible condition falling edge.
@@ -1107,9 +1285,40 @@ impl CombatTracker {
     pub fn on_boss_text(
         &mut self,
         object_id: i32,
+        speaker: Option<&str>,
         text: &str,
         time_ms: i64,
     ) -> Vec<CompletedFight> {
+        // The Shatters: a hard-mode boss *speaks* under its revealed name, which
+        // is the only way the client can learn it (the renamed boss keeps its
+        // object type), so hearing it is distinctive evidence for that boss --
+        // and it works for a player who joined after the unlock objects were
+        // destroyed. Latched per boss for the instance.
+        if let Some(name) = speaker {
+            if let Some(boss_type) = crate::assets::shatters_hm_named_boss(name) {
+                if self.shatters_hm_named.insert(boss_type) {
+                    tracing::info!("[SHATTERS_HM] {name} speaks: that boss is hard mode");
+                }
+            }
+        }
+        // Spectral Penitentiary: a mini-boss shouts its hard-mode taunt only when
+        // every objective of its wing was cleared, so the line itself proves that
+        // boss was hard mode. Latched for the instance; Murcian's own mode is
+        // inferred from these latches when his fight ends.
+        if let Some(boss) = crate::assets::spectral_hm_taunt_boss(text) {
+            if self.spectral_hm_bosses.insert(boss) {
+                tracing::info!("[SPECTRAL_HM] hard mode: {boss} cleared its objectives");
+            }
+            return Vec::new();
+        }
+        // Moonlight Village: the dancers announce the dance is over just before
+        // the clear loot lands. This is the earliest completion signal, so the
+        // dancer fights are scored here rather than at the (start-of-encounter)
+        // dropper spawn, which also keeps the run's loot attributable to them.
+        if crate::assets::is_mv_dance_concluded_text(text) {
+            self.complete_mv_bosses(crate::assets::MV_DANCER_TYPES, time_ms);
+            return std::mem::take(&mut self.deferred_finished);
+        }
         if !crate::assets::is_second_coming_transition_taunt(text) {
             return Vec::new();
         }
@@ -1122,6 +1331,197 @@ impl CombatTracker {
             return Vec::new();
         }
         self.perform_second_coming_split(object_id, time_ms)
+    }
+
+    /// The group activated Moonlight Village's Leisurely Mode by consuming a Tofu
+    /// Delicacy (the game raises a server notification for it). The mode
+    /// shortens the dance phases and cuts the loot, so the run's fights are
+    /// labelled with it on the card. Latched for the current instance.
+    pub fn on_mv_leisurely_mode(&mut self) {
+        self.mv_leisurely = true;
+    }
+
+    /// Latch Moonlight Village's Challenge Mode when the *local player* attacked
+    /// `target_id`: whacking the Challenge Gate pet-stasises them for the rest of
+    /// the run, which the card labels "Petless".
+    ///
+    /// The gate is a curated non-boss (it has 500k HP but is never a fight), so
+    /// the fight paths would skip it -- this is the only trace it leaves. Only
+    /// the local player counts: a teammate taking the challenge doesn't make this
+    /// player's run petless.
+    fn note_mv_challenge_gate(&mut self, target_id: i32, local: bool) {
+        if !local || self.mv_petless {
+            return;
+        }
+        let is_gate = self
+            .objects
+            .get(&target_id)
+            .is_some_and(|o| o.object_type == crate::assets::MV_CHALLENGE_GATE_TYPE);
+        if is_gate {
+            tracing::info!("[MV] Challenge Gate attacked by the local player: run is petless");
+            self.mv_petless = true;
+        }
+    }
+
+    /// The hard-mode name of a Shatters boss the group has already unlocked, or
+    /// `None` when the boss is not a hard-mode rename (or its unlock object was
+    /// never observed). Hard mode is per run, so the bridge and late stages are
+    /// tracked separately: a group that stops after Valen keeps the regular
+    /// names for the bosses it never reached.
+    pub fn shatters_hm_revealed_name(&self, boss_object_type: i32) -> Option<&'static str> {
+        use crate::assets::{
+            SHATTERS_BRIDGE_SENTINEL_TYPE, SHATTERS_KING_TYPE, SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+        };
+        let revealed = self.shatters_hm_named.contains(&boss_object_type)
+            || match boss_object_type {
+                SHATTERS_BRIDGE_SENTINEL_TYPE => self.shatters_hm_bridge,
+                SHATTERS_TWILIGHT_ARCHMAGE_TYPE | SHATTERS_KING_TYPE => self.shatters_hm_late,
+                _ => false,
+            };
+        if revealed {
+            crate::assets::shatters_hm_boss_name(boss_object_type)
+        } else {
+            None
+        }
+    }
+
+    /// Latch The Shatters' hard-mode stages from an unlock object we can see.
+    ///
+    /// The two unlock objects prove hard mode in different ways:
+    ///
+    /// - The Stone Idol is invulnerable outside hard mode -- it only becomes
+    ///   damageable once the Void Phantasm was absorbed next to it -- so *any*
+    ///   pool below its maximum proves hard mode, including one that had already
+    ///   lost HP before we arrived (a fight we joined late) and one that is now
+    ///   empty (the group destroyed it while we watched, or just before we read
+    ///   it). Its pool has to have been reported for a reading to mean anything:
+    ///   an object whose HP the server never sends keeps the zero default and is
+    ///   never mistaken for a damaged or destroyed one.
+    /// - The Source is spawned only in hard mode at all, and it sits in the
+    ///   secret wing the group only reaches past the bridge, so merely having it
+    ///   in view proves both stages -- no matter how far away it is, whether its
+    ///   HP is ever reported, or whether its destruction is ever seen.
+    ///
+    /// Seeing the Idol *leave* proves nothing on its own: in a regular Shatters
+    /// it patrols, chases whoever comes close and then wanders off, so a removal
+    /// -- however close to the local player it happens -- can be nothing but a
+    /// view cull. Only the pool it left behind can tell a destroyed Idol from one
+    /// that walked away. That leaves a deliberate gap: a hard-mode Idol killed
+    /// out of view, whose pool we therefore never read, is called regular until a
+    /// revealed boss proves the run's mode later.
+    ///
+    /// `previous_hp` is the pool before this reading (0 when it is the first we
+    /// get).
+    fn note_shatters_hm_unlock_object(&mut self, object_id: i32, previous_hp: i64) {
+        let Some(&TrackedObject {
+            object_type,
+            hp,
+            max_hp,
+            hp_seen,
+            ..
+        }) = self.objects.get(&object_id)
+        else {
+            return;
+        };
+        if object_type == crate::assets::SHATTERS_THE_SOURCE_TYPE {
+            // The Source sits in the Alchemy Lab, past the archmage, so by the
+            // time it is destroyed the bridge fight is long over: its presence
+            // proves the late stage, and only proves the bridge stage for a run
+            // that has not reached the bridge yet.
+            if !self.shatters_bridge_engaged {
+                self.confirm_shatters_hm_bridge("The Source in view");
+            }
+            self.confirm_shatters_hm_late("The Source in view");
+            return;
+        }
+        if object_type != crate::assets::SHATTERS_STONE_IDOL_TYPE
+            || self.shatters_hm_bridge
+            || !hp_seen
+            || max_hp <= 0
+        {
+            return;
+        }
+        // A group can pull the first boss *before* destroying the Idol, so hard
+        // mode can be "wasted" on a fight already under way: evidence that only
+        // turns up while the bridge fight is running describes the bosses after
+        // it, and the Sentinel stays regular. This is the accepted gap -- an Idol
+        // killed out of view reads the same way.
+        if self.shatters_bridge_engaged {
+            tracing::info!(
+                "[SHATTERS_HM] Stone Idol at {hp}/{max_hp} HP read after the bridge \
+                 fight started: not proof of hard mode for the bridge"
+            );
+            return;
+        }
+        let (max_hp, hp) = (max_hp as i64, hp as i64);
+        // Damage we can see, including a pool the group had already taken down
+        // before we looked.
+        let damaged = hp > 0 && hp < max_hp;
+        // A pool we had seen alive is now empty.
+        let destroyed = hp <= 0 && previous_hp > 0;
+        if damaged || destroyed {
+            self.confirm_shatters_hm_bridge(&format!("Stone Idol at {hp}/{max_hp} HP"));
+        }
+    }
+
+    /// Latch The Shatters' bridge-stage hard mode, logging the evidence the first
+    /// time so a run whose unlock object was never observed at all can be
+    /// diagnosed from the log.
+    fn confirm_shatters_hm_bridge(&mut self, evidence: &str) {
+        if !self.shatters_hm_bridge {
+            tracing::info!("[SHATTERS_HM] hard mode at the bridge stage: {evidence}");
+            self.shatters_hm_bridge = true;
+        }
+    }
+
+    /// Latch The Shatters' late-stage hard mode (the archmage and the king), with
+    /// the same logging as [`Self::confirm_shatters_hm_bridge`].
+    fn confirm_shatters_hm_late(&mut self, evidence: &str) {
+        if !self.shatters_hm_late {
+            tracing::info!("[SHATTERS_HM] hard mode at the late stage: {evidence}");
+            self.shatters_hm_late = true;
+        }
+    }
+
+    /// A loot bag was recorded in the current instance. Moonlight Village's
+    /// mechanics bosses never die, so the run is scored Completed by its loot:
+    /// the invisible `MV Dungeon Complete` / `MV Umi Complete` droppers emit the
+    /// dungeon's bags when the run is cleared, and a bag recorded here therefore
+    /// clears the dancers (or Umi, for her dropper's loot). The droppers' own
+    /// `mob_type` is usually unresolved -- the player never hits them -- so any
+    /// bag in the instance counts, guarded by the dancers having been engaged:
+    /// the tutorial reward bag lands before that and must not score a clear.
+    ///
+    /// Returns any fights finalized as a side effect. A run whose map changes
+    /// with no such loot stays Escaped.
+    pub fn on_instance_loot(
+        &mut self,
+        mob_type: i32,
+        map_seed: i32,
+        time_ms: i64,
+    ) -> Vec<CompletedFight> {
+        if map_seed != self.current_seed
+            || normalize_dungeon(&self.current_map) != crate::loot::MOONLIGHT_VILLAGE_NAME
+            || !self.mv_boss_engaged
+        {
+            return Vec::new();
+        }
+        let targets: &[i32] = crate::assets::mv_loot_completion_targets(mob_type);
+        self.complete_mv_bosses(targets, time_ms);
+        std::mem::take(&mut self.deferred_finished)
+    }
+
+    /// Mark Moonlight Village bosses Completed for the current run and finalize
+    /// their engaged fights. Mirrors what a real death would do: the types are
+    /// remembered so a later re-detection cannot record a second run, and each
+    /// type's live/suspended segments merge into one kill.
+    fn complete_mv_bosses(&mut self, targets: &[i32], time_ms: i64) {
+        for &boss_type in targets {
+            self.completed_boss_types.insert(boss_type);
+            if let Some(cf) = self.consolidate_completed_boss(boss_type, time_ms) {
+                self.deferred_finished.push(cf);
+            }
+        }
     }
 
     /// Finalize the active pre-survival segment for `object_id` (as a
@@ -1166,6 +1566,7 @@ impl CombatTracker {
                 split_done: true,
                 // The local player saw the whole revive segment; not late.
                 joined_late: false,
+                spirits: 0,
             },
         );
         finished
@@ -1181,6 +1582,14 @@ impl CombatTracker {
         self.pending_summon_shots
             .retain(|&(owner, _), _| owner != object_id);
         let last = self.objects.remove(&object_id);
+        // The Shatters' Stone Idol needs no removal handling: it patrols, chases
+        // and wanders out of view in a regular run just as it does in hard mode,
+        // so a removal -- however close to the local player it happens -- proves
+        // nothing on its own. The pool it left behind is the evidence, and that
+        // is read where its stats arrive (see
+        // [`Self::note_shatters_hm_unlock_object`]).
+        // The Source needs no removal handling either: it only ever exists in
+        // hard mode, so having it in view latched the route already.
         // Record a participant departure for death/nexus detection:
         // an object that is currently an attacker in some active fight is leaving
         // view. Snapshot its last-seen position BEFORE it is dropped so a
@@ -1278,10 +1687,25 @@ impl CombatTracker {
     ///
     /// Moonlight Village invulnerable-finish bosses (dancers / Umi) are keyed by
     /// type too: a summoner run re-detects them under many object ids before the
-    /// completion marker scores the kill, so type-keyed suspension folds every
+    /// run's clear scores the kill, so type-keyed suspension folds every
     /// re-detection into one fight per boss type instead of one record per id.
     fn suspend_or_finalize(&mut self, fight: FightState, time_ms: i64) -> Option<CompletedFight> {
         let otype = fight.boss_object_type;
+        // Moonlight Village mechanics bosses are always suspended, never finalized
+        // here: they leave view repeatedly across their phases, and their run is
+        // only scored by its completion (the dancers' concluding line or the
+        // run's loot). Holding them keeps every phase's damage and spirits on one
+        // record, and lets a completion land on it however late it arrives; an
+        // unfinished run is finalized as Escaped at map change.
+        if crate::assets::is_mv_boss(otype) {
+            match self.dormant_fights.get_mut(&otype) {
+                Some(existing) => merge_fight_into(existing, fight),
+                None => {
+                    self.dormant_fights.insert(otype, fight);
+                }
+            }
+            return None;
+        }
         if get_asset_manager().is_wandering_boss(otype)
             || crate::assets::is_invuln_finish_boss(otype)
         {
@@ -1339,6 +1763,9 @@ impl CombatTracker {
     /// "damage done to other players and enemies"), so the local id is rejected
     /// here to avoid double counting with the `PlayerHit` path.
     pub fn on_damage(&mut self, target_id: i32, attacker_id: i32, amount: i64, time_ms: i64) {
+        // A local DamagePacket against the Challenge Gate (recorded for some of
+        // the local player's own hits) also proves Challenge Mode.
+        self.note_mv_challenge_gate(target_id, attacker_id == self.local_object_id);
         if target_id != self.local_object_id
             && self
                 .objects
@@ -1899,6 +2326,10 @@ impl CombatTracker {
         if self.local_object_id == 0 {
             return;
         }
+        // Whacking the Challenge Gate is the only trace Moonlight Village's
+        // Challenge Mode leaves; it is a curated non-boss, so the fight paths
+        // below would skip it.
+        self.note_mv_challenge_gate(target_id, main_id == self.local_object_id);
         let is_boss = self.ensure_fight(target_id, time_ms);
         let aux = if is_boss {
             None
@@ -2153,6 +2584,12 @@ impl CombatTracker {
         let object_max_hp = obj.max_hp;
         let start_hp = if obj.hp > 0 { obj.hp } else { obj.max_hp };
 
+        // Engaging a dancer/Umi ends the boss-less tutorial: from here on,
+        // released spirits score.
+        if crate::assets::is_mv_boss(object_type) {
+            self.mv_boss_engaged = true;
+        }
+
         // A Moonlight Village boss already completed AND recorded this run must
         // not spawn a second fight from lingering fire on the now-invulnerable
         // object, which would duplicate the Completed record. The
@@ -2237,6 +2674,13 @@ impl CombatTracker {
                 // First sight below full HP means the fight was already underway
                 // when the local player arrived.
                 joined_late: object_max_hp > 0 && start_hp < object_max_hp,
+                // Spirits released between fights (their phase end raced the
+                // previous fight's finalize) belong to this one.
+                spirits: if crate::assets::is_mv_boss(object_type) {
+                    std::mem::take(&mut self.pending_mv_spirits)
+                } else {
+                    0
+                },
             },
         );
         true
@@ -2286,6 +2730,7 @@ impl CombatTracker {
                 display_name_override: Some(aux.display_name),
                 split_done: false,
                 joined_late: false,
+                spirits: 0,
             })
     }
 
@@ -2351,6 +2796,19 @@ impl CombatTracker {
             fights.push(seg);
         }
         fights.extend(self.aux_fights.drain().map(|(_, f)| f));
+        // Moonlight Village spirits released after the run's last dancer/Umi
+        // fight finalized (a phase-end burst racing the finalize) still belong to
+        // the run: credit them to its most recent MV fight, so the run total stays
+        // exact even though the individual burst was late.
+        if self.pending_mv_spirits > 0 {
+            if let Some(f) = fights
+                .iter_mut()
+                .filter(|f| crate::assets::is_mv_boss(f.boss_object_type))
+                .max_by_key(|f| (f.last_activity, f.started_at, f.boss_object_id))
+            {
+                f.spirits += std::mem::take(&mut self.pending_mv_spirits);
+            }
+        }
         let mut finished = std::mem::take(&mut self.deferred_finished);
         for fight in fights {
             if let Some(cf) = self.finalize_fight(fight, time_ms) {
@@ -2448,15 +2906,31 @@ impl CombatTracker {
         }
 
         let assets = get_asset_manager();
+        // The Shatters hard mode is a property of the run (see
+        // [`Self::shatters_hm_revealed_name`]), not of the boss packets: the game
+        // only reveals the renamed boss in dialogue, so the card carries it.
+        // Nothing about the Idol's *absence* can prove it either -- a regular
+        // run's Idol sits across the map and is easy to never see -- so the latch
+        // comes solely from the unlock objects we actually witnessed (its
+        // destruction, a damaged pool, or The Source in view). A run that never
+        // showed either stays regular, which is the honest reading at the cost of
+        // a hard-mode run whose Idol died elsewhere being called regular until
+        // its revealed boss is fought.
+        let shatters_hm = self
+            .shatters_hm_revealed_name(fight.boss_object_type)
+            .is_some();
         // Aggregated aux fights carry an explicit name ("Marble Core"); real
         // bosses resolve theirs from assets and may carry a segment suffix
         // ("Marble Colossus (Post-survival)").
         let boss_name = match fight.display_name_override {
             Some(name) => name.to_string(),
             None => {
-                let base = assets
-                    .object_name(fight.boss_object_type)
-                    .unwrap_or_else(|| format!("Boss 0x{:04X}", fight.boss_object_type as u16));
+                let base = match self.shatters_hm_revealed_name(fight.boss_object_type) {
+                    Some(name) => name.to_string(),
+                    None => assets
+                        .object_name(fight.boss_object_type)
+                        .unwrap_or_else(|| format!("Boss 0x{:04X}", fight.boss_object_type as u16)),
+                };
                 match fight.segment_label {
                     Some(label) => format!("{base} ({label})"),
                     None => base,
@@ -2465,6 +2939,23 @@ impl CombatTracker {
         };
 
         let dungeon = normalize_dungeon(&self.current_map);
+        // Spectral Penitentiary's hard mode is a property of the run, inferred
+        // from its mini-bosses' objective-cleared taunts (see
+        // [`Self::on_boss_text`]): a mini-boss carries the mode when it taunted,
+        // and Soulwarden Murcian -- who has no taunt of his own -- carries it only
+        // when both mini-bosses did, which is what makes the dungeon hard mode.
+        // Marking his row is what the card's "(HM)" tag reads.
+        let spectral_hm = if crate::assets::is_spectral_murcian(fight.boss_object_type) {
+            self.spectral_hm_bosses.len() >= SPECTRAL_HM_BOSSES_REQUIRED
+        } else {
+            // The type is what ties a latched taunt to this boss's own card; the
+            // name is a fallback for a form carrying an unexpected type.
+            let taunted = crate::assets::spectral_hm_taunt_boss_of_type(fight.boss_object_type);
+            let name = boss_name.trim();
+            self.spectral_hm_bosses
+                .iter()
+                .any(|boss| Some(*boss) == taunted || boss.eq_ignore_ascii_case(name))
+        };
         // Some bosses fought from the realm belong to a rated dungeon the raw
         // map name doesn't reflect (Oryx the Mad God 2 -> Wine Cellar). Remap so
         // the fight classifies by that dungeon's difficulty and shows its card.
@@ -2522,7 +3013,13 @@ impl CombatTracker {
         // down proportionally so shares are preserved and the total matches the
         // boss HP (exact for a solo kill). Only shrinks totals, never inflates,
         // so it is a no-op for crowded fights where we saw less than the full HP.
-        if fight.killed {
+        //
+        // Moonlight Village mechanics bosses are exempt: they never lose HP (the
+        // run is scored by its clear, not by a death), so their nominal max HP is
+        // not the damage they absorbed. Capping there would truncate the party's
+        // real output, so raw damage is kept as-is and shares are later taken
+        // against the tracked total.
+        if fight.killed && !crate::assets::is_mv_boss(fight.boss_object_type) {
             cap_overkill(&mut participants, fight.boss_start_hp as i64);
         }
 
@@ -2590,6 +3087,11 @@ impl CombatTracker {
                     Some(count)
                 }
             }),
+            spirits: fight.spirits,
+            leisurely: self.mv_leisurely,
+            petless: self.mv_petless,
+            spectral_hm,
+            shatters_hm,
             participants,
         };
 
@@ -3164,7 +3666,10 @@ fn apply_stats(obj: &mut TrackedObject, status: &ObjectStatusData, time_ms: i64)
     for stat in &status.stats {
         match stat.stat_type_id {
             x if x == StatType::MaxHP as u8 => obj.max_hp = stat.stat_value,
-            x if x == StatType::HP as u8 => obj.hp = stat.stat_value,
+            x if x == StatType::HP as u8 => {
+                obj.hp = stat.stat_value;
+                obj.hp_seen = true;
+            }
             x if x == StatType::Name as u8 => {
                 if let Some(ref n) = stat.string_stat_value {
                     if !n.is_empty() {
@@ -3297,6 +3802,7 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
     dst.killed = dst.killed || src.killed;
     dst.joined_late = dst.joined_late || src.joined_late;
     dst.local_close_calls += src.local_close_calls;
+    dst.spirits += src.spirits;
     for (aid, accum) in src.attackers {
         let e = dst.attackers.entry(aid).or_default();
         e.damage += accum.damage;
@@ -3787,6 +4293,7 @@ mod tests {
             display_name_override: None,
             split_done: false,
             joined_late: false,
+            spirits: 0,
         }
     }
 
@@ -4186,9 +4693,9 @@ mod tests {
     #[test]
     fn mv_completed_dancer_keeps_local_present_when_nexusing_after() {
         // Moonlight Village bosses never reach 0 HP -- they lock invulnerable and
-        // are completed by a marker object. A completion marker seen this run
-        // scores the dancer as killed, so a later nexus must keep the local player
-        // Present / Completed rather than flagging them Nexused.
+        // are completed by the run's clear (the dancers' concluding line, or their
+        // loot). The completion scores the dancer as killed, so the local player is
+        // recorded Present / Completed rather than Nexused.
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
@@ -4212,29 +4719,22 @@ mod tests {
         t.on_local_hit(500, 10, 1000, 1000, 200);
         // Dancer floors at 1 HP (invulnerable), never removed.
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        // MV Dungeon Complete marker (20658) -> the dancer is scored completed.
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        // Local nexuses afterwards; completion must survive the departure finalize.
-        let done = t.on_map_change("Nexus", 0, 500);
+        // The dance concludes: the dancer is scored Completed and its record is
+        // emitted. The local player is still present at that moment.
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 350);
         assert_eq!(done.len(), 1);
-        assert!(
-            done[0].killed,
-            "marker completion survives the nexus finalize"
-        );
+        assert!(done[0].killed, "completion scores the dancer as killed");
         let local = done[0]
             .participants
             .iter()
             .find(|p| p.is_local)
             .expect("local");
         assert_eq!(local.end_status, ParticipantEndStatus::Present);
+        // A later nexus adds nothing: the completion was already recorded.
+        assert!(
+            t.on_map_change("Nexus", 0, 500).is_empty(),
+            "no duplicate record after the nexus"
+        );
     }
 
     #[test]
@@ -5449,7 +5949,7 @@ mod tests {
 
         // Survival-exit taunt fires while still near 10% HP: split immediately,
         // before any heal-back tick is observed.
-        let split = t.on_boss_text(500, "...!", 25);
+        let split = t.on_boss_text(500, None, "...!", 25);
         assert_eq!(split.len(), 1, "taunt finalizes the pre-survival segment");
         assert!(
             split[0].boss_name.ends_with("(Pre-survival)"),
@@ -5511,7 +6011,7 @@ mod tests {
         t.on_damage(500, 1000, 5000, 10);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 40_000)]), 20);
         // Survival-exit taunt splits while still near the survival low.
-        assert_eq!(t.on_boss_text(500, "...!", 25).len(), 1);
+        assert_eq!(t.on_boss_text(500, None, "...!", 25).len(), 1);
 
         // Heal climbs while Invulnerable; max still reads the pre-rescale pool.
         t.on_object_status(
@@ -5650,9 +6150,9 @@ mod tests {
         t.on_damage(500, 1000, 5000, 10);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 40_000)]), 20);
         // A different boss line must not split.
-        assert!(t.on_boss_text(500, "Fear the halls!", 22).is_empty());
+        assert!(t.on_boss_text(500, None, "Fear the halls!", 22).is_empty());
         // The transition taunt from an unrelated object id must not split.
-        assert!(t.on_boss_text(999, "...!", 23).is_empty());
+        assert!(t.on_boss_text(999, None, "...!", 23).is_empty());
         // Still a single, un-split pre-survival fight in progress.
         assert_eq!(t.fights.len(), 1);
         assert!(!t.fights.get(&500).unwrap().split_done);
@@ -5908,6 +6408,89 @@ mod tests {
         assert!(
             done.is_empty(),
             "invincible add with 0 damage must not persist"
+        );
+    }
+
+    #[test]
+    fn curated_event_adds_never_become_their_own_fight() {
+        // The Goblin Patriarch Adept Encounter entries -- Outpost (34554), Shaman
+        // (34555, shown as "Goblin Priest"), Villager (34556) and Fire (34557) --
+        // plus the Legion Soldier (53007) are label-less event entries that the
+        // realm event scales past the boss fallback, so the curated deny-list is
+        // the only thing keeping them out of combat history, even when the local
+        // player lands hits on them.
+        for (object_type, name) in [
+            (34554, "Goblin Outpost"),
+            (34555, "Goblin Priest"),
+            (34556, "Goblin Villager"),
+            (34557, "Goblin Fire"),
+            (53007, "Legion Soldier"),
+        ] {
+            let mut t = CombatTracker::new();
+            t.on_map_change("Realm", 1, 0);
+            t.on_player_loaded(1000, 1);
+            t.on_object_spawn(
+                500,
+                object_type,
+                &status(
+                    500,
+                    vec![stat(StatType::MaxHP, 20_000), stat(StatType::HP, 20_000)],
+                ),
+                0,
+            );
+            t.on_damage(500, 1000, 5_000, 10);
+            t.on_local_hit(500, 7, 1000, 1000, 12);
+            t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+            let done = t.on_map_change("Nexus", 0, 100);
+            assert!(done.is_empty(), "{name} must not be tracked as a fight");
+        }
+    }
+
+    #[test]
+    fn curated_demonic_effigy_becomes_its_own_fight() {
+        // The Hero of Oryx set-piece "Demonic Effigy" (0x86F7) is a label-less
+        // realm boss whose 9k HP sits *below* the label-less boss fallback, so it
+        // used to be dropped: its loot was attributed to it while no fight was
+        // ever recorded. The curated allow-list is what promotes it.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x86F7,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 9_000), stat(StatType::HP, 9_000)],
+            ),
+            0,
+        );
+        t.on_damage(500, 1000, 4_000, 10);
+        t.on_local_hit(500, 7, 1000, 1000, 12);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t
+            .on_object_removed(500, 24)
+            .expect("the effigy is tracked as a fight");
+        assert_eq!(done.boss_object_type, 0x86F7);
+
+        // Its Worshipper adds (0x86DA, 5.5k HP, also label-less) stay out.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            600,
+            0x86DA,
+            &status(
+                600,
+                vec![stat(StatType::MaxHP, 5_500), stat(StatType::HP, 5_500)],
+            ),
+            0,
+        );
+        t.on_damage(600, 1000, 2_000, 10);
+        t.on_local_hit(600, 7, 1000, 1000, 12);
+        t.on_object_status(600, &status(600, vec![stat(StatType::HP, 0)]), 20);
+        assert!(
+            t.on_map_change("Nexus", 0, 100).is_empty(),
+            "an effigy worshipper must not be tracked as a fight"
         );
     }
 
@@ -6787,6 +7370,142 @@ mod tests {
     }
 
     #[test]
+    fn mv_boss_damage_is_not_capped_to_nominal_hp() {
+        // Moonlight Village mechanics bosses floor invulnerable -- their nominal
+        // max HP is not the damage they absorbed -- so the party's raw damage must
+        // survive finalize untouched instead of being trimmed to the boss HP.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 180_000), stat(StatType::HP, 180_000)],
+            ),
+            100,
+        );
+        // One other player plus the local player, together far above the nominal
+        // 180000 HP pool.
+        t.on_damage(500, 600, 250_000, 110);
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 200_000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 120);
+        // The dance concludes: the dancer is scored completed.
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].killed);
+        assert_eq!(
+            done[0].total_damage(),
+            450_000,
+            "raw damage kept, not capped to the nominal 180000 HP"
+        );
+    }
+
+    #[test]
+    fn mv_spirits_count_once_per_object_and_credit_the_active_fight() {
+        // Each spirit is one `MV Total Counter` object released at a phase end.
+        // The server re-adds the same object as it re-enters view, so the tally
+        // must count each id once and credit it to the live dancer fight.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 180_000), stat(StatType::HP, 180_000)],
+            ),
+            100,
+        );
+        t.on_damage(500, 600, 10_000, 110);
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 120);
+        // A phase-end burst of four spirits (pairs, up to 8 per phase).
+        let spirit = |id: i32| status(id, vec![stat(StatType::Size, 105)]);
+        for id in 700..704 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 200);
+        }
+        // Re-adds of the same objects (re-entering view) must not double-count.
+        for id in 700..704 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 240);
+        }
+        // A later burst adds two more.
+        for id in 710..712 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 300);
+        }
+        let done = t.on_map_change("Nexus", 0, 500);
+        let mv: Vec<_> = done
+            .iter()
+            .filter(|f| f.boss_object_type == 20450)
+            .collect();
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].spirits, 6, "four plus two, re-adds deduped");
+    }
+
+    #[test]
+    fn mv_tutorial_spirits_do_not_count_before_a_boss_is_engaged() {
+        // The dungeon opens with three boss-less lantern mini-phases. Any spirit
+        // releases there (or any pre-fight noise) must not score; counting starts
+        // only once a dancer/Umi fight has been engaged.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        let spirit = |id: i32| status(id, vec![stat(StatType::Size, 105)]);
+        for id in 700..704 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 50);
+        }
+        // Engage Sage Genji, then a phase-end burst counts.
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 180_000), stat(StatType::HP, 180_000)],
+            ),
+            100,
+        );
+        t.on_damage(500, 600, 10_000, 110);
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 120);
+        for id in 710..714 {
+            t.on_object_spawn(id, 0x5026, &spirit(id), 200);
+        }
+        let done = t.on_map_change("Nexus", 0, 500);
+        let mv: Vec<_> = done
+            .iter()
+            .filter(|f| f.boss_object_type == 20450)
+            .collect();
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].spirits, 4, "only the post-engagement burst counts");
+    }
+
+    #[test]
     fn overkill_cap_preserves_group_shares() {
         // 9000 + 3000 = 12000 raw, capped to a 10000 HP pool: shares preserved.
         let mut ps = vec![
@@ -7521,7 +8240,7 @@ mod tests {
     // A Moonlight Village dancer floors at 1 HP (invulnerable) and is never
     // removed, so without a completion signal it finalizes as Escaped.
     #[test]
-    fn mv_dancer_without_marker_stays_escaped() {
+    fn mv_dancer_without_completion_stays_escaped() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
@@ -7546,15 +8265,28 @@ mod tests {
         t.on_local_hit(500, 10, 1000, 1000, 200);
         // Floors at 1 HP -- never 0, so the kill heuristic never fires.
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
+        // The completion dropper is present but emits no loot: the run escaped.
+        t.on_object_spawn(
+            15598,
+            20658,
+            &status(
+                15598,
+                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
+            ),
+            350,
+        );
         let done = t.on_map_change("Nexus", 0, 500);
         assert_eq!(done.len(), 1);
-        assert!(!done[0].killed, "dancer at 1 HP with no marker is Escaped");
+        assert!(
+            !done[0].killed,
+            "a dancer cleared with no loot recorded is Escaped"
+        );
     }
 
-    // The MV Dungeon Complete marker (20658) scores all three dancers as
-    // completed even though they go invulnerable rather than dying.
+    // The dancers' concluding line scores all three as Completed even though they
+    // go invulnerable rather than dying.
     #[test]
-    fn mv_dungeon_complete_marker_completes_dancer() {
+    fn mv_dance_concluded_text_completes_dancer() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
@@ -7569,29 +8301,18 @@ mod tests {
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        // Completion marker spawns (invisible, 100 HP).
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        // The live fight is flagged immediately; a tick finalizes it as a kill.
-        let done = t.on_tick(450);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400);
         assert_eq!(done.len(), 1);
         assert!(
             done[0].killed,
-            "dancer completed via MV Dungeon Complete marker"
+            "dancer completed via the dance-concluded line"
         );
     }
 
-    // The MV Umi Complete marker (49339) completes Umi, who heals back to full
-    // and never dies.
+    // A recorded loot bag is the other completion signal: the droppers emit the
+    // run's loot when it is cleared. Kitsune Umi's loot clears only Umi.
     #[test]
-    fn mv_umi_complete_marker_completes_umi() {
+    fn mv_loot_completes_umi_only() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
@@ -7607,36 +8328,23 @@ mod tests {
         );
         t.on_local_hit(254, 7, 1000, 1000, 200);
         t.on_object_status(254, &status(254, vec![stat(StatType::HP, 180_000)]), 300);
-        t.on_object_spawn(
-            15599,
-            49339,
-            &status(
-                15599,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        let done = t.on_map_change("Nexus", 0, 500);
+        // Her loot lands (resolved to Umi, or her dropper's own type).
+        let done = t.on_instance_loot(20493, 42, 400);
         assert_eq!(done.len(), 1);
-        assert!(done[0].killed, "Umi completed via MV Umi Complete marker");
+        assert!(done[0].killed, "Umi completed by her loot");
+        assert_eq!(done[0].boss_object_type, 20493);
     }
 
-    // A marker only completes its own mapped boss types: the Umi marker must not
-    // complete an in-progress dancer.
+    // The dance concluded line completes the dancers only: Umi's optional fight
+    // is scored by her own loot, never by the dancers' clear.
     #[test]
-    fn mv_marker_only_completes_mapped_types() {
+    fn mv_dance_text_does_not_complete_umi() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
-        t.on_object_spawn(
-            500,
-            20450,
-            &status(
-                500,
-                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
-            ),
-            100,
-        );
+        let hp = || vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)];
+        t.on_object_spawn(500, 20450, &status(500, hp()), 100);
+        t.on_object_spawn(254, 20493, &status(254, hp()), 110);
         t.pending_shots.insert(
             10,
             PendingShot {
@@ -7646,43 +8354,30 @@ mod tests {
             },
         );
         t.on_local_hit(500, 10, 1000, 1000, 200);
+        t.on_local_hit(254, 10, 1000, 1000, 210);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        // Only the Umi marker fires -- the dancer is not one of its targets.
-        t.on_object_spawn(
-            15599,
-            49339,
-            &status(
-                15599,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
+        assert_eq!(
+            t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400)
+                .len(),
+            1
         );
         let done = t.on_map_change("Nexus", 0, 500);
-        assert_eq!(done.len(), 1);
-        assert!(
-            !done[0].killed,
-            "dancer not completed by an unrelated marker"
-        );
+        let umi: Vec<_> = done
+            .iter()
+            .filter(|f| f.boss_object_type == 20493)
+            .collect();
+        assert_eq!(umi.len(), 1);
+        assert!(!umi[0].killed, "Umi only clears on her own loot");
     }
 
-    // The completed-boss flag is scoped to the run: a marker in one map does not
-    // complete a same-type boss in a later map instance.
+    // Leisurely Mode (the group consumed a Tofu Delicacy before the dance) is
+    // announced with a server notification and labels the run's fights.
     #[test]
-    fn mv_completion_flag_clears_on_map_change() {
+    fn mv_leisurely_mode_labels_the_runs_fights() {
         let mut t = CombatTracker::new();
         t.on_map_change("Moonlight Village", 42, 0);
         t.on_player_loaded(1000, 42);
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            100,
-        );
-        // New run: a dancer here must not inherit the previous run's completion.
-        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_mv_leisurely_mode();
         t.on_object_spawn(
             500,
             20450,
@@ -7690,18 +8385,242 @@ mod tests {
                 500,
                 vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
             ),
+            100,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 200);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 300);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].leisurely, "the clear is labelled Leisurely Mode");
+
+        // The mode is per instance: the next run's fights are unlabelled.
+        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_object_spawn(
+            600,
+            20450,
+            &status(
+                600,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
             1100,
         );
         t.pending_shots.insert(
-            10,
+            11,
             PendingShot {
                 base_damage: 1000,
                 armor_piercing: false,
                 ..Default::default()
             },
         );
-        t.on_local_hit(500, 10, 1000, 1000, 1200);
-        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 1300);
+        t.on_local_hit(600, 11, 1000, 1000, 1200);
+        let next = t.on_boss_text(600, None, "This concludes the Moonlight Dance.", 1300);
+        assert_eq!(next.len(), 1);
+        assert!(
+            !next[0].leisurely,
+            "a later normal run is not labelled Leisurely Mode"
+        );
+    }
+
+    // Challenge Mode (the local player whacked the Challenge Gate, which
+    // pet-stasises them) labels the run's fights "Petless" on the card. The gate
+    // itself is a curated non-boss, so it never becomes a fight of its own.
+    #[test]
+    fn mv_challenge_gate_hit_labels_the_runs_fights_petless() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            700,
+            crate::assets::MV_CHALLENGE_GATE_TYPE,
+            &status(
+                700,
+                vec![stat(StatType::MaxHP, 500_000), stat(StatType::HP, 500_000)],
+            ),
+            50,
+        );
+        t.on_local_hit(700, 7, 1000, 1000, 60);
+        assert!(t.fights.is_empty(), "the gate is never a fight of its own");
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            100,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 200);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 300);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].petless, "the clear is labelled Petless");
+        assert!(
+            !done[0].leisurely,
+            "Challenge Mode is independent of Leisure"
+        );
+
+        // The mode is per instance: the next run's fights are unlabelled.
+        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_object_spawn(
+            600,
+            20450,
+            &status(
+                600,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            1100,
+        );
+        t.pending_shots.insert(
+            11,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(600, 11, 1000, 1000, 1200);
+        let next = t.on_boss_text(600, None, "This concludes the Moonlight Dance.", 1300);
+        assert_eq!(next.len(), 1);
+        assert!(!next[0].petless, "a later normal run is not Petless");
+    }
+
+    // Spectral Penitentiary: a mini-boss's objective-cleared taunt marks that
+    // boss hard mode, and Soulwarden Murcian is hard mode only when both
+    // mini-bosses were -- which is what makes the dungeon hard mode.
+    #[test]
+    fn spectral_mini_taunts_decide_murcian_hard_mode() {
+        let zole = crate::assets::SPECTRAL_HM_TAUNTS[0];
+        let lobotomik = crate::assets::SPECTRAL_HM_TAUNTS[1];
+
+        // Only one mini-boss cleared its objectives: Murcian stays regular, so
+        // the run is not hard mode even though a boss was.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Spectral Penitentiary", 7, 0);
+        t.on_player_loaded(1000, 7);
+        t.on_boss_text(500, None, zole.1, 100);
+        let zole_fight = finish_shatters_fight(&mut t, 500, 23659, 300_000, 150);
+        assert!(zole_fight.spectral_hm, "Zole taunted, so Zole is HM");
+        let murcian = finish_shatters_fight(&mut t, 600, 23681, 400_000, 200);
+        assert!(
+            !murcian.spectral_hm,
+            "one hard-mode mini-boss is not enough for Murcian"
+        );
+
+        // Both mini-bosses taunted: Murcian is hard mode, so is the run. A
+        // repeated taunt from the same boss must not count twice.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Spectral Penitentiary", 7, 0);
+        t.on_player_loaded(1000, 7);
+        t.on_boss_text(500, None, zole.1, 100);
+        t.on_boss_text(600, None, lobotomik.1, 110);
+        t.on_boss_text(700, None, zole.1, 120);
+        let zole_fight = finish_shatters_fight(&mut t, 500, 23659, 300_000, 150);
+        assert!(zole_fight.spectral_hm);
+        let lobo_fight = finish_shatters_fight(&mut t, 600, 23920, 300_000, 160);
+        assert!(lobo_fight.spectral_hm);
+        let murcian = finish_shatters_fight(&mut t, 700, 23681, 400_000, 200);
+        assert!(murcian.spectral_hm, "both mini-bosses were hard mode");
+
+        // The mode is per instance: the next run starts regular.
+        t.on_map_change("Spectral Penitentiary", 8, 500);
+        let next = finish_shatters_fight(&mut t, 800, 23681, 400_000, 600);
+        assert!(!next.spectral_hm, "a later run is not hard mode");
+    }
+
+    // A regular (non-hard-mode) line is never mistaken for a taunt.
+    #[test]
+    fn spectral_hm_taunts_are_exact() {
+        let zole = crate::assets::SPECTRAL_HM_TAUNTS[0];
+        assert_eq!(crate::assets::spectral_hm_taunt_boss(zole.1), Some(zole.0));
+        // Surrounding whitespace and case are tolerated.
+        assert_eq!(
+            crate::assets::spectral_hm_taunt_boss(&format!("  {}  ", zole.1.to_uppercase())),
+            Some(zole.0)
+        );
+        // The line Zole opens the fight with is not the taunt.
+        assert_eq!(
+            crate::assets::spectral_hm_taunt_boss(
+                "Pick cells that aren't already taken you imbeciles!"
+            ),
+            None
+        );
+    }
+
+    // Only the local player's own hit counts: a teammate ringing the gate makes
+    // *their* run petless, not ours.
+    #[test]
+    fn mv_challenge_gate_hit_by_someone_else_does_not_label_our_run() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            700,
+            crate::assets::MV_CHALLENGE_GATE_TYPE,
+            &status(
+                700,
+                vec![stat(StatType::MaxHP, 500_000), stat(StatType::HP, 500_000)],
+            ),
+            50,
+        );
+        // A DamagePacket from another player, and an EnemyHit owned by them.
+        t.on_damage(700, 2000, 5_000, 60);
+        t.on_local_hit(700, 7, 2000, 2000, 61);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            100,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 200);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 300);
+        assert_eq!(done.len(), 1);
+        assert!(!done[0].petless, "someone else's challenge is not our run");
+    }
+
+    // A completion in one dungeon instance does not carry to the next: a dancer
+    // in a later Moonlight Village run starts fresh.
+    #[test]
+    fn mv_completion_flag_clears_on_map_change() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            20450,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            100,
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 200);
+        assert_eq!(
+            t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 300)
+                .len(),
+            1
+        );
+        // New run: a dancer here must not inherit the previous run's completion.
+        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_object_spawn(
+            600,
+            20450,
+            &status(
+                600,
+                vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)],
+            ),
+            1100,
+        );
+        t.pending_shots.insert(
+            11,
+            PendingShot {
+                base_damage: 1000,
+                armor_piercing: false,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(600, 11, 1000, 1000, 1200);
+        t.on_object_status(600, &status(600, vec![stat(StatType::HP, 1)]), 1300);
         let done = t.on_map_change("Nexus", 0, 1500);
         assert_eq!(done.len(), 1);
         assert!(
@@ -7728,18 +8647,9 @@ mod tests {
         );
         t.on_local_hit(500, 7, 1000, 1000, 200);
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 1)]), 300);
-        // Marker fires, then a tick finalizes the flagged fight as a kill.
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            400,
-        );
-        let first = t.on_tick(450);
-        assert_eq!(first.len(), 1, "one completed dancer from the tick");
+        // The dance concludes while the fight is live.
+        let first = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 400);
+        assert_eq!(first.len(), 1, "one completed dancer");
         assert!(first[0].killed);
         // The invulnerable dancer object is still present; a late hit must not
         // create a second fight for the same completed boss type.
@@ -7760,9 +8670,9 @@ mod tests {
         );
     }
 
-    // A summoner run re-detects a dancer under many object ids before the
-    // completion marker fires. Every re-detection folds into one fight so the DB
-    // records a single row, not one per id.
+    // A summoner run re-detects a dancer under many object ids before the dance
+    // concludes. Every re-detection folds into one fight so the DB records a
+    // single row, not one per id.
     #[test]
     fn mv_dancer_redetected_under_many_ids_yields_one_record() {
         let mut t = CombatTracker::new();
@@ -7784,17 +8694,8 @@ mod tests {
                 assert!(t.on_tick(base + 30).is_empty(), "nothing surfaces mid-run");
             }
         }
-        // MV Dungeon Complete marker fires while the last detection is live.
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            3000,
-        );
-        let done = t.on_tick(3050);
+        // The dance concludes while the last detection is live.
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 3000);
         assert_eq!(
             done.len(),
             1,
@@ -7837,16 +8738,7 @@ mod tests {
             2,
             "two live same-type fights coexist",
         );
-        t.on_object_spawn(
-            15598,
-            20658,
-            &status(
-                15598,
-                vec![stat(StatType::MaxHP, 100), stat(StatType::HP, 100)],
-            ),
-            40,
-        );
-        let done = t.on_tick(50);
+        let done = t.on_boss_text(500, None, "This concludes the Moonlight Dance.", 40);
         assert_eq!(
             done.len(),
             1,
@@ -7899,5 +8791,688 @@ mod tests {
             .find(|p| p.name == "Bob")
             .expect("Bob");
         assert_eq!(bob.damage, 30_000);
+    }
+
+    /// Spawn, damage, engage and finish `object_type` under `object_id`.
+    fn finish_shatters_fight(
+        t: &mut CombatTracker,
+        object_id: i32,
+        object_type: i32,
+        max_hp: i32,
+        base: i64,
+    ) -> CompletedFight {
+        t.on_object_spawn(
+            object_id,
+            object_type,
+            &status(
+                object_id,
+                vec![stat(StatType::MaxHP, max_hp), stat(StatType::HP, max_hp)],
+            ),
+            base,
+        );
+        t.on_damage(object_id, 600, (max_hp / 2) as i64, base + 10);
+        t.on_local_hit(object_id, 7, 1000, 1000, base + 12);
+        t.on_object_status(
+            object_id,
+            &status(object_id, vec![stat(StatType::HP, 0)]),
+            base + 16,
+        );
+        t.on_object_removed(object_id, base + 20)
+            .expect("fight finalized")
+    }
+
+    #[test]
+    fn shatters_stone_idol_marks_the_bridge_sentinel_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        // The Idol is invulnerable until it absorbs the Void Phantasm, so any HP
+        // loss on it means the group is on the hard-mode route.
+        hard_mode_idol(&mut t);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
+        assert!(bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_bridge_sentinel_stays_regular_without_evidence() {
+        // The Idol was never in view at all -- the common case, since a regular
+        // run's Idol sits across the map in the Derelict Village. That is not
+        // evidence of anything: the Sentinel keeps its regular name and the run
+        // is not hard mode.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "regular name kept, got {}",
+            bridge.boss_name
+        );
+        assert!(!bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_the_source_alone_marks_the_whole_run_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        // The Idol was killed before we ever saw it, so the only hard-mode proof
+        // is The Source -- an object that is never spawned outside hard mode. It
+        // is far away and its HP is never reported, which must not matter.
+        t.on_object_spawn(
+            901,
+            crate::assets::SHATTERS_THE_SOURCE_TYPE,
+            &status_at(901, 200.0, 200.0, vec![]),
+            20,
+        );
+        assert_eq!(
+            t.shatters_hm_revealed_name(crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE),
+            Some("Valen the Unbreakable"),
+            "seeing the Source proves the bridge stage too"
+        );
+
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            100,
+        );
+        assert_eq!(archmage.boss_name, "Nox the Wild Shadow");
+        assert!(archmage.shatters_hm);
+        let king =
+            finish_shatters_fight(&mut t, 702, crate::assets::SHATTERS_KING_TYPE, 400_000, 300);
+        assert_eq!(king.boss_name, "King Azamoth");
+        assert!(king.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_the_source_destroyed_in_view_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        t.on_object_spawn(
+            901,
+            crate::assets::SHATTERS_THE_SOURCE_TYPE,
+            &status(
+                901,
+                vec![stat(StatType::MaxHP, 30_000), stat(StatType::HP, 1)],
+            ),
+            20,
+        );
+        t.on_object_removed(901, 22);
+
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            100,
+        );
+        assert_eq!(archmage.boss_name, "Nox the Wild Shadow");
+        assert!(archmage.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_bridge_only_hard_mode_keeps_the_archmage_regular() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        hard_mode_idol(&mut t);
+
+        // The group stopped after Valen (no Alchemy Lab, or the Source survived),
+        // so the archmage is fought in its regular form.
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
+        assert!(bridge.shatters_hm);
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            300,
+        );
+        assert!(
+            !archmage.shatters_hm,
+            "a regular archmage keeps its own phase regular"
+        );
+        assert!(
+            !archmage.boss_name.contains("Nox"),
+            "got {}",
+            archmage.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_idol_evidence_after_the_bridge_started_stays_regular() {
+        // Hard mode can be wasted by pulling the first boss before the Idol is
+        // destroyed: the group reaches the bridge, fights the Sentinel in regular
+        // mode, and only then takes the Idol down. The evidence belongs to the
+        // bosses after the bridge, so the Sentinel stays regular -- while the late
+        // stage (proved by The Source) still latches.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        // The Sentinel is in view: the bridge fight is under way.
+        t.on_object_spawn(
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            &status(
+                700,
+                vec![stat(StatType::MaxHP, 250_000), stat(StatType::HP, 250_000)],
+            ),
+            5,
+        );
+        // Only now does the Idol become damageable.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            8,
+        );
+        t.on_object_status(900, &status(900, vec![stat(StatType::HP, 20_000)]), 10);
+        // The Source (past the archmage) still proves the late stage.
+        t.on_object_spawn(
+            901,
+            crate::assets::SHATTERS_THE_SOURCE_TYPE,
+            &status_at(901, 200.0, 200.0, vec![]),
+            12,
+        );
+
+        t.on_damage(700, 1000, 100_000, 20);
+        t.on_local_hit(700, 7, 1000, 1000, 22);
+        t.on_object_status(700, &status(700, vec![stat(StatType::HP, 0)]), 26);
+        let bridge = t.on_object_removed(700, 30).expect("sentinel fight");
+        assert!(
+            !bridge.shatters_hm,
+            "evidence that arrived mid-fight does not make the Sentinel hard mode"
+        );
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+        assert!(
+            t.shatters_hm_revealed_name(crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE)
+                .is_some(),
+            "the late stage is still hard mode"
+        );
+    }
+
+    #[test]
+    fn shatters_tempest_marks_the_late_stage_only() {
+        // Tempest, the phoenix the hard-mode archmage summons, is the late
+        // stage's own evidence: the bridge stays regular when nothing proved hard
+        // mode before it, but the archmage and the King are renamed.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            10,
+        );
+        assert!(!bridge.shatters_hm, "no evidence before the bridge");
+
+        t.on_object_spawn(
+            902,
+            crate::assets::SHATTERS_TEMPEST_TYPE,
+            &status_at(902, 30.0, 30.0, vec![]),
+            20,
+        );
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            30,
+        );
+        assert_eq!(archmage.boss_name, "Nox the Wild Shadow");
+        assert!(archmage.shatters_hm);
+        let king =
+            finish_shatters_fight(&mut t, 702, crate::assets::SHATTERS_KING_TYPE, 500_000, 50);
+        assert_eq!(king.boss_name, "King Azamoth");
+        assert!(king.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_hm_speech_marks_the_boss_that_spoke() {
+        // A hard-mode boss speaks under its revealed name; the line is the only
+        // place the client can learn it from, so it is per-boss evidence.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        // The Sentinel speaks as Valen, so the Sentinel is hard mode...
+        let spoken = t.on_boss_text(
+            700,
+            Some("#Valen the Unbreakable"),
+            "I see now... my strength could not have held against this growing power.",
+            50,
+        );
+        assert!(spoken.is_empty(), "speech alone finalizes nothing");
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(
+            t.shatters_hm_revealed_name(crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE),
+            Some("Valen the Unbreakable")
+        );
+        assert!(bridge.shatters_hm);
+        // ...and the archmage, whose own line never arrived, stays regular: each
+        // boss is labelled from its own evidence, not from the run's.
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            300,
+        );
+        assert!(!archmage.shatters_hm);
+        assert!(
+            !archmage.boss_name.contains("Nox"),
+            "got {}",
+            archmage.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_regular_speech_is_not_hard_mode() {
+        // The regular Sentinel speaks under its regular name, which is no
+        // evidence of hard mode however the line is framed.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_boss_text(
+            700,
+            Some("#The Bridge Sentinel"),
+            "I tried to protect you... I have failed.",
+            50,
+        );
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(!bridge.shatters_hm);
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_late_join_reads_hard_mode_from_the_speech_it_hears() {
+        // A player who joined after the Idol and The Source were destroyed has no
+        // unlock evidence, but the archmage and the King speak under their
+        // hard-mode names, which is what labels them.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_boss_text(
+            701,
+            Some("[Nox the Wild Shadow]"),
+            "Unworthy as you are to know what hides beyond, I've had... an epiphany.",
+            20,
+        );
+        t.on_boss_text(
+            702,
+            Some("King Azamoth"),
+            "This fate is mine to bear... not hers.",
+            30,
+        );
+        let archmage = finish_shatters_fight(
+            &mut t,
+            701,
+            crate::assets::SHATTERS_TWILIGHT_ARCHMAGE_TYPE,
+            300_000,
+            40,
+        );
+        assert_eq!(archmage.boss_name, "Nox the Wild Shadow");
+        assert!(archmage.shatters_hm);
+        let king =
+            finish_shatters_fight(&mut t, 702, crate::assets::SHATTERS_KING_TYPE, 500_000, 60);
+        assert_eq!(king.boss_name, "King Azamoth");
+        assert!(king.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_stone_idol_is_its_own_phase_of_the_run() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+
+        let idol = finish_shatters_fight(
+            &mut t,
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            25_000,
+            5,
+        );
+        assert_eq!(
+            idol.boss_object_type,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE
+        );
+        assert!(idol.killed);
+        // The Idol is tracked as its own row of the dungeon's card, so the loot it
+        // drops can be shown under it.
+        assert!(
+            idol.encounter_run_id.is_some(),
+            "the idol joins the dungeon run"
+        );
+        // It is an object hard mode unlocks, not a boss hard mode renames, so the
+        // phase itself is not a hard-mode variant.
+        assert!(!idol.shatters_hm);
+    }
+
+    /// Damage the Stone Idol, which is invincible outside hard mode.
+    fn hard_mode_idol(t: &mut CombatTracker) {
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            5,
+        );
+        t.on_object_status(900, &status(900, vec![stat(StatType::HP, 24_000)]), 8);
+    }
+
+    #[test]
+    fn shatters_stone_idol_found_damaged_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        // We arrive after the Idol lost part of its pool (the group already
+        // absorbed the Phantasm): hard mode, even though we never saw the drop.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 12_000)],
+            ),
+            5,
+        );
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert_eq!(bridge.boss_name, "Valen the Unbreakable");
+        assert!(bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_stone_idol_killed_in_view_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        // The group destroys the Idol while we watch, without us landing a hit:
+        // its HP only becomes readable because it is in our view.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            5,
+        );
+        t.on_object_status(900, &status(900, vec![stat(StatType::HP, 0)]), 8);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_stone_idol_removed_without_hp_evidence_stays_regular() {
+        // The Idol is removed right beside the local player, but the server never
+        // reported its pool, so nothing shows it was ever damageable. A regular
+        // Idol that simply wandered out of view looks exactly like this, so the
+        // removal must not be read as a destruction.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(
+            1000,
+            0x0321,
+            &status_at(1000, 10.0, 10.0, vec![name_stat("Bob")]),
+            1,
+        );
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status_at(900, 11.0, 11.0, vec![]),
+            2,
+        );
+        t.on_object_removed(900, 6);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(
+            !bridge.shatters_hm,
+            "a removal with no pool to read proves nothing"
+        );
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_wandering_stone_idol_leaving_view_stays_regular() {
+        // The regular Idol patrols, chases whoever comes close and then wanders
+        // off -- it shoots the local player and is last seen two tiles away at
+        // full HP before leaving view. Its own movement caused the removal, so
+        // the run stays regular.
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(
+            1000,
+            0x0321,
+            &status_at(1000, 10.0, 10.0, vec![name_stat("Bob")]),
+            1,
+        );
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status_at(
+                900,
+                10.0,
+                12.0,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            2,
+        );
+        t.on_object_removed(900, 6);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(
+            !bridge.shatters_hm,
+            "an untouched Idol that patrolled away is not a kill"
+        );
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_stone_idol_leaving_view_marks_nothing() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        // The local player walks away from the Idol: the removal is a view cull,
+        // so the run stays regular. This is the common case in a non-hard-mode
+        // Shatters, where the Idol cannot be killed at all -- and the cull fires
+        // far outside the near radius, so it is never mistaken for a kill.
+        t.on_object_spawn(
+            1000,
+            0x0321,
+            &status_at(1000, 40.0, 40.0, vec![name_stat("Bob")]),
+            1,
+        );
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status_at(
+                900,
+                0.0,
+                0.0,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            2,
+        );
+        t.on_object_removed(900, 6);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(!bridge.shatters_hm);
+        assert!(
+            !bridge.boss_name.contains("Valen"),
+            "got {}",
+            bridge.boss_name
+        );
+    }
+
+    #[test]
+    fn shatters_stone_idol_at_lethal_hp_marks_hard_mode() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        // The group takes the Idol down to lethal HP in our view (the kill itself
+        // happens out of view, so it is never removed for us): the pool we read
+        // proves it was damageable, which is hard mode.
+        t.on_object_spawn(
+            900,
+            crate::assets::SHATTERS_STONE_IDOL_TYPE,
+            &status(
+                900,
+                vec![stat(StatType::MaxHP, 25_000), stat(StatType::HP, 25_000)],
+            ),
+            2,
+        );
+        t.on_object_status(900, &status(900, vec![stat(StatType::HP, 1_000)]), 4);
+
+        let bridge = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(bridge.shatters_hm);
+    }
+
+    #[test]
+    fn shatters_hard_mode_resets_with_the_instance() {
+        let mut t = CombatTracker::new();
+        t.on_map_change("The Shatters", 777, 0);
+        t.on_player_loaded(1000, 777);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
+        hard_mode_idol(&mut t);
+        let hard = finish_shatters_fight(
+            &mut t,
+            700,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            100,
+        );
+        assert!(hard.shatters_hm);
+
+        // The next Shatters instance starts regular again: nothing proved hard
+        // mode there, and the Sentinel's own evidence is what carries the mode.
+        t.on_map_change("Nexus", 0, 500);
+        t.on_map_change("The Shatters", 778, 600);
+        t.on_player_loaded(1000, 778);
+        t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 600);
+        let regular = finish_shatters_fight(
+            &mut t,
+            710,
+            crate::assets::SHATTERS_BRIDGE_SENTINEL_TYPE,
+            250_000,
+            700,
+        );
+        assert!(!regular.shatters_hm);
+        assert!(
+            !regular.boss_name.contains("Valen"),
+            "got {}",
+            regular.boss_name
+        );
     }
 }

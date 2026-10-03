@@ -93,6 +93,12 @@ pub enum SoundType {
     Guild,
     Pm,
     Trade,
+    /// Plays when a chat message from another player mentions the local
+    /// character name. Placeholder audio is the private-message ping.
+    IgnMention,
+    /// Plays when a chat message contains the user's custom chat trigger text.
+    /// Placeholder audio is the guild-message ping.
+    CustomChat,
     /// Plays when entering a Dimitus dungeon.
     DimitusAlert,
     /// Plays when entering a dungeon with a dangerous (red-outline) modifier
@@ -119,6 +125,10 @@ impl SoundType {
             Self::Guild => GUILD_WAV,
             Self::Pm => PM_WAV,
             Self::Trade => TRADE_WAV,
+            // Placeholders until dedicated pings are sourced; the settings row
+            // lets the user point either one at their own file meanwhile.
+            Self::IgnMention => PM_WAV,
+            Self::CustomChat => GUILD_WAV,
             Self::DimitusAlert => DIMITUS_ALERT,
             Self::BadModWarning => BAD_MOD_WARNING,
         }
@@ -142,6 +152,8 @@ impl SoundType {
             Self::Guild => settings.guild,
             Self::Pm => settings.pm,
             Self::Trade => settings.trade,
+            Self::IgnMention => settings.ign_mention,
+            Self::CustomChat => settings.custom_chat,
             Self::DimitusAlert => settings.dimitus_dungeon,
             Self::BadModWarning => settings.bad_mod_warning,
         }
@@ -193,6 +205,8 @@ impl SoundType {
             Self::Guild => "guild",
             Self::Pm => "pm",
             Self::Trade => "trade",
+            Self::IgnMention => "ign_mention",
+            Self::CustomChat => "custom_chat",
             Self::DimitusAlert => "dimitus_alert",
             Self::BadModWarning => "bad_mod_warning",
         }
@@ -895,5 +909,48 @@ mod latency_tests {
         assert_eq!(second.delayed_commands, 1);
         assert_eq!(second.peak_queue, std::time::Duration::from_millis(500));
         assert_eq!(diagnostics.health_volume_commands, 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_ping_sounds_are_off_by_default_and_follow_their_toggles() {
+        let mut settings = SoundSettings::default();
+        assert!(!SoundType::IgnMention.is_enabled(&settings));
+        assert!(!SoundType::CustomChat.is_enabled(&settings));
+
+        settings.ign_mention = true;
+        assert!(SoundType::IgnMention.is_enabled(&settings));
+        assert!(!SoundType::CustomChat.is_enabled(&settings));
+
+        settings.custom_chat = true;
+        assert!(SoundType::CustomChat.is_enabled(&settings));
+    }
+
+    #[test]
+    fn chat_ping_sounds_have_their_own_settings_keys() {
+        // The key drives the custom-sound override map and the per-sound volume
+        // overrides, so a collision would cross the two new pings with an
+        // existing sound.
+        let keys = [
+            SoundType::IgnMention.settings_key(),
+            SoundType::CustomChat.settings_key(),
+        ];
+        assert_eq!(keys, ["ign_mention", "custom_chat"]);
+        for other in [
+            SoundType::Pm,
+            SoundType::Guild,
+            SoundType::Party,
+            SoundType::Trade,
+        ] {
+            assert!(
+                !keys.contains(&other.settings_key()),
+                "{:?} shares a settings key with a chat ping",
+                other
+            );
+        }
     }
 }
