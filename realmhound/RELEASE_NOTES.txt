@@ -1,6 +1,24 @@
-# Open Source
-- RealmHound's source code is now public on GitHub. Versions through v0.20.2 were binary-only releases; v0.20.3 is the first release built from the public source snapshot.
+# Live Feed
+- Dungeon callouts now have more flexible settings.
+- A new option to learn and disable callouts for guaranteed special and unique dungeon mods during Deca's events.
+- Realm status callout: name a closing realm past 90% or show "in X% realm" from your own threshold.
+- Nexus callout: a new option to label dungeons opened in Nexus/Guild Hall/Vault/Bazaar as "nexus".
+- Live Feed settings are regrouped into sub-tabs.
+- Automatic copy to clipboard feature for dungeon callouts.
+- Optional sound pings for your character name and custom chat words.
 
-# Improvements
-- Reduced Combat History persistence work that could delay notifications during long sessions.
-- Update downloads are now verified against the published SHA-256 checksum before installation.
+# Combat History
+- MV fight card now tracks the spirits collected in a run.
+- Fixed MV loot attribution.
+- MV fight card no longer caps party damage by the boss's HP.
+- Labels for special MV modes: "(Leisurely)" and "(Petless)".
+- The Shatters hard mode is detected and its fight cards are titled "(HM)".
+- Fixed Shatters HM extra loot bag attribution.
+- Labels for Spec Pen hard mode in fight cards.
+- Goblin Patriarch's and Legion Colonel's minions are no longer tracked, and the Demonic Effigy is tracked.
+
+# Fixes
+- RealmHound recovers its windows after display changes.
+- Security enhancements.
+- Added loopback VPN traffic support.
+- RealmShark imports work in offline mode again.
