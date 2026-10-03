@@ -633,6 +633,35 @@ fn is_hub_map(display_name: &str) -> bool {
     HUB_MARKERS.iter().any(|hub| name.contains(hub))
 }
 
+/// Whether a dungeon's `MapInfo` realm field names a hub space rather than a
+/// realm, i.e. the dungeon was opened in a hub (the Nexus, or the Vault, Guild
+/// Hall and Bazaar, which all count as the Nexus).
+///
+/// The field names the area a dungeon was opened in: hubs report the plain Nexus
+/// (`Nexus`, or `{s.nexus}` in the raw form), while a realm entry reports
+/// `NexusPortal.<Realm>` and a dungeon opened in a realm reports that same realm
+/// name. So a hub parent is the plain Nexus, never the `NexusPortal.` prefix that
+/// marks a realm (see [`parse_realm_name_for_realm`]).
+fn realm_field_is_hub(realm_name_field: &str) -> bool {
+    let name = realm_name_field
+        .trim()
+        .trim_start_matches("{s.")
+        .trim_end_matches('}')
+        .trim()
+        .to_ascii_lowercase();
+    name.is_empty()
+        || matches!(
+            name.as_str(),
+            "nexus"
+                | "nexusportal"
+                | "nexusportal."
+                | "vault"
+                | "guildhall"
+                | "guild hall"
+                | "bazaar"
+        )
+}
+
 impl DungeonEntry {
     /// Create a new dungeon entry from a display name and decoded modifier tokens.
     ///
@@ -1737,16 +1766,15 @@ impl LiveFeedPanel {
         // Parse realm name from realm_name field (e.g., "NexusPortal.Medusa" -> "Medusa")
         // Server name comes from IP lookup, not from this field
         let parsed_realm = Self::parse_realm_name_for_realm(realm_name_field);
-        // A dungeon reports the area it was opened in: "NexusPortal.<Realm>" for
-        // one entered through a realm portal, and nothing for one opened in a hub
-        // (a hub is not a realm, so the game has no realm name to report). Landing
-        // in a dungeon that names no realm while we were in one therefore says the
-        // instance was not opened in that realm -- it runs under the Nexus. That
-        // is what a party call into someone else's Nexus-popped key looks like, and
-        // it is the only origin signal a party call gives us (the entry never
-        // loads a hub map, and the instance's host need not be one RH can name).
+        // A dungeon reports the area it was opened in: `NexusPortal.<Realm>` for
+        // one entered through a realm portal, and the plain Nexus for one opened
+        // in a hub (a hub is not a realm, so the game has no realm name to
+        // report). That makes the field the instance's own statement of where it
+        // was opened, and the only origin signal a party call gives us -- the entry
+        // never loads a hub map, and the instance's host need not be one RH can
+        // name. It is read whatever we came from (a realm, or another dungeon).
         self.nexus_parent_dungeon =
-            self.left_from_realm && !in_realm && !self.map_is_hub && parsed_realm.is_none();
+            !in_realm && !self.map_is_hub && realm_field_is_hub(realm_name_field);
         if !in_realm && !self.map_is_hub {
             tracing::info!(
                 "[LIVE_FEED] entering '{display_name}': realm field '{realm_name_field}' \
@@ -7154,14 +7182,16 @@ mod tests {
             );
         }
 
-        // ...but the Oryx endgame areas do not, even though they are hubs of a
-        // sort: a dungeon keyed open in the castle is not a Nexus entry.
+        // ...and a dungeon whose own MapInfo names one of the Oryx endgame areas
+        // as the place it was opened is not a Nexus call either, whatever we
+        // walked in from.
         for oryx in ["{s.oryx_s_castle}", "{s.wine_cellar}"] {
             let mut panel = LiveFeedPanel::new();
             panel.update_location(oryx, oryx, 0, 0);
             panel.nexus_marker = NexusMarker::InNexus;
             panel.pending_portal_spawn = Some(std::time::Instant::now());
-            enter_dungeon(&mut panel, 1, "Snake Pit");
+            panel.update_location("Snake Pit", oryx, 0, 0);
+            panel.push_dungeon(1, "Snake Pit", &[], None);
             assert_eq!(newest_callout(&panel).as_deref(), Some("snake"), "{oryx}");
         }
 
@@ -7176,13 +7206,15 @@ mod tests {
         enter_dungeon(&mut panel, 1, "Snake Pit");
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
 
-        // A dungeon keyed open inside another dungeon names neither origin.
+        // A dungeon keyed open inside another dungeon reports that instance's
+        // area, not the Nexus, so it names neither origin.
         let mut panel = LiveFeedPanel::new();
         panel.update_location("Nexus", "Nexus", 0, 0);
         panel.nexus_marker = NexusMarker::InNexus;
         panel.update_location("Spider Den", "Spider Den", 0, 0);
         panel.pending_portal_spawn = Some(std::time::Instant::now());
-        enter_dungeon(&mut panel, 1, "Snake Pit");
+        panel.update_location("Snake Pit", "Spider Den", 0, 0);
+        panel.push_dungeon(1, "Snake Pit", &[], None);
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake"));
 
         // The shorter marker option appends just its own text.
@@ -7192,6 +7224,49 @@ mod tests {
         panel.pending_portal_spawn = Some(std::time::Instant::now());
         enter_dungeon(&mut panel, 1, "Snake Pit");
         assert_eq!(newest_callout(&panel).as_deref(), Some("snake nex"));
+    }
+
+    #[test]
+    fn opened_in_nexus_follows_the_joined_instance_not_the_origin() {
+        let _assets = crate::test_support::modifier_assets();
+        // A party call can arrive from anywhere -- a realm, a dungeon, a closed
+        // realm, the castle, the vault. What decides is what we join: an instance
+        // whose own MapInfo was opened in a hub reports the plain Nexus as its
+        // area (a key popped in the Bazaar and called into party looks like this).
+        let origins: [(&str, &str, i32, i32); 4] = [
+            ("Sprite World", "NexusPortal.Hearth", 0, 0), // inside a dungeon
+            ("Realm of the Mad God", "NexusPortal.Hearth", 20, 100), // in a realm
+            ("{s.oryx_s_castle}", "{s.oryx_s_castle}", 0, 0), // Oryx's castle
+            ("{s.vault}", "{s.vault}", 0, 0),             // the vault
+        ];
+        for (map, field, score, max) in origins {
+            let mut panel = LiveFeedPanel::new();
+            panel.update_location(map, field, score, max);
+            panel.nexus_marker = NexusMarker::Nex;
+            panel.update_location("Snake Pit", "Nexus", 0, 0);
+            panel.push_dungeon(1, "Snake Pit", &[], None);
+            assert_eq!(
+                newest_callout(&panel).as_deref(),
+                Some("snake nex"),
+                "joined from {map}"
+            );
+        }
+
+        // The mirror: whatever we came from, an instance that reports a realm (or
+        // any other non-hub area) as its own is not a Nexus call.
+        for field in [
+            "NexusPortal.Hearth",
+            "Hearth",
+            "{s.oryx_s_castle}",
+            "Spider Den",
+        ] {
+            let mut panel = LiveFeedPanel::new();
+            panel.update_location("Sprite World", "NexusPortal.Hearth", 0, 0);
+            panel.nexus_marker = NexusMarker::Nex;
+            panel.update_location("Snake Pit", field, 0, 0);
+            panel.push_dungeon(1, "Snake Pit", &[], None);
+            assert_eq!(newest_callout(&panel).as_deref(), Some("snake"), "{field}");
+        }
     }
 
     #[test]
