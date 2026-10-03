@@ -8989,7 +8989,7 @@ impl RealmHoundApp {
                             .map(|age| format!(" (captured {}h ago)", age.num_hours()))
                             .unwrap_or_default();
                         refresh_btn.clone().hover_tip(format!(
-                            "Click here to refresh your entire account data at once.\n\n\u{26a0} Your access token looks expired{age_hint}. If the refresh fails, launch the game to capture a fresh one."
+                            "Click here to refresh your entire account data at once.\n\n\u{26a0} Your access token looks expired{age_hint}. If the refresh fails, re-launch the game to capture a fresh one."
                         ));
                     } else {
                         refresh_btn.clone().hover_tip(
@@ -9019,8 +9019,9 @@ impl RealmHoundApp {
                 if !can_refresh {
                     if !has_token {
                         refresh_btn.disabled_hover_tip(
-                            "Tokens are memory-only. Start capture, then reconnect or log into RotMG \
-                             to enable API refresh after restarting or switching accounts."
+                            "Refresh button only works with your game launched. After launching \
+                             your game, switch portals once then press Refresh and wait for it to \
+                             finish loading your data before switching portals again."
                         );
                     } else if is_loading {
                         refresh_btn.disabled_hover_tip("Loading...");
