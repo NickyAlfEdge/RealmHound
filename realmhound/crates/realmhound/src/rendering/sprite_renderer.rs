@@ -19,6 +19,7 @@
 
 use crate::ui_ext::HoverTooltipExt;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::thread;
 
@@ -150,6 +151,91 @@ pub enum AtlasLoadState {
     Ready,
 }
 
+/// What an item unlocks, when it unlocks anything. Drives the tooltip's `OWNED`
+/// tag: forge blueprints, skin items and pet stones unlock a *different* object
+/// than themselves, so ownership is tested against the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unlocks {
+    /// The item unlocks nothing: ownership keys on the item id itself (emotes).
+    Nothing,
+    /// A forge blueprint; the value is the item id it unlocks.
+    ForgeItem(i32),
+    /// A skin item or pet stone; the value is the cosmetic object it unlocks,
+    /// which is what the account's unlock data lists.
+    Cosmetic(i32),
+}
+
+/// Account unlock state backing the item tooltip's `OWNED` tag.
+///
+/// Built from account data: the wardrobe ids char/list lists (skins, emotes)
+/// plus unlocks observed live (pet skins), and the two forge blueprint lists.
+#[derive(Debug, Clone, Default)]
+pub struct OwnedUnlocks {
+    /// Wardrobe item ids the account owns (skins, emotes, observed pet skins).
+    wardrobe: HashSet<i32>,
+    /// Item ids whose forge blueprint is unlocked in the regular forge.
+    blueprints_regular: HashSet<i32>,
+    /// Item ids whose forge blueprint is unlocked in the seasonal forge.
+    blueprints_seasonal: HashSet<i32>,
+}
+
+impl OwnedUnlocks {
+    /// The tooltip tag state for an item, or `None` when the account does not
+    /// own it. `unlocks` says what the item unlocks, when it unlocks anything.
+    ///
+    /// `Some(false)` is the gold pill: a blueprint unlocked in the regular forge
+    /// only, or an owned skin / emote / pet skin (the wardrobe families make no
+    /// seasonal distinction). `Some(true)` is the green pill: a blueprint that is
+    /// also unlocked in the seasonal forge, i.e. owned in both.
+    fn tag(&self, item_id: i32, unlocks: Unlocks) -> Option<bool> {
+        match unlocks {
+            // The forge lists unlocked items, so a blueprint is matched through
+            // its target.
+            Unlocks::ForgeItem(unlocked) => {
+                if self.blueprints_seasonal.contains(&unlocked) {
+                    return Some(true);
+                }
+                self.blueprints_regular.contains(&unlocked).then_some(false)
+            }
+            // A pet stone or skin item and the cosmetic it unlocks key on the
+            // unlocked object; the set holds skins, emotes and pet skins alike.
+            Unlocks::Cosmetic(target) => self.wardrobe.contains(&target).then_some(false),
+            Unlocks::Nothing => self.wardrobe.contains(&item_id).then_some(false),
+        }
+    }
+
+    /// Rebuild from account data.
+    fn from_account_data(account_data: &realmhound_core::vault::AccountData) -> Self {
+        let mut wardrobe: HashSet<i32> = account_data.owned_wardrobe_ids.iter().copied().collect();
+        // A pet wearing a pet skin proves the account owns it. The pet-skin list
+        // itself comes from `account/getOwnedPetSkins` (char/list carries none),
+        // so this catches skins worn before that list was fetched.
+        for pet in account_data
+            .characters
+            .regular_pets
+            .values()
+            .chain(account_data.characters.seasonal_pets.values())
+        {
+            if pet.skin > 0 {
+                wardrobe.insert(pet.skin);
+            }
+        }
+        Self {
+            wardrobe,
+            blueprints_regular: account_data
+                .unlocked_blueprints_regular
+                .iter()
+                .copied()
+                .collect(),
+            blueprints_seasonal: account_data
+                .unlocked_blueprints_seasonal
+                .iter()
+                .copied()
+                .collect(),
+        }
+    }
+}
+
 /// Sprite renderer for drawing item sprites in egui.
 pub struct SpriteRenderer {
     /// Local texture cache
@@ -216,10 +302,16 @@ pub struct SpriteRenderer {
     owned_rarities: HashMap<i32, [u32; 5]>,
     /// When true, item tooltips omit the "Owned rarity" section. Set by views
     /// that show other players' gear (e.g. Combat History), where the app-user's
-    /// own collection counts are irrelevant.
+    /// own collection counts are irrelevant. This is about *equipment rarity*
+    /// counts only: the `OWNED` cosmetic/blueprint tag is unrelated and always
+    /// shows.
     hide_owned_rarity: bool,
     /// Account generation the `owned_rarities` map was built from (skip recompute).
     owned_rarities_generation: u64,
+    /// Account unlock state behind the tooltip's `OWNED` tag.
+    owned_unlocks: OwnedUnlocks,
+    /// Account generation the `owned_unlocks` snapshot was built from.
+    owned_unlocks_generation: u64,
     /// Per-item content-centering offset in native sprite pixels
     /// (`frame_center - content_center`). Sprites are stored in fixed frames
     /// with visible pixels sometimes off-center (e.g. rings); this shifts them
@@ -281,6 +373,8 @@ impl SpriteRenderer {
             owned_rarities: HashMap::new(),
             hide_owned_rarity: false,
             owned_rarities_generation: u64::MAX,
+            owned_unlocks: OwnedUnlocks::default(),
+            owned_unlocks_generation: u64::MAX,
             content_offsets: HashMap::new(),
             trim_cache: HashMap::new(),
             collection_icon_texture: None,
@@ -557,17 +651,56 @@ impl SpriteRenderer {
         get_asset_manager().is_shiny(item_id)
     }
 
-    /// Refresh the owned-item rarity breakdown from account data. Counts every
-    /// owned copy of each item by its enchant-slot rarity (0 = Common .. 4 =
-    /// Divine) across all live and dead characters and both vaults. Skips the
-    /// (potentially large) recompute when the account generation is unchanged.
     /// Toggle whether item tooltips include the "Owned rarity" section (the
     /// app-user's own collection counts). Views that display other players' gear
-    /// (Combat History) set this false so those counts don't appear.
+    /// (Combat History) set this true so those counts don't appear. Cosmetic and
+    /// blueprint `OWNED` tags are unaffected.
     pub fn set_hide_owned_rarity(&mut self, hide: bool) {
         self.hide_owned_rarity = hide;
     }
 
+    /// Refresh the account unlock state behind the tooltip's `OWNED` tag: the
+    /// wardrobe ids (skins, emotes, pet skins) and both forge blueprint lists.
+    /// Skips the rebuild when the account generation is unchanged.
+    pub fn update_owned_unlocks(&mut self, account_data: &realmhound_core::vault::AccountData) {
+        if self.owned_unlocks_generation == account_data.generation {
+            return;
+        }
+        self.owned_unlocks_generation = account_data.generation;
+        self.owned_unlocks = OwnedUnlocks::from_account_data(account_data);
+    }
+
+    /// The `OWNED` tag state for `item_id`, or `None` when the account does not
+    /// own it. See [`OwnedUnlocks::tag`] for what the returned flag means.
+    fn owned_tag(&self, item_id: i32) -> Option<bool> {
+        let asset_mgr = get_asset_manager();
+        // A skin item is owned when the skin object it unlocks is, and a pet
+        // stone when the pet skin it unlocks is. The items themselves are
+        // consumed on use, so their own ids prove nothing.
+        if let Some(target) = asset_mgr
+            .skin_unlocked_id(item_id)
+            .or_else(|| asset_mgr.pet_skin_unlocked_id(item_id))
+        {
+            return self.owned_unlocks.tag(item_id, Unlocks::Cosmetic(target));
+        }
+        // A blueprint is owned when the item it unlocks is in a forge list; a
+        // blueprint with no known target cannot be matched.
+        if asset_mgr
+            .get_object(item_id)
+            .is_some_and(|o| o.is_blueprint())
+        {
+            let (unlocked, _) = asset_mgr.blueprint_unlocked_item(item_id)?;
+            return self
+                .owned_unlocks
+                .tag(item_id, Unlocks::ForgeItem(unlocked));
+        }
+        self.owned_unlocks.tag(item_id, Unlocks::Nothing)
+    }
+
+    /// Refresh the owned-item rarity breakdown from account data. Counts every
+    /// owned copy of each item by its enchant-slot rarity (0 = Common .. 4 =
+    /// Divine) across all live and dead characters and both vaults. Skips the
+    /// (potentially large) recompute when the account generation is unchanged.
     pub fn update_owned_rarities(&mut self, account_data: &realmhound_core::vault::AccountData) {
         if self.owned_rarities_generation == account_data.generation {
             return;
@@ -4919,11 +5052,32 @@ impl SpriteRenderer {
             }
 
             ui.separator();
-            ui.label(
-                RichText::new(format!("ID: 0x{:04X}", item_id))
-                    .small()
-                    .weak(),
-            );
+            // Item id on the left, the account-owned `OWNED` tag pinned to the
+            // bottom-right on the same row.
+            let owned = self.owned_tag(item_id);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("ID: 0x{:04X}", item_id))
+                        .small()
+                        .weak(),
+                );
+                if let Some(also_seasonal) = owned {
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| {
+                            crate::ui_ext::status_pill(
+                                ui,
+                                "OWNED",
+                                if also_seasonal {
+                                    crate::ui_ext::PILL_GREEN
+                                } else {
+                                    crate::ui_ext::PILL_GOLD
+                                },
+                            );
+                        },
+                    );
+                }
+            });
         });
 
         // Suppress the unused variable warning for rect/tooltip_id
@@ -5243,6 +5397,134 @@ impl SpriteRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unlocks(wardrobe: &[i32], regular: &[i32], seasonal: &[i32]) -> OwnedUnlocks {
+        OwnedUnlocks {
+            wardrobe: wardrobe.iter().copied().collect(),
+            blueprints_regular: regular.iter().copied().collect(),
+            blueprints_seasonal: seasonal.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn owned_tag_marks_wardrobe_items_gold() {
+        let owned = unlocks(&[64979, 65040], &[], &[]);
+        // A skin or emote the account owns: gold, whatever forge state exists.
+        assert_eq!(owned.tag(64979, Unlocks::Nothing), Some(false));
+        assert_eq!(owned.tag(65040, Unlocks::Nothing), Some(false));
+        // An item the account does not own gets no tag.
+        assert_eq!(owned.tag(12345, Unlocks::Nothing), None);
+    }
+
+    #[test]
+    fn owned_tag_marks_cosmetic_unlockers_by_their_target() {
+        // A skin item or pet stone is keyed on the cosmetic object it unlocks,
+        // not on its own id.
+        const SKIN_ITEM: i32 = 9240;
+        const SKIN_OBJECT: i32 = 9226;
+        const STONE: i32 = 19141;
+        const PET_SKIN: i32 = 19140;
+        let owns_skin = unlocks(&[SKIN_OBJECT, PET_SKIN], &[], &[]);
+        assert_eq!(
+            owns_skin.tag(SKIN_ITEM, Unlocks::Cosmetic(SKIN_OBJECT)),
+            Some(false)
+        );
+        assert_eq!(
+            owns_skin.tag(STONE, Unlocks::Cosmetic(PET_SKIN)),
+            Some(false)
+        );
+        // The unlocked skin itself is owned too.
+        assert_eq!(owns_skin.tag(SKIN_OBJECT, Unlocks::Nothing), Some(false));
+        // An unlocker whose target is not unlocked carries no tag.
+        let not_owned = unlocks(&[], &[], &[]);
+        assert_eq!(
+            not_owned.tag(SKIN_ITEM, Unlocks::Cosmetic(SKIN_OBJECT)),
+            None
+        );
+        assert_eq!(not_owned.tag(STONE, Unlocks::Cosmetic(PET_SKIN)), None);
+    }
+
+    #[test]
+    fn owned_tag_marks_blueprints_gold_or_green_by_forge() {
+        // The forge lists unlocked *items*, so the blueprint is matched through
+        // the item it unlocks.
+        const BLUEPRINT: i32 = 40000;
+        const UNLOCKED_ITEM: i32 = 8386;
+        let regular_only = unlocks(&[], &[UNLOCKED_ITEM], &[]);
+        assert_eq!(
+            regular_only.tag(BLUEPRINT, Unlocks::ForgeItem(UNLOCKED_ITEM)),
+            Some(false)
+        );
+        let both = unlocks(&[], &[UNLOCKED_ITEM], &[UNLOCKED_ITEM]);
+        assert_eq!(
+            both.tag(BLUEPRINT, Unlocks::ForgeItem(UNLOCKED_ITEM)),
+            Some(true)
+        );
+        // Unlocked in neither forge: no tag, even though the item is forge gear.
+        let neither = unlocks(&[], &[], &[]);
+        assert_eq!(
+            neither.tag(BLUEPRINT, Unlocks::ForgeItem(UNLOCKED_ITEM)),
+            None
+        );
+        // A seasonal entry alone still counts as owned: seasonal unlocks are
+        // account-wide.
+        let seasonal_only = unlocks(&[], &[], &[UNLOCKED_ITEM]);
+        assert_eq!(
+            seasonal_only.tag(BLUEPRINT, Unlocks::ForgeItem(UNLOCKED_ITEM)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn owned_unlocks_include_pet_skins_worn_by_pets() {
+        // char/list has no pet-skin unlock list, so a pet wearing a skin is the
+        // bulk evidence that the account owns it.
+        let mut account_data = realmhound_core::vault::AccountData::default();
+        let mut pet = realmhound_core::vault::CachedPet::default();
+        pet.skin = 19140;
+        account_data.characters.regular_pets.insert(7, pet);
+
+        let mut renderer = SpriteRenderer::new();
+        renderer.update_owned_unlocks(&account_data);
+        assert!(renderer.owned_unlocks.wardrobe.contains(&19140));
+    }
+
+    #[test]
+    fn owned_unlocks_rebuild_from_account_data() {
+        let mut account_data = realmhound_core::vault::AccountData::default();
+        account_data.owned_wardrobe_ids = vec![64979];
+        account_data.unlocked_blueprints_regular = vec![8386];
+        account_data.unlocked_blueprints_seasonal = vec![8386, 306];
+        let mut renderer = SpriteRenderer::new();
+        renderer.update_owned_unlocks(&account_data);
+        assert_eq!(renderer.owned_tag(64979), Some(false));
+        assert_eq!(renderer.owned_unlocks.blueprints_seasonal.len(), 2);
+
+        // The generation guard skips the rebuild, so a stale snapshot survives
+        // without a bumped generation.
+        renderer.owned_unlocks.wardrobe.clear();
+        renderer.update_owned_unlocks(&account_data);
+        assert!(renderer.owned_unlocks.wardrobe.is_empty());
+
+        // A bumped generation rebuilds it.
+        account_data.bump_generation();
+        renderer.update_owned_unlocks(&account_data);
+        assert!(renderer.owned_unlocks.wardrobe.contains(&64979));
+    }
+
+    #[test]
+    fn the_rarity_toggle_does_not_affect_the_owned_tag() {
+        // The "Owned rarity" suppression is about equipment rarity counts in
+        // other players' gear views; cosmetic/blueprint OWNED tags are separate
+        // and always show.
+        let mut renderer = SpriteRenderer::new();
+        renderer.owned_unlocks = unlocks(&[64979], &[], &[]);
+        assert_eq!(renderer.owned_tag(64979), Some(false));
+        renderer.set_hide_owned_rarity(true);
+        assert_eq!(renderer.owned_tag(64979), Some(false));
+        renderer.set_hide_owned_rarity(false);
+        assert_eq!(renderer.owned_tag(64979), Some(false));
+    }
 
     #[test]
     fn test_sprite_renderer_new() {

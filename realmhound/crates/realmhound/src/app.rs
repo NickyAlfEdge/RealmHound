@@ -1266,6 +1266,7 @@ impl RealmHoundApp {
             *app.trophy_hall_panel.show_no_collection_dungeons_mut() =
                 s.trophy_hall.show_no_collection_dungeons;
             *app.trophy_hall_panel.compact_view_mut() = s.trophy_hall.compact_view;
+            *app.trophy_hall_panel.show_legacy_dungeons_mut() = s.trophy_hall.show_legacy_dungeons;
         }
 
         // Forward cached vault data to treasury panel (vault panel loads its own cache)
@@ -1348,6 +1349,8 @@ impl RealmHoundApp {
             settings.trophy_hall.show_no_collection_dungeons =
                 self.trophy_hall_panel.show_no_collection_dungeons();
             settings.trophy_hall.compact_view = self.trophy_hall_panel.compact_view();
+            settings.trophy_hall.show_legacy_dungeons =
+                self.trophy_hall_panel.show_legacy_dungeons();
             settings.save();
         }
     }
@@ -1667,6 +1670,9 @@ impl RealmHoundApp {
             } => {
                 self.live_feed_panel
                     .apply_dungeon_freeze(map_seed, elapsed_ms);
+            }
+            UiPayload::CombatHistoryChanged => {
+                self.combat_panel.invalidate_cards();
             }
             UiPayload::PushLoot(drop) => {
                 self.live_feed_panel.push_loot(&drop);
@@ -4945,21 +4951,18 @@ impl RealmHoundApp {
 
         shadcn.card(ui, "trophy_hall_view", "View Options", |ui| {
             let compact_resp = shadcn
-                .switch(ui, self.trophy_hall_panel.compact_view_mut(), "Compact view")
+                .switch(
+                    ui,
+                    self.trophy_hall_panel.compact_view_mut(),
+                    "Compact view",
+                )
                 .hover_tip("Hide dungeon name column and collection section names.");
             if compact_resp.changed() {
                 self.persist_trophy_hall_view();
             }
-            let resp = shadcn
-                .switch(
-                    ui,
-                    self.trophy_hall_panel.show_no_collection_dungeons_mut(),
-                    "Show dungeons without collections",
-                )
-                .hover_tip("Show dungeons whose collection is intentionally empty because their drops fully duplicate another dungeon's collection.");
-            if resp.changed() {
-                self.persist_trophy_hall_view();
-            }
+            // The "dungeons without collections" and Legacy toggles live in the
+            // Trophy Hall's own navigation bar, next to the item filters they
+            // belong with.
         });
     }
 
@@ -8205,8 +8208,8 @@ impl RealmHoundApp {
                     value_color,
                 )
                 .hover_tip(
-                    "Estimated battlepass end (season midpoint, snapped to Tuesday).\n\
-                     Press Refresh to load or update it.",
+                    "Battlepass end date from live game data, or the season midpoint \
+                     estimate when the server has none.\nPress Refresh to load or update it.",
                 );
             }
             WidgetKind::CurrentCharacter => {
@@ -8414,6 +8417,42 @@ impl RealmHoundApp {
                     progress,
                     scope: mission_scope,
                 });
+            }
+            // Exact season start and battlepass window. The mission payload's pool
+            // timestamp keeps reporting the previous cycle's start after a
+            // rollover, which put the battlepass estimate's midpoint behind now
+            // and collapsed the countdown onto the season end.
+            let season_info = match client.get_season_info() {
+                Ok(body) => realmhound_core::api::parse_season_info(&body),
+                Err(e) => {
+                    tracing::warn!("[SEASON] season/seasonInfo failed: {e}");
+                    None
+                }
+            };
+            let battlepass = match client.get_battlepass_info() {
+                Ok(body) => realmhound_core::api::parse_battlepass_info(&body),
+                Err(e) => {
+                    tracing::warn!("[SEASON] season/bpInfo failed: {e}");
+                    None
+                }
+            };
+            if season_info.is_some() || battlepass.is_some() {
+                if let Ok(mut s) = settings.write() {
+                    let mut changed = false;
+                    if let Some((start, end)) = season_info.as_ref().and_then(|i| i.window()) {
+                        // Season and end together: this endpoint is authoritative,
+                        // so it can also repair a date `getClientSeasons` never
+                        // delivered or reported stale.
+                        changed |= s.season.apply_live_season_window(start, end);
+                    }
+                    if let Some((start, end)) = battlepass.as_ref().and_then(|b| b.window()) {
+                        changed |= s.season.apply_live_battlepass_window(start, end);
+                    }
+                    if changed {
+                        s.save();
+                        tracing::info!("[SEASON] season/battlepass window auto-set from live data");
+                    }
+                }
             }
         });
     }
@@ -9118,6 +9157,8 @@ impl RealmHoundApp {
 
         self.sprite_renderer
             .update_owned_rarities(&self.account_data);
+        self.sprite_renderer
+            .update_owned_unlocks(&self.account_data);
 
         let api_refresh_allowed = self.client_relaunched_today();
         let mut ctx = PanelContext {
@@ -9141,7 +9182,15 @@ impl RealmHoundApp {
         // scroll position) on entry instead of inheriting a stale position.
         if self.active_tab != self.last_active_tab {
             match self.active_tab {
-                ActiveTab::CombatHistory => self.combat_panel.reset_scroll(),
+                ActiveTab::CombatHistory => {
+                    // Cards can change while another tab is open (a loot bag
+                    // completing an escaped fight changes no fight count), so
+                    // re-read the stored summaries on entry as well: the
+                    // delivery of `UiPayload::CombatHistoryChanged` must not be
+                    // the only way an open view is invalidated.
+                    self.combat_panel.invalidate_cards();
+                    self.combat_panel.reset_scroll();
+                }
                 ActiveTab::LootHistory => self.loot_panel.reset_scroll(),
                 ActiveTab::Chat => self.chat_panel.reset_scroll(),
                 _ => {}
@@ -9237,6 +9286,9 @@ impl RealmHoundApp {
                         s.characters.last_live_char_id = keep;
                         s.save();
                     }
+                }
+                AppAction::SaveTrophyHallView => {
+                    self.persist_trophy_hall_view();
                 }
                 AppAction::SaveMissionsSettings(missions) => {
                     if let Ok(mut s) = self.settings.write() {

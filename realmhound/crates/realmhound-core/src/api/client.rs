@@ -134,6 +134,30 @@ impl RotmgApiClient {
         self.make_request("account/listPowerUpStats")
     }
 
+    /// Get the pet skins the account owns.
+    ///
+    /// Returns XML holding the owned pet-skin object ids, e.g.
+    /// `<PetSkins>32846,50290</PetSkins>`. Pet-skin ownership is never sent
+    /// over the game socket, so this endpoint is the only bulk source of it.
+    pub fn get_owned_pet_skins(&self) -> Result<String, ApiError> {
+        self.make_request("account/getOwnedPetSkins")
+    }
+
+    /// Get the running season's window (name, start, end).
+    ///
+    /// Returns raw JSON. The mission payload only carries the season's pool
+    /// timestamp, which keeps reporting the previous cycle's start.
+    pub fn get_season_info(&self) -> Result<String, ApiError> {
+        self.make_request("season/seasonInfo")
+    }
+
+    /// Get the running battlepass (title, start, end).
+    ///
+    /// Returns raw JSON, or a response with no battlepass between battlepasses.
+    pub fn get_battlepass_info(&self) -> Result<String, ApiError> {
+        self.make_request("season/bpInfo")
+    }
+
     /// Get the seasonal battle-pass mission DEFINITIONS (names, descriptions,
     /// objectives, rewards) for the account's available seasons.
     ///

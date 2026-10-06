@@ -2320,6 +2320,26 @@ pub fn encounter_loot_completes(mob_type: i32) -> Option<&'static str> {
         .map(|(_, id)| *id)
 }
 
+/// Bosses whose guaranteed bag alone proves they died, because they drop no Mark
+/// item to key on. Lair of Shaitan's Head of Shaitan always bags, and the local
+/// player can leave the fight before the killing blow (nexus, disconnect, or a
+/// late-joined fight), so the bag is the only in-record evidence that it died in
+/// that instance.
+const BAG_PROVES_KILL: &[i32] = &[
+    28058, // Head of Shaitan (Lair of Shaitan anchor, loot form)
+];
+
+/// Whether a bag attributed to `mob_type` proves the boss died in that instance
+/// on its own, without a Mark item (see [`BAG_PROVES_KILL`]).
+pub fn bag_proves_boss_killed(mob_type: i32) -> bool {
+    BAG_PROVES_KILL.contains(&mob_type)
+}
+
+/// Every boss type whose bag alone proves the kill (see [`BAG_PROVES_KILL`]).
+pub fn bag_proves_kill_boss_types() -> &'static [i32] {
+    BAG_PROVES_KILL
+}
+
 /// Whether `encounter_id` supports loot-driven completion, i.e. its card may be
 /// marked Completed from a run-level `killed` flag even when no member phase was
 /// scored as a kill. Only these encounters honor the `encounter_runs.killed`
@@ -2486,6 +2506,29 @@ impl AssetManager {
                         }
                         Err(e) => {
                             tracing::warn!("Failed to merge equipment XML: {}", e);
+                        }
+                    }
+                }
+
+                // Merge cosmetic unlock targets: skin items (equipSkins.xml) and
+                // pet stones (pets.xml). Neither file is read above, and both
+                // map an unlocker item to a different cosmetic object, the same
+                // way blueprints map to the item they unlock.
+                for name in ["equipSkins.xml", "pets.xml"] {
+                    let path = assets_dir.join("xml").join(name);
+                    if !path.exists() {
+                        continue;
+                    }
+                    match list.merge_cosmetic_unlocks(&path) {
+                        Ok(count) => {
+                            tracing::info!(
+                                "Merged {} cosmetic unlock targets from {:?}",
+                                count,
+                                path
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to merge cosmetic unlocks: {}", e);
                         }
                     }
                 }
@@ -2765,6 +2808,25 @@ impl AssetManager {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("Item 0x{item_id:04X}"));
         Some((item_id, name))
+    }
+
+    /// The pet-skin type id a pet stone unlocks, from the authoritative
+    /// `<Activate skinType="N">UnlockPetSkin</Activate>` in `pets.xml` /
+    /// `equip.xml`. Returns `None` when `id` is not a pet stone.
+    pub fn pet_skin_unlocked_id(&self, id: i32) -> Option<i32> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard.as_ref()?.pet_skin_unlocked_id(id)
+    }
+
+    /// The skin object id a skin item unlocks, from the authoritative
+    /// `<Activate skinType="N">UnlockSkin</Activate>` in `equipSkins.xml`.
+    /// Returns `None` when `id` is not a skin item. Char/list's `OwnedSkins`
+    /// lists these skin objects, not the items that grant them.
+    pub fn skin_unlocked_id(&self, id: i32) -> Option<i32> {
+        self.try_load();
+        let guard = self.objects.read().unwrap();
+        guard.as_ref()?.skin_unlocked_id(id)
     }
 
     /// Human-readable dungeon/collection name for a `collectionIcon` frame
@@ -5643,6 +5705,18 @@ mod tests {
         assert_eq!(encounter_loot_completes(47909), Some("towering_perfection"));
         assert_eq!(encounter_loot_completes(47916), None);
         assert_eq!(encounter_loot_completes(47917), None);
+    }
+
+    #[test]
+    fn bag_proves_kill_covers_the_markless_lair_of_shaitan_head() {
+        // The Head of Shaitan always bags and drops no Mark, so its bag alone
+        // proves the kill.
+        assert!(bag_proves_boss_killed(28058));
+        assert_eq!(bag_proves_kill_boss_types(), &[28058]);
+        // A Mark boss's bag is only proof with the Mark in it, and a realm event
+        // core completes its card through the loot-completion rule instead.
+        assert!(!bag_proves_boss_killed(LEGACY_LOD_IVORY_BOSS));
+        assert!(!bag_proves_boss_killed(47909));
     }
 
     #[test]

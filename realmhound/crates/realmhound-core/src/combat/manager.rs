@@ -39,6 +39,20 @@ pub struct CombatManager {
     /// fights persist, so the signal is buffered and re-applied on every persist;
     /// cleared on map change. See [`crate::assets::encounter_loot_completes`].
     pending_loot_completions: std::collections::HashSet<(i32, &'static str)>,
+    /// Escaped main-boss fights a bag proves were killed, keyed by
+    /// `(map_seed, boss_type, drop timestamp)`. A guaranteed bag means the boss
+    /// died even when its kill was never observed (the bag holds the boss's Mark,
+    /// or the boss is one whose bag alone is proof — see
+    /// [`crate::assets::bag_proves_boss_killed`]). Like the loot completions
+    /// above, the bag can register before the fight persists, so the signal is
+    /// buffered and re-applied on every persist; cleared on map change. See
+    /// [`CombatDatabase::mark_boss_killed_by_loot`].
+    pending_kill_proofs: std::collections::HashSet<(i32, i32, i64)>,
+    /// Stored cards that changed without a new fight being recorded (loot bags
+    /// completing escaped fights and encounter runs). An open Combat History
+    /// view only polls the fight count, so the processor drains these to tell it
+    /// to re-read its summaries.
+    pending_history_changes: Vec<FightSelection>,
 }
 
 /// Tracks the current dungeon run so its elapsed time can be accumulated into
@@ -73,6 +87,8 @@ impl CombatManager {
             dungeon_timer: None,
             pending_dungeon_freeze: None,
             pending_loot_completions: std::collections::HashSet::new(),
+            pending_kill_proofs: std::collections::HashSet::new(),
+            pending_history_changes: Vec::new(),
         }
     }
 
@@ -239,6 +255,8 @@ impl CombatManager {
         // the signal is dropped, then clear it for the next instance.
         self.apply_pending_loot_completions();
         self.pending_loot_completions.clear();
+        self.apply_pending_kill_proofs();
+        self.pending_kill_proofs.clear();
         // Close out the run we just left, then arm a timer if the new map is a
         // groupable dungeon instance (Realm / Nexus / hubs are excluded).
         self.flush_dungeon_timer(time_ms);
@@ -258,9 +276,28 @@ impl CombatManager {
     /// Moonlight Village is the same shape: its bosses floor invulnerable, so a
     /// bag recorded in the instance is what clears them (or Kitsune Umi, for her
     /// dropper's loot). The finalized fights are persisted here.
-    pub fn on_boss_loot(&mut self, mob_type: i32, map_seed: i32, time_ms: i64) {
+    ///
+    /// A bag whose contents prove the boss died — its Mark, or the guaranteed bag
+    /// of a boss that drops none (Lair of Shaitan's Head, [`BAG_PROVES_KILL`]) —
+    /// completes the closest still-escaped fight of that boss, so a kill that was
+    /// never observed (the local player left the fight before the killing blow, a
+    /// party-scaled burst kill, or a late join) is not stuck as Escaped.
+    /// `item_ids` are the bag's contents.
+    ///
+    /// [`BAG_PROVES_KILL`]: crate::assets::bag_proves_boss_killed
+    pub fn on_boss_loot(&mut self, mob_type: i32, map_seed: i32, time_ms: i64, item_ids: &[i32]) {
         if map_seed == 0 {
             return;
+        }
+        let proves_kill = mob_type > 0
+            && (crate::loot::bag_has_boss_mark(item_ids)
+                || crate::assets::bag_proves_boss_killed(mob_type));
+        if proves_kill {
+            self.pending_kill_proofs
+                .insert((map_seed, mob_type, time_ms));
+            // The fight is usually already persisted (the bag lands after the
+            // boss died); the buffer covers loot that arrives first.
+            self.apply_pending_kill_proofs();
         }
         let mv_finished = self.tracker.on_instance_loot(mob_type, map_seed, time_ms);
         if !mv_finished.is_empty() {
@@ -283,16 +320,71 @@ impl CombatManager {
     }
 
     /// Latch `killed` on every persisted encounter run matching a buffered
-    /// loot-completion signal. Idempotent: a run stays killed once set.
+    /// loot-completion signal. Idempotent: a run stays killed once set. The
+    /// completed runs' awards are reconciled and the change is queued for the
+    /// Combat History view, which cannot see it through the fight count.
     fn apply_pending_loot_completions(&mut self) {
         let Some(db) = self.database.as_mut() else {
             return;
         };
+        let mut changed: Vec<FightSelection> = Vec::new();
         for &(map_seed, enc_id) in &self.pending_loot_completions {
-            if let Err(e) = db.mark_encounter_killed_by_loot(map_seed, enc_id) {
-                tracing::warn!("[COMBAT] loot-completion update failed: {}", e);
+            match db.mark_encounter_killed_by_loot(map_seed, enc_id) {
+                Ok(selections) => changed.extend(selections),
+                Err(e) => tracing::warn!("[COMBAT] loot-completion update failed: {}", e),
             }
         }
+        self.note_history_changes(changed);
+    }
+
+    /// Latch `killed` on the escaped fight each buffered bag proves died.
+    /// Idempotent: a fight stays killed once set, and a signal is kept until it
+    /// completes a fight, so loot that lands before its fight is persisted still
+    /// applies once it is. A failed update keeps its signal too: a transient
+    /// write error must not lose the proof, so the next persist or map change
+    /// retries it. The completed fights' awards are reconciled and the change is
+    /// queued for the Combat History view, which cannot see it through the fight
+    /// count.
+    fn apply_pending_kill_proofs(&mut self) {
+        let Some(db) = self.database.as_mut() else {
+            return;
+        };
+        let mut changed: Vec<FightSelection> = Vec::new();
+        let mut remaining = std::collections::HashSet::new();
+        for &(map_seed, boss_type, timestamp) in &self.pending_kill_proofs {
+            match db.mark_boss_killed_by_loot(map_seed, boss_type, timestamp) {
+                // The bag found its fight and completed it.
+                Ok(Some(selection)) => changed.push(selection),
+                // Loot that landed before its fight was persisted: wait for it.
+                Ok(None) => {
+                    remaining.insert((map_seed, boss_type, timestamp));
+                }
+                // Keep the proof so the next lifecycle retries the write.
+                Err(e) => {
+                    tracing::warn!("[COMBAT] loot kill-proof update failed: {}", e);
+                    remaining.insert((map_seed, boss_type, timestamp));
+                }
+            }
+        }
+        self.pending_kill_proofs = remaining;
+        self.note_history_changes(changed);
+    }
+
+    /// Reconcile the awards of cards that changed without a new fight, and queue
+    /// them so the processor can refresh an open Combat History view.
+    fn note_history_changes(&mut self, changed: Vec<FightSelection>) {
+        if changed.is_empty() {
+            return;
+        }
+        self.reconcile_awards_for_selections(&changed);
+        self.pending_history_changes.extend(changed);
+    }
+
+    /// Drain the stored cards that changed since the last call, so the UI can
+    /// re-read its summaries (a loot completion adds no fight, so the fight-count
+    /// poll cannot see it).
+    pub fn take_pending_history_changes(&mut self) -> Vec<FightSelection> {
+        std::mem::take(&mut self.pending_history_changes)
     }
 
     /// Disconnected from the server.
@@ -536,6 +628,7 @@ impl CombatManager {
             // encounters are currently non-Exaltation; if that changes, include
             // every affected run in `changed_cards`.
             self.apply_pending_loot_completions();
+            self.apply_pending_kill_proofs();
             let changed_cards: Vec<FightSelection> = changed_cards.into_iter().collect();
             self.reconcile_awards_for_selections(&changed_cards);
             self.reconcile_close_calls();
@@ -720,6 +813,176 @@ mod tests {
         f.ended_at = ended_at;
         f.killed = true;
         f
+    }
+
+    #[test]
+    fn mark_loot_completes_an_escaped_fight() {
+        let assets = crate::assets::get_asset_manager();
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            assets.set_assets_dir(&dir);
+        }
+        let _ = assets.try_load();
+        let Some(mark) = assets.boss_mark_item_ids().into_iter().min() else {
+            eprintln!("skipping: game assets not available");
+            return;
+        };
+        let boss = crate::assets::LEGACY_LOD_IVORY_BOSS;
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+        // An escaped fight persisted for instance 42, then its Mark bag lands.
+        let mut escaped = fight("Legacy Lair of Draconis", "Ivory Wyvern", false);
+        escaped.map_seed = 42;
+        escaped.boss_object_type = boss;
+        escaped.killed = false;
+        escaped.reached_zero = false;
+        escaped.started_at = 1_000;
+        escaped.ended_at = 61_000;
+        m.persist(vec![escaped]);
+        assert!(
+            !m.database
+                .as_ref()
+                .unwrap()
+                .recent_fights(10)
+                .unwrap()
+                .is_empty(),
+            "the escaped fight is recorded"
+        );
+
+        m.on_boss_loot(boss, 42, 65_000, &[mark]);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(
+            fights[0].killed,
+            "the Mark bag completes the escaped fight it proves was killed"
+        );
+        // A completion records no new fight, so a fight-count poll cannot see it:
+        // the manager queues the changed card for the UI and reports it once.
+        assert_eq!(
+            m.take_pending_history_changes(),
+            vec![FightSelection::Single(fights[0].id)],
+            "the completed card is queued for the Combat History view"
+        );
+        assert!(
+            m.take_pending_history_changes().is_empty(),
+            "the change is only reported once"
+        );
+    }
+
+    /// The Head of Shaitan drops no Mark, so its guaranteed bag is what completes
+    /// the fight the local player left before the killing blow.
+    #[test]
+    fn bag_loot_completes_a_markless_boss_fight() {
+        const HEAD: i32 = 28058;
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_in_memory().unwrap());
+        let mut escaped = fight("Lair of Shaitan", "Shaitan the Advisor", false);
+        escaped.map_seed = 42;
+        escaped.boss_object_type = HEAD;
+        escaped.killed = false;
+        escaped.reached_zero = false;
+        escaped.started_at = 1_000;
+        escaped.ended_at = 61_000;
+        m.persist(vec![escaped]);
+
+        // The bag lands 25 s after the fight closed, carrying an ordinary drop.
+        m.on_boss_loot(HEAD, 42, 86_000, &[17]);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(
+            fights[0].killed,
+            "the Head's bag completes the escaped fight it proves was killed"
+        );
+        // A bag with no instance (Nexus) proves nothing.
+        let mut nexus_escaped = fight("Lair of Shaitan", "Shaitan the Advisor", false);
+        nexus_escaped.map_seed = 0;
+        nexus_escaped.boss_object_type = HEAD;
+        nexus_escaped.killed = false;
+        nexus_escaped.reached_zero = false;
+        m.persist(vec![nexus_escaped]);
+        m.on_boss_loot(HEAD, 0, 90_000, &[17]);
+        assert!(
+            m.database
+                .as_ref()
+                .unwrap()
+                .recent_fights(10)
+                .unwrap()
+                .iter()
+                .filter(|f| f.map_seed == 0)
+                .all(|f| !f.killed),
+            "a bag outside an instance completes nothing"
+        );
+    }
+
+    /// A transient write failure must not lose a buffered kill proof: it stays
+    /// queued and the next lifecycle retries it.
+    #[test]
+    fn a_failed_kill_proof_stays_buffered_until_it_applies() {
+        const HEAD: i32 = 28058;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat_history.db");
+        // The writer records an escaped Head fight and stays open, so the manager
+        // can then be pointed at a read-only connection whose writes fail.
+        let mut writer = super::super::database::CombatDatabase::open_writer(&path).unwrap();
+        let mut escaped = fight("Lair of Shaitan", "Shaitan the Advisor", false);
+        escaped.map_seed = 42;
+        escaped.boss_object_type = HEAD;
+        escaped.killed = false;
+        escaped.reached_zero = false;
+        escaped.started_at = 1_000;
+        escaped.ended_at = 61_000;
+        writer.insert_fight(&escaped).unwrap();
+
+        let mut m = CombatManager::new();
+        m.database = Some(super::super::database::CombatDatabase::open_reader_at(&path).unwrap());
+
+        // The reader sees the escaped fight, and its write really fails: the kept
+        // proof can only be the failed update, never an unfound row.
+        assert_eq!(
+            m.database
+                .as_ref()
+                .unwrap()
+                .recent_fights(10)
+                .unwrap()
+                .len(),
+            1,
+            "the readonly reader sees the fight it has to fail to complete"
+        );
+        assert!(
+            m.database
+                .as_mut()
+                .unwrap()
+                .mark_boss_killed_by_loot(42, HEAD, 86_000)
+                .is_err(),
+            "the readonly connection cannot record the kill"
+        );
+
+        // The bag proves the kill, but the readonly connection cannot record it.
+        m.on_boss_loot(HEAD, 42, 86_000, &[17]);
+
+        assert_eq!(
+            m.pending_kill_proofs.len(),
+            1,
+            "a failed write keeps its proof for the next attempt"
+        );
+        assert!(
+            m.take_pending_history_changes().is_empty(),
+            "a failed write reports nothing to the UI"
+        );
+
+        // The next map change retries it, and the fight completes.
+        m.database = Some(writer);
+        m.on_map_change("Nexus", 0, 90_000);
+
+        let fights = m.database.as_ref().unwrap().recent_fights(10).unwrap();
+        assert_eq!(fights.len(), 1);
+        assert!(fights[0].killed, "the retry completes the abandoned fight");
+        assert_eq!(
+            m.take_pending_history_changes(),
+            vec![FightSelection::Single(fights[0].id)],
+            "the completion is only reported once it actually applies"
+        );
     }
 
     #[test]

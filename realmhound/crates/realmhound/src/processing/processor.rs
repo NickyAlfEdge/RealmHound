@@ -851,6 +851,30 @@ impl PacketProcessor {
                 self.account_data.max_num_chars = data.max_num_chars;
                 self.account_data.next_char_slot_price = data.next_char_slot_price;
                 self.account_data.owned_skins_count = data.owned_skins_count;
+                // char/list is authoritative for the wardrobe (skins + emotes)
+                // and the regular forge unlocks; the pet-skin list comes from its
+                // own endpoint, and anything learned live (pet skins via
+                // ReskinUnlock, the seasonal forge list via packet 120) is kept.
+                if !data.owned_skin_ids.is_empty()
+                    || !data.owned_emote_ids.is_empty()
+                    || !data.owned_pet_skin_ids.is_empty()
+                {
+                    let mut ids: Vec<i32> = data
+                        .owned_skin_ids
+                        .iter()
+                        .chain(data.owned_emote_ids.iter())
+                        .chain(data.owned_pet_skin_ids.iter())
+                        .copied()
+                        .collect();
+                    ids.extend(self.account_data.owned_wardrobe_ids.iter().copied());
+                    ids.sort_unstable();
+                    ids.dedup();
+                    self.account_data.owned_wardrobe_ids = ids;
+                }
+                if !data.regular_forge_blueprints.is_empty() {
+                    self.account_data.unlocked_blueprints_regular =
+                        data.regular_forge_blueprints.clone();
+                }
                 if data.account_credits.is_some()
                     || data.account_fame.is_some()
                     || data.account_star.is_some()
@@ -1038,6 +1062,34 @@ impl PacketProcessor {
         }
     }
 
+    /// The combat tracker's recent fights, split for loot attribution: the bosses
+    /// it scored as killed, and every *other* boss fight seen in the instance
+    /// (recorded as Escaped). Only the Mark rule reads the escaped ones, since a
+    /// guaranteed Mark proves its boss died even when the kill itself was never
+    /// observed (party-scaled HP plus a burst death, or a late join).
+    fn recent_boss_fights_for_loot(&self) -> (Vec<RecentBossKill>, Vec<RecentBossKill>) {
+        let mut kills = Vec::new();
+        let mut escaped = Vec::new();
+        for fight in self.combat.tracker().recent_fights() {
+            if fight.boss_object_type <= 0 {
+                continue;
+            }
+            let record = RecentBossKill {
+                map_seed: fight.map_seed,
+                object_type: fight.boss_object_type,
+                name: fight.boss_name.clone(),
+                started_at_ms: fight.started_at,
+                ended_at_ms: fight.ended_at,
+            };
+            if fight.killed {
+                kills.push(record);
+            } else {
+                escaped.push(record);
+            }
+        }
+        (kills, escaped)
+    }
+
     /// Terminal drain before shutdown: finalize in-flight fights, fold their
     /// tallies, and flush loot buffers. Finalize runs before the fold (reverse of
     /// the live-tick order) so a fight ending at shutdown still contributes.
@@ -1046,21 +1098,9 @@ impl PacketProcessor {
         self.combat.on_tick(now);
         self.fold_deferred_combat();
 
-        let recent_kills: Vec<RecentBossKill> = self
-            .combat
-            .tracker()
-            .recent_fights()
-            .iter()
-            .filter(|f| f.killed && f.boss_object_type > 0)
-            .map(|f| RecentBossKill {
-                map_seed: f.map_seed,
-                object_type: f.boss_object_type,
-                name: f.boss_name.clone(),
-                started_at_ms: f.started_at,
-                ended_at_ms: f.ended_at,
-            })
-            .collect();
+        let (recent_kills, recent_fights) = self.recent_boss_fights_for_loot();
         self.loot_tracker.set_recent_boss_kills(recent_kills);
+        self.loot_tracker.set_recent_boss_fights(recent_fights);
         self.loot_tracker.flush_pending(now as u64);
     }
 
@@ -2168,6 +2208,40 @@ impl PacketProcessor {
                 // Drives vault + Treasury live-vault resync.
                 self.vault_view_gen += 1;
             }
+            GameEvent::ForgeUnlockedBlueprints {
+                seasonal_forge,
+                ref item_ids,
+            } => {
+                // The list is authoritative for its forge: entering the Nexus
+                // re-sends it, including entries earned since the last one.
+                if seasonal_forge == 0 {
+                    self.account_data.unlocked_blueprints_regular = item_ids.clone();
+                } else {
+                    self.account_data.unlocked_blueprints_seasonal = item_ids.clone();
+                }
+                self.account_data.bump_generation();
+            }
+            GameEvent::ObjectUnlocked { unlock_id, .. } => {
+                // Live unlock notifications only add ids (unlocks are permanent);
+                // this is what gives pet skins an OWNED tag, since char/list has
+                // no pet-skin list.
+                if unlock_id > 0 && !self.account_data.owned_wardrobe_ids.contains(&unlock_id) {
+                    self.account_data.owned_wardrobe_ids.push(unlock_id);
+                    self.account_data.bump_generation();
+                }
+            }
+            GameEvent::PetStoneUsed { item_type } => {
+                // The stone that was just applied unlocks its target pet skin; no
+                // list or notification reports that, so record the skin itself.
+                let skin =
+                    realmhound_core::assets::get_asset_manager().pet_skin_unlocked_id(item_type);
+                if let Some(skin) = skin.filter(|s| *s > 0) {
+                    if !self.account_data.owned_wardrobe_ids.contains(&skin) {
+                        self.account_data.owned_wardrobe_ids.push(skin);
+                        self.account_data.bump_generation();
+                    }
+                }
+            }
             GameEvent::TextReceived(ref text) => {
                 // Detect realm-close / lag-warning before from_text_packet filters them out.
                 if text.name.contains("Oryx the Mad God") {
@@ -2689,18 +2763,22 @@ impl PacketProcessor {
                         let changes = extract_inventory_changes(status);
                         if !changes.is_empty() {
                             let storage = self.account_data.get_vault(vault_type);
-                            if let Some(page) =
-                                detect_page_from_changes(&storage.gift_items, &changes)
-                            {
+                            // Gift items are stored reversed relative to the packet
+                            // order, so match and update through the mirrored index
+                            // mapping. Using the plain page layout here would never
+                            // match and the fallback would clobber page 0 (the row
+                            // shown at the top of the grid).
+                            if let Some(page) = storage.find_matching_gift_display_page(&changes) {
                                 if self.session.vault.active_gift_page != Some(page) {
                                     self.session.vault.active_gift_page = Some(page);
                                 }
                             } else if let Some(page) = self.session.vault.active_gift_page {
                                 let storage = self.account_data.get_vault_mut(vault_type);
                                 for (slot, item_id) in changes {
-                                    let abs_idx = page * 8 + slot;
-                                    if storage.update_gift_slot(abs_idx, item_id) {
-                                        vault_updated = true;
+                                    if let Some(abs_idx) = storage.gift_display_index(page, slot) {
+                                        if storage.update_gift_slot(abs_idx, item_id) {
+                                            vault_updated = true;
+                                        }
                                     }
                                 }
                             }
@@ -2771,21 +2849,9 @@ impl PacketProcessor {
                 // Process pending bags and write to database. Feed the loot
                 // tracker the combat tracker's recently killed bosses first so
                 // Unknown bags can fall back to fight-correlation.
-                let recent_kills: Vec<RecentBossKill> = self
-                    .combat
-                    .tracker()
-                    .recent_fights()
-                    .iter()
-                    .filter(|f| f.killed && f.boss_object_type > 0)
-                    .map(|f| RecentBossKill {
-                        map_seed: f.map_seed,
-                        object_type: f.boss_object_type,
-                        name: f.boss_name.clone(),
-                        started_at_ms: f.started_at,
-                        ended_at_ms: f.ended_at,
-                    })
-                    .collect();
+                let (recent_kills, recent_fights) = self.recent_boss_fights_for_loot();
                 self.loot_tracker.set_recent_boss_kills(recent_kills);
+                self.loot_tracker.set_recent_boss_fights(recent_fights);
                 #[cfg(feature = "latency-diagnostics")]
                 let loot_started = std::time::Instant::now();
                 let new_drops = self.loot_tracker.on_tick(time_ms);
@@ -2812,9 +2878,19 @@ impl PacketProcessor {
                     // A core-boss bag latches its realm-event card to Completed
                     // even when the core (e.g. Towering Perfection) was never seen
                     // dying and only its segments were damaged; a Moonlight
-                    // Village bag is what clears the (invulnerable) dancers/Umi.
-                    self.combat
-                        .on_boss_loot(drop.mob_type, drop.player.map_seed, time_ms as i64);
+                    // Village bag is what clears the (invulnerable) dancers/Umi;
+                    // a bag holding the boss's Mark proves the main boss died even
+                    // when its kill was never observed.
+                    self.combat.on_boss_loot(
+                        drop.mob_type,
+                        drop.player.map_seed,
+                        time_ms as i64,
+                        &drop
+                            .items
+                            .iter()
+                            .map(|item| item.item_id)
+                            .collect::<Vec<i32>>(),
+                    );
                     self.emit(UiPayload::PushLoot(drop.clone()));
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
                     if let Some((ref settings, ref catalog)) = enchant_ctx {
@@ -2938,6 +3014,9 @@ impl PacketProcessor {
         // targeted by map seed so it lands on the correct row even though the
         // Broadcast for a new dungeon is emitted before this run's flush.
         self.forward_dungeon_freeze();
+        // Cards completed by a loot bag change no fight count, so the Combat
+        // History panel cannot poll them up: push the change to it.
+        self.forward_combat_history_changes();
     }
 
     /// Drain a pending dungeon-run freeze from the CombatManager and forward it
@@ -2948,6 +3027,16 @@ impl PacketProcessor {
                 map_seed,
                 elapsed_ms,
             });
+        }
+    }
+
+    /// Drain the fight cards the CombatManager changed without recording a new
+    /// fight (loot bags completing escaped fights) and tell the open Combat
+    /// History view to re-read its summaries. Awards for those cards are already
+    /// reconciled by the manager.
+    fn forward_combat_history_changes(&mut self) {
+        if !self.combat.take_pending_history_changes().is_empty() {
+            self.emit(UiPayload::CombatHistoryChanged);
         }
     }
 
@@ -3206,6 +3295,126 @@ mod dungeon_alert_tests {
         assert_eq!(outline_kind(&modifiers(&["DIMITUS"])), OutlineKind::Golden);
         assert_eq!(outline_kind(&modifiers(&["EXPOSED_1"])), OutlineKind::Red);
         assert_eq!(outline_kind(&modifiers(&["WEAKBOSS_3"])), OutlineKind::Blue);
+    }
+}
+
+#[cfg(test)]
+mod owned_unlock_tests {
+    use super::PacketProcessor;
+    use realmhound_core::vault::AccountData;
+    use realmhound_core::GameEvent;
+
+    /// Packet 120 sends one list per forge; the latest list wins for its forge
+    /// and the other forge's list is untouched.
+    #[test]
+    fn forge_blueprint_lists_are_stored_per_forge() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+
+        processor.dispatch_event(GameEvent::ForgeUnlockedBlueprints {
+            seasonal_forge: 0,
+            item_ids: vec![8386, 4333],
+        });
+        processor.dispatch_event(GameEvent::ForgeUnlockedBlueprints {
+            seasonal_forge: 1,
+            item_ids: vec![306, 8386],
+        });
+        assert_eq!(
+            processor.account_data.unlocked_blueprints_regular,
+            vec![8386, 4333]
+        );
+        assert_eq!(
+            processor.account_data.unlocked_blueprints_seasonal,
+            vec![306, 8386]
+        );
+
+        // Re-entering the Nexus re-sends the regular list; it replaces the old
+        // one (a removed unlock must not linger) without touching the seasonal.
+        processor.dispatch_event(GameEvent::ForgeUnlockedBlueprints {
+            seasonal_forge: 0,
+            item_ids: vec![8386],
+        });
+        assert_eq!(
+            processor.account_data.unlocked_blueprints_regular,
+            vec![8386]
+        );
+        assert_eq!(
+            processor.account_data.unlocked_blueprints_seasonal,
+            vec![306, 8386]
+        );
+    }
+
+    /// Apply a pet stone (as the client does) and the target pet skin becomes
+    /// owned, so the stone itself then tags OWNED.
+    #[test]
+    fn applying_a_pet_stone_marks_its_skin_owned() {
+        let assets = crate::test_support::asset_manager_guard();
+        let manager = realmhound_core::assets::get_asset_manager();
+        if let Some(dir) = realmhound_core::assets::find_assets_dir() {
+            manager.set_assets_dir(&dir);
+        }
+        if !manager.try_load() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        drop(assets);
+        // A real stone from the live assets, whatever this build ships with.
+        let stone = (0..80_000).find(|id| manager.pet_skin_unlocked_id(*id).is_some());
+        let Some(stone) = stone else {
+            eprintln!("skipping: no pet stones in the assets");
+            return;
+        };
+        let skin = manager.pet_skin_unlocked_id(stone).unwrap();
+
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+        assert!(!processor.account_data.owned_wardrobe_ids.contains(&skin));
+        processor.dispatch_event(GameEvent::PetStoneUsed { item_type: stone });
+        assert!(
+            processor.account_data.owned_wardrobe_ids.contains(&skin),
+            "the applied stone's skin is recorded as owned"
+        );
+        // Applying the same stone again does not duplicate the entry.
+        processor.dispatch_event(GameEvent::PetStoneUsed { item_type: stone });
+        assert_eq!(
+            processor
+                .account_data
+                .owned_wardrobe_ids
+                .iter()
+                .filter(|id| **id == skin)
+                .count(),
+            1
+        );
+        // A stone with no mapping (or an empty slot) records nothing.
+        processor.dispatch_event(GameEvent::PetStoneUsed { item_type: -1 });
+        processor.dispatch_event(GameEvent::PetStoneUsed { item_type: 0 });
+    }
+
+    /// Live unlock notifications accumulate once each; they are what gives pet
+    /// skins an OWNED tag, since char/list lists no pet skins.
+    #[test]
+    fn observed_unlocks_accumulate_once() {
+        let mut processor = PacketProcessor::new_for_test(AccountData::new());
+
+        processor.dispatch_event(GameEvent::ObjectUnlocked {
+            unlock_type: 1,
+            unlock_id: 64979,
+        });
+        processor.dispatch_event(GameEvent::ObjectUnlocked {
+            unlock_type: 2,
+            unlock_id: 606,
+        });
+        // The same id again (another character, or a re-sent notification).
+        processor.dispatch_event(GameEvent::ObjectUnlocked {
+            unlock_type: 1,
+            unlock_id: 64979,
+        });
+        assert_eq!(processor.account_data.owned_wardrobe_ids, vec![64979, 606]);
+
+        // A nonsense id is ignored.
+        processor.dispatch_event(GameEvent::ObjectUnlocked {
+            unlock_type: 1,
+            unlock_id: 0,
+        });
+        assert_eq!(processor.account_data.owned_wardrobe_ids.len(), 2);
     }
 }
 
@@ -4367,6 +4576,64 @@ mod isolation_gate_tests {
             scope: scope(key, &other_id, 5),
         });
         assert_eq!(p.last_mission_gen, 0, "foreign server id rejected");
+    }
+
+    /// char/list is authoritative for the wardrobe (skins + emotes) and the
+    /// regular forge list, while unlocks learned live (pet skins, the seasonal
+    /// forge list, which char/list does not carry) and the pet-skin endpoint's
+    /// list survive the refresh.
+    #[test]
+    fn api_account_data_merges_the_unlock_lists() {
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        // Learned live before the API refresh: a pet skin unlock and the
+        // seasonal forge list.
+        p.account_data.owned_wardrobe_ids = vec![606];
+        p.account_data.unlocked_blueprints_seasonal = vec![8386];
+
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            owned_skin_ids: vec![872, 9012],
+            owned_emote_ids: vec![49678],
+            owned_pet_skin_ids: vec![30445, 24724],
+            regular_forge_blueprints: vec![8386, 4333],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert_eq!(
+            p.account_data.owned_wardrobe_ids,
+            vec![606, 872, 9012, 24724, 30445, 49678],
+            "char/list ids and the pet-skin list merge with the live pet-skin unlock"
+        );
+        assert_eq!(p.account_data.unlocked_blueprints_regular, vec![8386, 4333]);
+        assert_eq!(
+            p.account_data.unlocked_blueprints_seasonal,
+            vec![8386],
+            "char/list has no seasonal list, so it must not clear one"
+        );
+    }
+
+    /// The pet-skin list arrives from its own endpoint, so a refresh whose
+    /// char/list carried neither `OwnedSkins` nor `OwnedEmotes` (a mule response
+    /// or a partial one) must still learn the pet skins.
+    #[test]
+    fn api_account_data_merges_pet_skins_without_a_wardrobe_list() {
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            owned_pet_skin_ids: vec![30445],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert_eq!(p.account_data.owned_wardrobe_ids, vec![30445]);
     }
 
     /// A stale API account-data completion (older generation) is rejected.

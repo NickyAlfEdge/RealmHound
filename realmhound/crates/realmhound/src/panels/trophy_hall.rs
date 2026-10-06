@@ -87,6 +87,10 @@ struct IndexRow {
     /// Raw dungeon names from loot DB that resolved to this display name.
     /// Used for detail queries (DB stores raw names, not normalized).
     db_names: Vec<String>,
+    /// RealmShark's own keys that resolved to this display name ("The Realm" for
+    /// the "Realm" row). Kept so detail loading can find the imported dungeon
+    /// under the spelling the import used.
+    rs_keys: Vec<String>,
     total_items: u64,
     completions: i32,
     difficulty: Option<f32>,
@@ -133,6 +137,12 @@ pub struct TrophyHallPanel {
     /// drop tables, e.g. White Snake Invasion I/II). Off by default since
     /// these rows have no items to show, just completions.
     show_no_collection_dungeons: bool,
+    /// List Legacy dungeons (the Time Chamber's retro dungeons, and the Legacy
+    /// Heroic ones). On by default, matching the game's own Time Chamber hub.
+    show_legacy_dungeons: bool,
+    /// Dungeon name selected in the icon view, for keyboard navigation. The first
+    /// visible tile is selected as soon as the view is shown.
+    selected_icon: Option<String>,
     show_st: bool,
     show_ut: bool,
     show_shiny: bool,
@@ -174,6 +184,8 @@ impl TrophyHallPanel {
             force_rebuild: false,
             column_count: 2,
             show_no_collection_dungeons: false,
+            show_legacy_dungeons: true,
+            selected_icon: None,
             show_st: true,
             show_ut: true,
             show_shiny: true,
@@ -232,6 +244,14 @@ impl TrophyHallPanel {
 
     pub fn show_no_collection_dungeons(&self) -> bool {
         self.show_no_collection_dungeons
+    }
+
+    pub fn show_legacy_dungeons_mut(&mut self) -> &mut bool {
+        &mut self.show_legacy_dungeons
+    }
+
+    pub fn show_legacy_dungeons(&self) -> bool {
+        self.show_legacy_dungeons
     }
 
     /// Open a file picker for a RealmShark `dungeon.stats` file and import it to
@@ -491,6 +511,7 @@ impl TrophyHallPanel {
                     let entry = merged.entry(canonical.clone()).or_insert_with(|| IndexRow {
                         name: canonical.clone(),
                         db_names: Vec::new(),
+                        rs_keys: Vec::new(),
                         total_items: 0,
                         completions: 0,
                         difficulty: dungeon_difficulty(&canonical),
@@ -505,18 +526,30 @@ impl TrophyHallPanel {
         // RealmShark imported drop counts
         if include_realmshark {
             if let Some(rs) = &self.realmshark_data {
-                for (canonical, dungeon) in &rs.dungeons {
+                let registry = realmhound_core::stats::dungeon_registry::get_dungeon_registry();
+                for (raw_key, dungeon) in &rs.dungeons {
+                    // RealmShark keeps its own spellings ("The Realm", "Vault"),
+                    // so run them through the same normalization as the drop rows
+                    // above: otherwise "The Realm" would appear beside
+                    // RealmHound's "Realm" as a second, empty-looking row.
+                    let display = portal_map.normalize_dungeon_name(raw_key);
+                    let canonical = registry.normalize(&display);
+                    if is_non_dungeon_location(&display) {
+                        continue;
+                    }
                     let entry = merged.entry(canonical.clone()).or_insert_with(|| IndexRow {
                         name: canonical.clone(),
                         db_names: Vec::new(),
+                        rs_keys: Vec::new(),
                         total_items: 0,
                         completions: 0,
-                        difficulty: dungeon_difficulty(canonical),
+                        difficulty: dungeon_difficulty(&canonical),
                         time_ms: 0,
                     });
                     let item_total: i64 = dungeon.items.iter().map(|i| i.total_count).sum();
                     entry.total_items += item_total as u64;
                     entry.completions += dungeon.completions;
+                    entry.rs_keys.push(raw_key.clone());
                 }
             }
         }
@@ -532,6 +565,7 @@ impl TrophyHallPanel {
                 .or_insert_with(|| IndexRow {
                     name: snap.dungeon_name.clone(),
                     db_names: Vec::new(),
+                    rs_keys: Vec::new(),
                     total_items: 0,
                     completions: 0,
                     difficulty: snap.difficulty,
@@ -563,6 +597,7 @@ impl TrophyHallPanel {
             self.index_rows.push(IndexRow {
                 name: d.name.to_string(),
                 db_names: Vec::new(),
+                rs_keys: Vec::new(),
                 total_items: 0,
                 completions: 0,
                 difficulty: dungeon_difficulty(d.name),
@@ -577,6 +612,7 @@ impl TrophyHallPanel {
             self.index_rows.push(IndexRow {
                 name: "Realm".to_string(),
                 db_names: Vec::new(),
+                rs_keys: Vec::new(),
                 total_items: 0,
                 completions: 0,
                 difficulty: dungeon_difficulty("Realm"),
@@ -605,9 +641,13 @@ impl TrophyHallPanel {
         }
         if include_realmshark {
             if let Some(rs) = &self.realmshark_data {
-                for (canonical, dungeon) in &rs.dungeons {
+                for (raw_key, dungeon) in &rs.dungeons {
                     if dungeon.total_time_ms > 0 {
-                        *time_by_dungeon.entry(canonical.clone()).or_insert(0) +=
+                        // Same normalization as the item totals above: RealmShark
+                        // spells the key its own way ("The Realm").
+                        let display = portal_map.normalize_dungeon_name(raw_key);
+                        let canonical = registry.normalize(&display);
+                        *time_by_dungeon.entry(canonical).or_insert(0) +=
                             dungeon.total_time_ms as u64;
                     }
                 }
@@ -634,6 +674,7 @@ impl TrophyHallPanel {
                 rows[vi].total_items += remnant.total_items;
                 rows[vi].completions += remnant.completions;
                 rows[vi].db_names.extend(remnant.db_names);
+                rows[vi].rs_keys.extend(remnant.rs_keys);
             }
             (Some(ri), None) => {
                 // Rename Remnant to The Void
@@ -673,6 +714,7 @@ impl TrophyHallPanel {
     fn load_detail(
         &mut self,
         db_names: &[String],
+        rs_keys: &[String],
         loot_db: Option<&LootDatabase>,
         dungeon_name: &str,
     ) {
@@ -716,7 +758,18 @@ impl TrophyHallPanel {
         // RealmShark items
         if include_realmshark {
             if let Some(rs) = &self.realmshark_data {
-                if let Some(dungeon) = rs.dungeons.get(dungeon_name) {
+                // The import keys the dungeon its own way ("The Realm" for the
+                // "Realm" row), so use the keys the row was merged from; a row
+                // built without an import falls back to its own name.
+                let keys: Vec<&str> = if rs_keys.is_empty() {
+                    vec![dungeon_name]
+                } else {
+                    rs_keys.iter().map(String::as_str).collect()
+                };
+                for key in keys {
+                    let Some(dungeon) = rs.dungeons.get(key) else {
+                        continue;
+                    };
                     for item in &dungeon.items {
                         if let Some(existing) =
                             all_items.iter_mut().find(|i| i.item_id == item.item_id)
@@ -811,14 +864,127 @@ impl TrophyHallPanel {
 
     // ------ Rendering ------
 
+    /// The item-group and dungeon-list filters, shared by both pages' navigation
+    /// bars so they keep the same place whether or not a dungeon page is open.
+    /// Returns true when a persisted setting changed.
+    fn render_filter_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        shadcn: &crate::shadcn_ui::Shadcn,
+        sprites: &mut SpriteRenderer,
+    ) -> bool {
+        let mut changed = false;
+        ui.label("Show:");
+        shadcn
+            .tgl(ui, &mut self.show_ut, RichText::new("UT").small())
+            .hover_tip("Show Untiered (UT) items");
+        shadcn
+            .tgl(ui, &mut self.show_st, RichText::new("ST").small())
+            .hover_tip("Show Set Tier (ST) items");
+        sprites.shiny_toggle(ui, shadcn, &mut self.show_shiny, "Show Shiny items");
+
+        // Checkboxes, not pills: the pills filter item categories inside a
+        // collection, while these two change which dungeons are listed.
+        if ui
+            .checkbox(&mut self.show_legacy_dungeons, "Legacy Dungeons")
+            .hover_tip("List the Time Chamber's Legacy dungeons and their retro collections")
+            .changed()
+        {
+            changed = true;
+        }
+        // Stored as "show dungeons with no collection", presented the other way
+        // round so ticking the box hides them instead.
+        let mut hide_without_collection = !self.show_no_collection_dungeons;
+        if ui
+            .checkbox(
+                &mut hide_without_collection,
+                "Hide dungeons without collections",
+            )
+            .hover_tip(
+                "Hide dungeons whose collection is intentionally empty because their drops \
+                 fully duplicate another dungeon's collection",
+            )
+            .changed()
+        {
+            self.show_no_collection_dungeons = !hide_without_collection;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Indices of the rows the active search and filters keep visible, in
+    /// displayed order. The list, the icon grid and the dungeon page's
+    /// Previous/Next buttons all read the ordering from here so they agree on
+    /// what "previous" and "next" mean.
+    fn visible_indices(&self) -> Vec<usize> {
+        let query_lower = self.search_query.to_lowercase();
+        let show_no_collection = self.show_no_collection_dungeons;
+        let show_legacy = self.show_legacy_dungeons;
+        let collections = &self.collections;
+        self.index_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower))
+            .filter(|(_, r)| show_legacy || !is_legacy_dungeon(&r.name))
+            .filter(|(_, r)| {
+                show_no_collection
+                    || collections
+                        .get(&r.name)
+                        .map(|c| !c.items.is_empty())
+                        .unwrap_or(true)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The loot-database names and RealmShark keys the merged row for `dungeon`
+    /// was built from, so detail loading can query both sources under their own
+    /// spellings. Both empty for a row that does not exist.
+    fn row_source_keys(&self, dungeon: &str) -> (Vec<String>, Vec<String>) {
+        self.index_rows
+            .iter()
+            .find(|r| r.name == dungeon)
+            .map(|r| (r.db_names.clone(), r.rs_keys.clone()))
+            .unwrap_or_default()
+    }
+
+    /// The dungeons surrounding the open one in the filtered list, as
+    /// `(name, db_names)` pairs ready to hand to `load_detail`. `None` at either
+    /// end disables that navigation button.
+    fn detail_neighbours(
+        &self,
+        dungeon: &str,
+    ) -> (Option<(String, Vec<String>)>, Option<(String, Vec<String>)>) {
+        let visible = self.visible_indices();
+        let Some(pos) = visible
+            .iter()
+            .position(|&i| self.index_rows[i].name == dungeon)
+        else {
+            return (None, None);
+        };
+        let at = |idx: usize| {
+            let row = &self.index_rows[idx];
+            Some((row.name.clone(), row.db_names.clone()))
+        };
+        (
+            pos.checked_sub(1).and_then(at),
+            visible.get(pos + 1).copied().and_then(at),
+        )
+    }
+
     fn render_index(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) -> Vec<AppAction> {
         realmhound_core::prof_function!();
-        let actions = Vec::new();
+        let mut actions = Vec::new();
         let shadcn = ctx.shadcn;
 
-        // Controls row: view mode + sort dropdown + search + data source
+        // Controls row: filters first (shared with the dungeon page, so they keep
+        // the same place in both), then view mode + sort + search.
         shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
             shadcn.band_row(ui, |ui| {
+                if self.render_filter_group(ui, shadcn, &mut ctx.sprite_renderer) {
+                    actions.push(AppAction::SaveTrophyHallView);
+                }
+                ui.separator();
                 ui.label("View:");
                 egui::ComboBox::from_id_salt("dungeon_view_mode")
                     .selected_text(match self.view_mode {
@@ -905,20 +1071,6 @@ impl TrophyHallPanel {
                         }
                     }
                 }
-                ui.separator();
-                ui.label("Show:");
-                shadcn
-                    .tgl(ui, &mut self.show_ut, RichText::new("UT").small())
-                    .hover_tip("Show Untiered (UT) items");
-                shadcn
-                    .tgl(ui, &mut self.show_st, RichText::new("ST").small())
-                    .hover_tip("Show Set Tier (ST) items");
-                ctx.sprite_renderer.shiny_toggle(
-                    ui,
-                    shadcn,
-                    &mut self.show_shiny,
-                    "Show Shiny items",
-                );
             });
         });
 
@@ -1043,31 +1195,14 @@ impl TrophyHallPanel {
 
     fn render_list_view(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) {
         let portal_map = get_dungeon_portal_map();
-        let query_lower = self.search_query.to_lowercase();
-        let show_no_collection = self.show_no_collection_dungeons;
-        let collections = &self.collections;
         let filtered_indices: Vec<usize> = {
             realmhound_core::prof_scope!("dstats_filter");
-            self.index_rows
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| {
-                    query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower)
-                })
-                .filter(|(_, r)| {
-                    show_no_collection
-                        || collections
-                            .get(&r.name)
-                            .map(|c| !c.items.is_empty())
-                            .unwrap_or(true)
-                })
-                .map(|(i, _)| i)
-                .collect()
+            self.visible_indices()
         };
 
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             realmhound_core::prof_scope!("dstats_index_scroll_body");
-            let mut navigate_to: Option<(String, Vec<String>)> = None;
+            let mut navigate_to: Option<String> = None;
 
             let num_columns = (self.column_count as usize).clamp(1, 3);
 
@@ -1168,8 +1303,10 @@ impl TrophyHallPanel {
             // content edge.
             ui.add_space(12.0);
 
-            if let Some((display_name, db_names)) = navigate_to {
-                self.load_detail(&db_names, ctx.loot_database, &display_name);
+            if let Some(display_name) = navigate_to {
+                self.selected_icon = Some(display_name.clone());
+                let (db_names, rs_keys) = self.row_source_keys(&display_name);
+                self.load_detail(&db_names, &rs_keys, ctx.loot_database, &display_name);
                 self.page = Page::Detail { name: display_name };
             }
         });
@@ -1181,7 +1318,7 @@ impl TrophyHallPanel {
         ctx: &mut PanelContext,
         portal_map: &realmhound_core::assets::DungeonPortalMap,
         indices: &[usize],
-        navigate_to: &mut Option<(String, Vec<String>)>,
+        navigate_to: &mut Option<String>,
         col_width: f32,
     ) {
         const MAX_INLINE: usize = MAX_INLINE_COLLECTION_ITEMS;
@@ -1430,7 +1567,7 @@ impl TrophyHallPanel {
                     );
                 }
                 if resp.clicked() {
-                    *navigate_to = Some((row.name.clone(), row.db_names.clone()));
+                    *navigate_to = Some(row.name.clone());
                 }
                 // The row-wide click rect is drawn on top of the icon and
                 // name, so attach the drop tooltip here too -- otherwise the
@@ -1442,30 +1579,93 @@ impl TrophyHallPanel {
 
     fn render_icon_view(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext) {
         let portal_map = get_dungeon_portal_map();
-        let query_lower = self.search_query.to_lowercase();
-        let show_no_collection = self.show_no_collection_dungeons;
-        let collections = &self.collections;
-        let filtered_indices: Vec<usize> = self
-            .index_rows
+        let filtered_indices = self.visible_indices();
+
+        // Keyboard navigation. The first visible tile is selected as soon as the
+        // icon view is shown; the arrow keys cycle through the tiles (wrapping at
+        // both ends) and Enter opens the selected one. The handling itself lives
+        // inside the scroll area because Up/Down need the resolved column count.
+        // Anything that owns the keyboard - the search box - suspends this.
+        let visible_names: Vec<String> = filtered_indices
             .iter()
-            .enumerate()
-            .filter(|(_, r)| query_lower.is_empty() || r.name.to_lowercase().contains(&query_lower))
-            .filter(|(_, r)| {
-                show_no_collection
-                    || collections
-                        .get(&r.name)
-                        .map(|c| !c.items.is_empty())
-                        .unwrap_or(true)
+            .map(|&i| self.index_rows[i].name.clone())
+            .collect();
+        let selection_missing = !self
+            .selected_icon
+            .as_ref()
+            .is_some_and(|sel| visible_names.contains(sel));
+        if visible_names.is_empty() {
+            self.selected_icon = None;
+        } else if selection_missing {
+            self.selected_icon = Some(visible_names[0].clone());
+        }
+        // Completion per visible row, computed here so the grid closure below
+        // doesn't have to reach into the collections map (which would clash with
+        // the mutation that follows a click).
+        let completion_by_row: HashMap<String, u32> = filtered_indices
+            .iter()
+            .filter_map(|&i| {
+                let name = self.index_rows[i].name.clone();
+                self.collections
+                    .get(&name)
+                    .and_then(|c| {
+                        let total = c.items.len();
+                        (total > 0).then(|| {
+                            let obtained = c
+                                .items
+                                .iter()
+                                .filter(|it| self.obtained_items.contains(&it.item_id))
+                                .count();
+                            ((obtained * 100) / total) as u32
+                        })
+                    })
+                    .map(|pct| (name, pct))
             })
-            .map(|(i, _)| i)
             .collect();
 
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            let mut navigate_to: Option<(String, Vec<String>)> = None;
+            let mut navigate_to: Option<String> = None;
 
             let available_width = ui.available_width();
             let button_width = 150.0;
             let cols = (available_width / button_width).floor().max(1.0) as usize;
+
+            if !visible_names.is_empty() && ui.memory(|m| m.focused().is_none()) {
+                let (left, right, up, down, enter) = ui.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::ArrowLeft),
+                        i.key_pressed(egui::Key::ArrowRight),
+                        i.key_pressed(egui::Key::ArrowUp),
+                        i.key_pressed(egui::Key::ArrowDown),
+                        i.key_pressed(egui::Key::Enter),
+                    )
+                });
+                if let Some(sel) = self.selected_icon.clone() {
+                    if let Some(pos) = visible_names.iter().position(|n| *n == sel) {
+                        let dir = if left {
+                            Some(IconNav::Left)
+                        } else if right {
+                            Some(IconNav::Right)
+                        } else if up {
+                            Some(IconNav::Up)
+                        } else if down {
+                            Some(IconNav::Down)
+                        } else {
+                            None
+                        };
+                        if let Some(next) =
+                            dir.and_then(|dir| icon_nav_target(pos, visible_names.len(), cols, dir))
+                        {
+                            self.selected_icon = Some(visible_names[next].clone());
+                        }
+                        if enter {
+                            if let Some(row) = self.index_rows.iter().find(|r| r.name == sel) {
+                                navigate_to = Some(row.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
 
             egui::Grid::new("dungeon_icon_grid")
                 .num_columns(cols)
@@ -1487,7 +1687,7 @@ impl TrophyHallPanel {
                         );
 
                         if resp.clicked() {
-                            navigate_to = Some((row.name.clone(), row.db_names.clone()));
+                            navigate_to = Some(row.name.clone());
                         }
                         attach_dungeon_tooltip(
                             resp.clone(),
@@ -1498,13 +1698,57 @@ impl TrophyHallPanel {
 
                         if ui.is_rect_visible(rect) {
                             let painter = ui.painter();
+                            let is_selected =
+                                self.selected_icon.as_deref() == Some(row.name.as_str());
 
-                            let bg_color = if resp.hovered() {
+                            let bg_color = if is_selected {
+                                // Selected tile: tinted with the navigation blue.
+                                Color32::from_rgba_unmultiplied(0x04, 0x97, 0xff, 70)
+                            } else if resp.hovered() {
                                 Color32::from_white_alpha(25)
                             } else {
                                 Color32::from_white_alpha(10)
                             };
                             painter.rect_filled(rect, 4.0, bg_color);
+
+                            if is_selected {
+                                painter.rect_stroke(
+                                    rect,
+                                    4.0,
+                                    egui::Stroke::new(1.5_f32, Color32::from_rgb(0x04, 0x97, 0xff)),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+
+                            // Collection completion in the top-left corner, and a
+                            // golden frame once nothing is missing from it.
+                            if let Some(pct) = completion_by_row.get(&row.name).copied() {
+                                let pct_color = if pct == 100 {
+                                    Color32::from_rgb(100, 255, 100)
+                                } else if pct > 0 {
+                                    Color32::from_rgb(200, 200, 100)
+                                } else {
+                                    Color32::from_rgb(120, 120, 120)
+                                };
+                                painter.text(
+                                    egui::pos2(rect.left() + 4.0, rect.top() + 4.0),
+                                    egui::Align2::LEFT_TOP,
+                                    format!("{pct}%"),
+                                    egui::FontId::proportional(10.0),
+                                    pct_color,
+                                );
+                                if pct == 100 {
+                                    painter.rect_stroke(
+                                        rect,
+                                        4.0,
+                                        egui::Stroke::new(
+                                            2.0_f32,
+                                            Color32::from_rgb(0xff, 0xbf, 0x00),
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                            }
 
                             // Portal sprite (centered vertically in upper portion)
                             let sprite_size = 40.0;
@@ -1618,8 +1862,10 @@ impl TrophyHallPanel {
                     }
                 });
 
-            if let Some((display_name, db_names)) = navigate_to {
-                self.load_detail(&db_names, ctx.loot_database, &display_name);
+            if let Some(display_name) = navigate_to {
+                self.selected_icon = Some(display_name.clone());
+                let (db_names, rs_keys) = self.row_source_keys(&display_name);
+                self.load_detail(&db_names, &rs_keys, ctx.loot_database, &display_name);
                 self.page = Page::Detail { name: display_name };
             }
         });
@@ -1631,104 +1877,157 @@ impl TrophyHallPanel {
         ctx: &mut PanelContext,
         dungeon: &str,
     ) -> Vec<AppAction> {
-        let actions = Vec::new();
+        let mut actions = Vec::new();
 
         // Lazily reload detail cache if cleared by refresh
         if self.detail_cache.is_none() {
-            let db_names: Vec<String> = self
-                .index_rows
-                .iter()
-                .find(|r| r.name == dungeon)
-                .map(|r| r.db_names.clone())
-                .unwrap_or_default();
-            self.load_detail(&db_names, ctx.loot_database, dungeon);
+            let (db_names, rs_keys) = self.row_source_keys(dungeon);
+            self.load_detail(&db_names, &rs_keys, ctx.loot_database, dungeon);
         }
 
-        ui.horizontal(|ui| {
-            ui.set_min_height(32.0);
-            ui.add(egui::Label::new(""));
-            if ui.button("← Back").clicked() {
-                self.page = Page::Index;
-                self.detail_cache = None;
-            }
+        let shadcn = ctx.shadcn;
 
-            let portal_map = get_dungeon_portal_map();
-            let portal_id = portal_map.get_portal_id(dungeon);
-            let portal_resp = render_portal_sprite_sized(ui, portal_id, ctx.sprite_renderer, 32.0);
-            attach_dungeon_tooltip(portal_resp, ctx.sprite_renderer, dungeon, dungeon);
+        // Backspace is the keyboard twin of "← Back", taking the dungeon page
+        // back to the list (whichever view mode it was opened from).
+        if ui.memory(|m| m.focused().is_none()) && ui.input(|i| i.key_pressed(egui::Key::Backspace))
+        {
+            self.page = Page::Index;
+            self.detail_cache = None;
+            return actions;
+        }
 
-            let name_resp = ui.heading(dungeon);
-            attach_dungeon_tooltip(name_resp, ctx.sprite_renderer, dungeon, dungeon);
-
-            let sep_color = Color32::from_rgb(150, 150, 150);
-
-            if let Some(diff) = dungeon_difficulty(dungeon) {
-                ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-                ui.label(
-                    RichText::new(format!("Difficulty: {}", format_difficulty(diff)))
-                        .color(Color32::LIGHT_GRAY),
-                );
-                let (grave_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                ctx.sprite_renderer
-                    .draw_sprite_in_rect(ui, GRAVESTONE_ID, grave_rect);
-            }
-
-            // Completion %: obtained/total of the full (unfiltered) collection.
-            if let Some(collection) = self.collections.get(dungeon) {
-                let total = collection.items.len();
-                if total > 0 {
-                    let obtained = collection
-                        .items
-                        .iter()
-                        .filter(|i| self.obtained_items.contains(&i.item_id))
-                        .count();
-                    let pct = (obtained * 100) / total;
-                    let pct_color = if pct == 100 {
-                        Color32::from_rgb(100, 255, 100)
-                    } else if pct > 0 {
-                        Color32::from_rgb(200, 200, 100)
-                    } else {
-                        Color32::from_rgb(80, 80, 80)
-                    };
-                    ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-                    ui.label(RichText::new(format!("{pct}%")).color(pct_color));
+        // Navigation band, matching the other panels' navigation rows (darker
+        // secondary fill). Back sits first, as it does in those panels, followed
+        // by Previous/Next walking the same filtered list the dungeon was opened
+        // from; the filters trail behind them. The dungeon's own details belong
+        // in the page header below.
+        let (prev, next) = self.detail_neighbours(dungeon);
+        let mut open: Option<(String, Vec<String>)> = None;
+        shadcn.header_band(ui, shadcn.secondary_header_fill(), |ui| {
+            shadcn.band_row(ui, |ui| {
+                if shadcn.btn(ui, "← Back").clicked() {
+                    self.page = Page::Index;
+                    self.detail_cache = None;
                 }
-            }
-
-            // Runs: total completions across all characters.
-            let completions = self
-                .index_rows
-                .iter()
-                .find(|r| r.name == dungeon)
-                .map(|r| r.completions)
-                .unwrap_or(0);
-            ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-            let runs_label = if completions == 1 {
-                "1 run".to_string()
-            } else {
-                format!("{completions} runs")
-            };
-            ui.label(RichText::new(runs_label).color(Color32::LIGHT_GRAY));
-
-            // Time spent: running per-dungeon counter (RealmHound and/or
-            // RealmShark, per the Data Source selector). Hidden when unknown.
-            let time_ms = self
-                .index_rows
-                .iter()
-                .find(|r| r.name == dungeon)
-                .map(|r| r.time_ms)
-                .unwrap_or(0);
-            if time_ms > 0 {
-                ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
-                ui.label(
-                    RichText::new(format!("Time spent: {}", format_dungeon_time(time_ms)))
-                        .color(Color32::LIGHT_GRAY),
-                );
-            }
+                if ui
+                    .add_enabled(prev.is_some(), egui::Button::new("<< Previous"))
+                    .clicked()
+                {
+                    open = prev.clone();
+                }
+                if ui
+                    .add_enabled(next.is_some(), egui::Button::new("Next >>"))
+                    .clicked()
+                {
+                    open = next.clone();
+                }
+                ui.separator();
+                if self.render_filter_group(ui, shadcn, &mut ctx.sprite_renderer) {
+                    actions.push(AppAction::SaveTrophyHallView);
+                }
+            });
         });
 
-        ui.separator();
+        // Swapping to a neighbour needs the new row's source keys, so it happens
+        // here rather than inside the band closure. Returning early avoids
+        // drawing this frame's header for the old dungeon while the body already
+        // belongs to the new one.
+        if let Some((name, _)) = open {
+            self.selected_icon = Some(name.clone());
+            let (db_names, rs_keys) = self.row_source_keys(&name);
+            self.load_detail(&db_names, &rs_keys, ctx.loot_database, &name);
+            self.page = Page::Detail { name };
+            return actions;
+        }
+
+        // Dungeon page header: portal, name, difficulty, completion, runs and
+        // time spent. Kept above the Collection section. It uses the page's own
+        // background rather than the darker secondary band - these are page
+        // content, not chrome - and the stacked variant keeps the fill from
+        // bleeding above the divider that closes the navigation row.
+        shadcn.header_band_page(ui, shadcn.colors().background, |ui| {
+            shadcn.band_row(ui, |ui| {
+                let portal_map = get_dungeon_portal_map();
+                let portal_id = portal_map.get_portal_id(dungeon);
+                let portal_resp =
+                    render_portal_sprite_sized(ui, portal_id, ctx.sprite_renderer, 32.0);
+                attach_dungeon_tooltip(portal_resp, ctx.sprite_renderer, dungeon, dungeon);
+
+                let name_resp = ui.heading(dungeon);
+                attach_dungeon_tooltip(name_resp, ctx.sprite_renderer, dungeon, dungeon);
+
+                let sep_color = Color32::from_rgb(150, 150, 150);
+
+                if let Some(diff) = dungeon_difficulty(dungeon) {
+                    ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
+                    ui.label(
+                        RichText::new(format!("Difficulty: {}", format_difficulty(diff)))
+                            .color(Color32::LIGHT_GRAY),
+                    );
+                    let (grave_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    ctx.sprite_renderer
+                        .draw_sprite_in_rect(ui, GRAVESTONE_ID, grave_rect);
+                }
+
+                // Completion %: obtained/total of the full (unfiltered) collection.
+                if let Some(collection) = self.collections.get(dungeon) {
+                    let total = collection.items.len();
+                    if total > 0 {
+                        let obtained = collection
+                            .items
+                            .iter()
+                            .filter(|i| self.obtained_items.contains(&i.item_id))
+                            .count();
+                        let pct = (obtained * 100) / total;
+                        let pct_color = if pct == 100 {
+                            Color32::from_rgb(100, 255, 100)
+                        } else if pct > 0 {
+                            Color32::from_rgb(200, 200, 100)
+                        } else {
+                            Color32::from_rgb(80, 80, 80)
+                        };
+                        ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
+                        ui.label(RichText::new(format!("{pct}%")).color(pct_color));
+                    }
+                }
+
+                // Runs: total completions across all characters. Realm and the Vault
+                // are not completed runs, so they never show a counter (it would
+                // always read "0 runs").
+                let completions = self
+                    .index_rows
+                    .iter()
+                    .find(|r| r.name == dungeon)
+                    .map(|r| r.completions)
+                    .unwrap_or(0);
+                if runs_apply_to(dungeon) {
+                    ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
+                    let runs_label = if completions == 1 {
+                        "1 run".to_string()
+                    } else {
+                        format!("{completions} runs")
+                    };
+                    ui.label(RichText::new(runs_label).color(Color32::LIGHT_GRAY));
+                }
+
+                // Time spent: running per-dungeon counter (RealmHound and/or
+                // RealmShark, per the Data Source selector). Hidden when unknown.
+                let time_ms = self
+                    .index_rows
+                    .iter()
+                    .find(|r| r.name == dungeon)
+                    .map(|r| r.time_ms)
+                    .unwrap_or(0);
+                if time_ms > 0 {
+                    ui.label(RichText::new("•").size(15.0).strong().color(sep_color));
+                    ui.label(
+                        RichText::new(format!("Time spent: {}", format_dungeon_time(time_ms)))
+                            .color(Color32::LIGHT_GRAY),
+                    );
+                }
+            });
+        });
 
         self.render_detail_body(ui, ctx, dungeon);
 
@@ -2014,64 +2313,72 @@ impl TrophyHallPanel {
     /// Tracked-loot breakdown (per-item drop counts + mob-item table), sourced
     /// via the Data Source selector, shown below the collection on the detail page.
     fn render_detail_body(&mut self, ui: &mut egui::Ui, ctx: &mut PanelContext, dungeon: &str) {
-        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-            self.render_detail_collection(ui, ctx, dungeon);
+        // Salted per dungeon so Previous/Next open the neighbour at the top
+        // instead of inheriting the previous dungeon's scroll position.
+        ScrollArea::vertical()
+            .auto_shrink(false)
+            .id_salt(("dungeon_detail", dungeon))
+            .show(ui, |ui| {
+                self.render_detail_collection(ui, ctx, dungeon);
 
-            let Some(detail) = &self.detail_cache else {
-                ui.label("No tracked loot drops recorded.");
-                return;
-            };
+                let Some(detail) = &self.detail_cache else {
+                    ui.label("No tracked loot drops recorded.");
+                    return;
+                };
 
-            if detail.items.is_empty() {
-                ui.label("No tracked loot drops recorded.");
-                return;
-            }
+                if detail.items.is_empty() {
+                    ui.label("No tracked loot drops recorded.");
+                    return;
+                }
 
-            ui.heading("All Items");
-            ui.add_space(4.0);
+                ui.heading("All Items");
+                ui.add_space(4.0);
 
-            let available_width = ui.available_width();
-            let tile_width = 46.0;
-            let spacing = 4.0;
-            let cols = (available_width / tile_width).floor().max(1.0) as usize;
-            let row_height = 62.0; // tile + count label
-            let total_rows = (detail.items.len() + cols - 1) / cols;
+                let available_width = ui.available_width();
+                let tile_width = 46.0;
+                let spacing = 4.0;
+                let cols = (available_width / tile_width).floor().max(1.0) as usize;
+                let row_height = 62.0; // tile + count label
+                let total_rows = (detail.items.len() + cols - 1) / cols;
 
-            // Virtualized grid: allocate full height, render only visible rows
-            let (total_rect, _) = ui.allocate_exact_size(
-                egui::vec2(available_width, total_rows as f32 * (row_height + spacing)),
-                egui::Sense::hover(),
-            );
+                // Virtualized grid: allocate full height, render only visible rows
+                let (total_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(available_width, total_rows as f32 * (row_height + spacing)),
+                    egui::Sense::hover(),
+                );
 
-            let clip_rect = ui.clip_rect();
-            let first_visible_row = ((clip_rect.top() - total_rect.top()) / (row_height + spacing))
-                .floor()
-                .max(0.0) as usize;
-            let last_visible_row = ((clip_rect.bottom() - total_rect.top())
-                / (row_height + spacing))
-                .ceil()
-                .min(total_rows as f32) as usize;
+                let clip_rect = ui.clip_rect();
+                let first_visible_row = ((clip_rect.top() - total_rect.top())
+                    / (row_height + spacing))
+                    .floor()
+                    .max(0.0) as usize;
+                let last_visible_row = ((clip_rect.bottom() - total_rect.top())
+                    / (row_height + spacing))
+                    .ceil()
+                    .min(total_rows as f32) as usize;
 
-            for row in first_visible_row..last_visible_row {
-                let row_start = row * cols;
-                let row_end = (row_start + cols).min(detail.items.len());
-                let row_y = total_rect.top() + row as f32 * (row_height + spacing);
+                for row in first_visible_row..last_visible_row {
+                    let row_start = row * cols;
+                    let row_end = (row_start + cols).min(detail.items.len());
+                    let row_y = total_rect.top() + row as f32 * (row_height + spacing);
 
-                for (col, item_idx) in (row_start..row_end).enumerate() {
-                    let item = &detail.items[item_idx];
-                    let tile_x = total_rect.left() + col as f32 * tile_width;
-                    let tile_rect = egui::Rect::from_min_size(
-                        egui::pos2(tile_x, row_y),
-                        egui::vec2(tile_width, row_height),
-                    );
+                    for (col, item_idx) in (row_start..row_end).enumerate() {
+                        let item = &detail.items[item_idx];
+                        let tile_x = total_rect.left() + col as f32 * tile_width;
+                        let tile_rect = egui::Rect::from_min_size(
+                            egui::pos2(tile_x, row_y),
+                            egui::vec2(tile_width, row_height),
+                        );
 
-                    let mut child_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(tile_rect)
-                            .layout(egui::Layout::top_down(egui::Align::Center)),
-                    );
-                    let rarity_counts: Vec<(u8, &str, u32)> =
-                        if detail.enchantable.contains(&item.item_id) {
+                        let mut child_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(tile_rect)
+                                .layout(egui::Layout::top_down(egui::Align::Center)),
+                        );
+                        let rarity_counts: Vec<(u8, &str, u32)> = if detail
+                            .enchantable
+                            .contains(&item.item_id)
+                        {
                             detail
                                 .rarity_breakdowns
                                 .get(&item.item_id)
@@ -2087,99 +2394,103 @@ impl TrophyHallPanel {
                         } else {
                             Vec::new()
                         };
-                    ctx.sprite_renderer.render_item_tile_with_rarity_counts(
-                        &mut child_ui,
-                        item.item_id,
-                        Some(&item.item_name),
-                        &rarity_counts,
-                    );
-                    child_ui.label(
-                        RichText::new(format!("×{}", item.total_count))
-                            .size(10.0)
-                            .color(Color32::LIGHT_GRAY),
-                    );
-                }
-            }
-
-            if !detail.mob_items.is_empty() {
-                ui.add_space(12.0);
-                ui.heading("Drops By Monster");
-                ui.add_space(4.0);
-
-                let mut i = 0;
-                while i < detail.mob_items.len() {
-                    let mob_name = detail.mob_items[i].mob_name.clone();
-                    let mob_type = detail.mob_items[i].mob_type;
-
-                    let start = i;
-                    while i < detail.mob_items.len() && detail.mob_items[i].mob_name == mob_name {
-                        i += 1;
+                        ctx.sprite_renderer.render_item_tile_with_rarity_counts(
+                            &mut child_ui,
+                            item.item_id,
+                            Some(&item.item_name),
+                            &rarity_counts,
+                        );
+                        child_ui.label(
+                            RichText::new(format!("×{}", item.total_count))
+                                .size(10.0)
+                                .color(Color32::LIGHT_GRAY),
+                        );
                     }
-
-                    let header_id = egui::Id::new(format!("mob_section_{}_{}", mob_type, start));
-                    egui::collapsing_header::CollapsingState::load_with_default_open(
-                        ui.ctx(),
-                        header_id,
-                        false,
-                    )
-                    .show_header(ui, |ui| {
-                        let sprite_type =
-                            realmhound_core::assets::normalize_train_sprite(mob_type, &mob_name);
-                        render_mob_sprite(ui, sprite_type, ctx.sprite_renderer);
-                        ui.label(RichText::new(&mob_name).strong());
-                    })
-                    .body(|ui| {
-                        egui::Grid::new(format!("mob_items_{}_{}", mob_type, start))
-                            .num_columns(cols)
-                            .spacing(egui::vec2(4.0, 4.0))
-                            .show(ui, |ui| {
-                                for (j, idx) in (start..i).enumerate() {
-                                    if j > 0 && j % cols == 0 {
-                                        ui.end_row();
-                                    }
-                                    let mob_item = &detail.mob_items[idx];
-                                    ui.vertical(|ui| {
-                                        let rarity_counts: Vec<(u8, &str, u32)> =
-                                            if detail.enchantable.contains(&mob_item.item_id) {
-                                                detail
-                                                    .rarity_breakdowns
-                                                    .get(&mob_item.item_id)
-                                                    .map(|breakdown| {
-                                                        breakdown
-                                                            .iter()
-                                                            .map(|&(slots, count)| {
-                                                                (
-                                                                    slots as u8,
-                                                                    rarity_name(slots as u8),
-                                                                    count as u32,
-                                                                )
-                                                            })
-                                                            .collect()
-                                                    })
-                                                    .unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            };
-                                        ctx.sprite_renderer.render_item_tile_with_rarity_counts(
-                                            ui,
-                                            mob_item.item_id,
-                                            Some(&mob_item.item_name),
-                                            &rarity_counts,
-                                        );
-                                        ui.label(
-                                            RichText::new(format!("×{}", mob_item.count))
-                                                .size(10.0)
-                                                .color(Color32::LIGHT_GRAY),
-                                        );
-                                    });
-                                }
-                            });
-                    });
-
-                    ui.add_space(4.0);
                 }
-            }
-        });
+
+                if !detail.mob_items.is_empty() {
+                    ui.add_space(12.0);
+                    ui.heading("Drops By Monster");
+                    ui.add_space(4.0);
+
+                    let mut i = 0;
+                    while i < detail.mob_items.len() {
+                        let mob_name = detail.mob_items[i].mob_name.clone();
+                        let mob_type = detail.mob_items[i].mob_type;
+
+                        let start = i;
+                        while i < detail.mob_items.len() && detail.mob_items[i].mob_name == mob_name
+                        {
+                            i += 1;
+                        }
+
+                        let header_id =
+                            egui::Id::new(format!("mob_section_{}_{}", mob_type, start));
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            header_id,
+                            false,
+                        )
+                        .show_header(ui, |ui| {
+                            let sprite_type = realmhound_core::assets::normalize_train_sprite(
+                                mob_type, &mob_name,
+                            );
+                            render_mob_sprite(ui, sprite_type, ctx.sprite_renderer);
+                            ui.label(RichText::new(&mob_name).strong());
+                        })
+                        .body(|ui| {
+                            egui::Grid::new(format!("mob_items_{}_{}", mob_type, start))
+                                .num_columns(cols)
+                                .spacing(egui::vec2(4.0, 4.0))
+                                .show(ui, |ui| {
+                                    for (j, idx) in (start..i).enumerate() {
+                                        if j > 0 && j % cols == 0 {
+                                            ui.end_row();
+                                        }
+                                        let mob_item = &detail.mob_items[idx];
+                                        ui.vertical(|ui| {
+                                            let rarity_counts: Vec<(u8, &str, u32)> =
+                                                if detail.enchantable.contains(&mob_item.item_id) {
+                                                    detail
+                                                        .rarity_breakdowns
+                                                        .get(&mob_item.item_id)
+                                                        .map(|breakdown| {
+                                                            breakdown
+                                                                .iter()
+                                                                .map(|&(slots, count)| {
+                                                                    (
+                                                                        slots as u8,
+                                                                        rarity_name(slots as u8),
+                                                                        count as u32,
+                                                                    )
+                                                                })
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default()
+                                                } else {
+                                                    Vec::new()
+                                                };
+                                            ctx.sprite_renderer
+                                                .render_item_tile_with_rarity_counts(
+                                                    ui,
+                                                    mob_item.item_id,
+                                                    Some(&mob_item.item_name),
+                                                    &rarity_counts,
+                                                );
+                                            ui.label(
+                                                RichText::new(format!("×{}", mob_item.count))
+                                                    .size(10.0)
+                                                    .color(Color32::LIGHT_GRAY),
+                                            );
+                                        });
+                                    }
+                                });
+                        });
+
+                        ui.add_space(4.0);
+                    }
+                }
+            });
     }
 }
 
@@ -2230,6 +2541,8 @@ const GRAVESTONE_ID: i32 = 1282;
 /// collapsible toggle in the index list (matches render_list_column).
 const MAX_INLINE_COLLECTION_ITEMS: usize = 24;
 
+/// Portal sprite for the dungeon page header, drawn with the same outline the
+/// index view's tiles use so the two read alike.
 fn render_portal_sprite_sized(
     ui: &mut egui::Ui,
     portal_id: Option<i32>,
@@ -2241,7 +2554,7 @@ fn render_portal_sprite_sized(
         return response;
     }
     let drawn = if let Some(id) = portal_id {
-        sprite_renderer.draw_sprite_in_rect(ui, id, rect)
+        sprite_renderer.draw_outlined_sprite_in_rect(ui, id, rect)
     } else {
         false
     };
@@ -2293,9 +2606,215 @@ fn is_non_dungeon_location(name: &str) -> bool {
     EXCLUDED.iter().any(|&e| name.eq_ignore_ascii_case(e))
 }
 
+/// Whether a "runs" counter means anything for a dungeon row. Realm and the
+/// Vault are permanent locations rather than completed runs, so their header
+/// omits the counter instead of printing "0 runs".
+fn runs_apply_to(dungeon: &str) -> bool {
+    !matches!(dungeon, "Realm" | "Vault")
+}
+
+/// Whether a dungeon row belongs to the Legacy family: the Time Chamber's retro
+/// dungeons and the Legacy Heroic reskins. They are listed by default and can be
+/// filtered out with the panel's "Legacy Dungeons" toggle.
+fn is_legacy_dungeon(name: &str) -> bool {
+    name.strip_prefix("Legacy ")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// The directions the icon view's keyboard navigation understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IconNav {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Where an arrow key moves the icon view's selection to, wrapping at both ends
+/// of the tile list. `cols` is how many tiles a row holds, so Up/Down move by a
+/// whole row (the list is not rectangular, hence the wrapped jump).
+fn icon_nav_target(pos: usize, count: usize, cols: usize, dir: IconNav) -> Option<usize> {
+    if count == 0 || cols == 0 || pos >= count {
+        return None;
+    }
+    let jump = cols % count;
+    Some(match dir {
+        IconNav::Left => (pos + count - 1) % count,
+        IconNav::Right => (pos + 1) % count,
+        IconNav::Up => (pos + count - jump) % count,
+        IconNav::Down => (pos + jump) % count,
+    })
+}
+
 #[cfg(test)]
 mod gating_tests {
     use super::*;
+
+    #[test]
+    fn is_legacy_dungeon_matches_the_legacy_family_only() {
+        assert!(is_legacy_dungeon("Legacy Spider Den"));
+        assert!(is_legacy_dungeon("Legacy The Shatters"));
+        assert!(is_legacy_dungeon("Legacy Heroic Undead Lair"));
+        assert!(!is_legacy_dungeon("Spider Den"));
+        assert!(!is_legacy_dungeon("The Nest"));
+        assert!(!is_legacy_dungeon("Legacy"));
+        assert!(!is_legacy_dungeon("legacy spider den"));
+        assert!(!is_legacy_dungeon(""));
+    }
+
+    #[test]
+    fn icon_arrows_cycle_with_wrapping() {
+        // Six tiles in rows of three.
+        assert_eq!(icon_nav_target(0, 6, 3, IconNav::Right), Some(1));
+        assert_eq!(icon_nav_target(2, 6, 3, IconNav::Right), Some(3));
+        assert_eq!(icon_nav_target(5, 6, 3, IconNav::Right), Some(0));
+        assert_eq!(icon_nav_target(0, 6, 3, IconNav::Left), Some(5));
+        // Vertical moves are a whole row, wrapping past the ends.
+        assert_eq!(icon_nav_target(1, 6, 3, IconNav::Down), Some(4));
+        assert_eq!(icon_nav_target(3, 6, 3, IconNav::Down), Some(0));
+        assert_eq!(icon_nav_target(4, 6, 3, IconNav::Up), Some(1));
+        assert_eq!(icon_nav_target(1, 6, 3, IconNav::Up), Some(4));
+        // A ragged last row still wraps around the end of the list.
+        assert_eq!(icon_nav_target(4, 5, 3, IconNav::Down), Some(2));
+        assert_eq!(icon_nav_target(1, 5, 3, IconNav::Up), Some(3));
+        // No tile below or above (a single row): the selection stays put.
+        assert_eq!(icon_nav_target(1, 2, 4, IconNav::Down), Some(1));
+        assert_eq!(icon_nav_target(1, 2, 4, IconNav::Up), Some(1));
+        // Empty lists, unknown positions and unknown column counts have no target.
+        assert_eq!(icon_nav_target(0, 0, 3, IconNav::Right), None);
+        assert_eq!(icon_nav_target(5, 5, 3, IconNav::Right), None);
+        assert_eq!(icon_nav_target(0, 6, 0, IconNav::Down), None);
+    }
+
+    #[test]
+    fn realmshark_time_and_items_follow_the_normalized_row() {
+        use realmhound_core::realmshark_import::{RealmSharkDungeon, RealmSharkStats};
+
+        // RealmShark keys the realm as "The Realm"; the merged row is "Realm".
+        let mut panel = TrophyHallPanel::new();
+        panel.data_source = DataSource::RealmShark;
+        panel.realmshark_data = Some(RealmSharkStats {
+            dungeons: [(
+                "The Realm".to_string(),
+                RealmSharkDungeon {
+                    name: "The Realm".to_string(),
+                    completions: 12,
+                    total_time_ms: 3_600_000,
+                    items: vec![DungeonItemStat {
+                        item_id: 2608,
+                        item_name: String::new(),
+                        total_count: 4,
+                        bag_type_counts: Vec::new(),
+                    }],
+                    mob_items: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+
+        panel.rebuild_index(None, &AccountData::new(), None);
+
+        let row = panel
+            .index_rows
+            .iter()
+            .find(|r| r.name == "Realm")
+            .expect("the import merges into the Realm row");
+        assert_eq!(row.rs_keys, vec!["The Realm".to_string()]);
+        assert_eq!(row.total_items, 4, "the imported items land on the row");
+        assert_eq!(
+            row.time_ms, 3_600_000,
+            "the imported time lands on the same row"
+        );
+
+        // ...and the detail page finds the import under its own key too.
+        let (db_names, rs_keys) = panel.row_source_keys("Realm");
+        panel.load_detail(&db_names, &rs_keys, None, "Realm");
+        let detail = panel.detail_cache.as_ref().expect("detail loaded");
+        assert_eq!(detail.items.len(), 1);
+        assert_eq!(detail.items[0].item_id, 2608);
+    }
+
+    fn index_row(name: &str) -> IndexRow {
+        IndexRow {
+            name: name.to_string(),
+            db_names: vec![name.to_string()],
+            rs_keys: Vec::new(),
+            total_items: 0,
+            completions: 0,
+            difficulty: None,
+            time_ms: 0,
+        }
+    }
+
+    #[test]
+    fn dungeon_neighbours_follow_the_filtered_list() {
+        let neighbours = |panel: &TrophyHallPanel, name: &str| {
+            let (prev, next) = panel.detail_neighbours(name);
+            (prev.map(|(n, _)| n), next.map(|(n, _)| n))
+        };
+
+        let mut panel = TrophyHallPanel::new();
+        panel.index_rows = vec![
+            index_row("Better Gardens"),
+            index_row("Spectral Penitentiary"),
+            index_row("The Nest"),
+            index_row("Legacy Spider Den"),
+        ];
+
+        // Legacy dungeons are listed by default, so the Legacy row is the last
+        // stop on the walk and the first dungeon has nothing before it.
+        assert_eq!(panel.visible_indices(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            neighbours(&panel, "Better Gardens"),
+            (None, Some("Spectral Penitentiary".to_string()))
+        );
+        assert_eq!(
+            neighbours(&panel, "Spectral Penitentiary"),
+            (
+                Some("Better Gardens".to_string()),
+                Some("The Nest".to_string())
+            )
+        );
+        assert_eq!(
+            neighbours(&panel, "Legacy Spider Den"),
+            (Some("The Nest".to_string()), None)
+        );
+
+        // Hiding Legacy dungeons drops that row from the walk, so the dungeon
+        // before it becomes the last stop and it loses its neighbours.
+        panel.show_legacy_dungeons = false;
+        assert_eq!(panel.visible_indices(), vec![0, 1, 2]);
+        assert_eq!(
+            neighbours(&panel, "The Nest"),
+            (Some("Spectral Penitentiary".to_string()), None)
+        );
+        assert_eq!(neighbours(&panel, "Legacy Spider Den"), (None, None));
+
+        // The search box narrows the list too.
+        panel.show_legacy_dungeons = true;
+        panel.search_query = "nest".to_string();
+        assert_eq!(panel.visible_indices(), vec![2]);
+        assert_eq!(neighbours(&panel, "The Nest"), (None, None));
+    }
+
+    #[test]
+    fn legacy_toggle_defaults_on() {
+        let panel = TrophyHallPanel::new();
+        assert!(panel.show_legacy_dungeons());
+        assert!(
+            realmhound_core::settings::TrophyHallSettings::default().show_legacy_dungeons,
+            "a fresh settings file must list Legacy dungeons"
+        );
+    }
+
+    #[test]
+    fn runs_counter_is_hidden_for_realm_and_vault() {
+        assert!(runs_apply_to("The Nest"));
+        assert!(runs_apply_to("Legacy Spider Den"));
+        assert!(!runs_apply_to("Realm"));
+        assert!(!runs_apply_to("Vault"));
+    }
 
     #[test]
     fn realmshark_gating_requires_a_bound_import_path() {

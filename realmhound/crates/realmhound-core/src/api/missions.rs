@@ -79,9 +79,9 @@ pub struct MissionDef {
     pub participants: i32,
     /// Equipment restrictions: the character must have an item of each listed
     /// slot type equipped to make progress (e.g. an Orb, restricting the
-    /// mission to Mystics). Empty when unrestricted. Deca serialises the absent
-    /// value as an empty string and the present value as an array, so it is
-    /// parsed leniently.
+    /// mission to Mystics; a Sigil, restricting it to Druids). Empty when
+    /// unrestricted. Deca serialises the absent value as an empty string and the
+    /// present value as an array, so it is parsed leniently.
     #[serde(
         default,
         rename = "wornRestriction",
@@ -91,7 +91,8 @@ pub struct MissionDef {
 }
 
 /// A single worn-equipment restriction. `kind` is the game `SlotType` name
-/// (e.g. `"ORB"`, `"SKULL"`); `display` is the human label (e.g. `"Orb"`).
+/// (e.g. `"ORB"`, `"SKULL"`, `"SIGIL"`); `display` is the human label (e.g.
+/// `"Orb"`).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct WornRestriction {
     #[serde(default, rename = "type")]
@@ -866,7 +867,7 @@ fn parse_tree_mission_pairs(section: Option<&str>) -> Vec<(i32, i32)> {
 }
 
 /// Return the text between `<tag>` and `</tag>` (first occurrence).
-fn extract_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+pub(crate) fn extract_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}");
     let start_tag = body.find(&open)?;
     // Skip to the end of the opening tag (handles attributes like id="52").

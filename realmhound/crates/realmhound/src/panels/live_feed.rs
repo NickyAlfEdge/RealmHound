@@ -1526,30 +1526,31 @@ impl LiveFeedPanel {
         join: realmhound_core::settings::JoinPosition,
     ) -> String {
         use realmhound_core::settings::JoinPosition;
-        let mut out = String::new();
+        // Assembled from parts so an empty body (a name-less call with no tag to
+        // name) still reads as `/p j` rather than carrying a stray double space.
+        let mut parts: Vec<String> = Vec::new();
         if self.call_for_party {
-            out.push_str("/p ");
+            parts.push("/p".to_string());
         }
         if join == JoinPosition::Beginning {
-            out.push_str("j ");
+            parts.push("j".to_string());
         }
         if self.include_server_name {
             if let Some(server) = server {
-                out.push_str(realmhound_core::protocol::short_server_name(server));
-                out.push(' ');
+                parts.push(realmhound_core::protocol::short_server_name(server).to_string());
             }
         }
         if self.include_realm_name {
             if let Some(realm) = realm {
-                out.push_str(realm);
-                out.push(' ');
+                parts.push(realm.to_string());
             }
         }
-        out.push_str(body);
+        parts.push(body.to_string());
         if join == JoinPosition::End {
-            out.push_str(" j");
+            parts.push("j".to_string());
         }
-        out
+        parts.retain(|part| !part.is_empty());
+        parts.join(" ")
     }
 
     /// Initialize dust state from cached account data.
@@ -5843,24 +5844,32 @@ fn quest_chip_groups(q: &crate::panels::taskbar::QuestTask) -> Vec<Vec<ChipSeg>>
 
 /// Chip segment-groups for a combined mission+quest pill. Per dungeon variety
 /// the pill shows the mark pickups first, then any remaining portal-only runs:
-/// each of the first `mark_count` dungeon runs also drops a mark, so only
-/// `dungeon_runs - mark_count` runs are portal-only. When the marks already
-/// cover every run (`mark_count >= dungeon_runs`) just the marks show; with no
-/// marks left just the portals show. A choice/tie yields one `|`-separated
-/// group per variety.
+/// a run drops one mark for every quest the variety covers, so the marks need
+/// `max(remaining)` runs and only the surplus is portal-only. When the marks
+/// already cover every run (`max(remaining) >= dungeon_runs`) just the marks
+/// show; with no marks left just the portals show. A choice/tie yields one
+/// `|`-separated group per variety.
 fn combined_chip_groups(variants: &[crate::panels::taskbar::CombinedVariant]) -> Vec<Vec<ChipSeg>> {
     use crate::panels::missions::ObjIcon;
     variants
         .iter()
         .filter_map(|v| {
             let mut segs: Vec<ChipSeg> = Vec::new();
-            if v.mark_id > 0 && v.mark_count > 0 {
-                segs.push(ChipSeg {
-                    prefix: None,
-                    icon: ObjIcon::Object(v.mark_id),
-                    text: format!("x {}", v.mark_count),
-                });
-                let extra_portals = v.dungeon_runs - v.mark_count;
+            let marks: Vec<_> = v
+                .marks
+                .iter()
+                .filter(|m| m.mark_id > 0 && m.remaining > 0)
+                .collect();
+            if !marks.is_empty() {
+                for m in &marks {
+                    segs.push(ChipSeg {
+                        prefix: None,
+                        icon: ObjIcon::Object(m.mark_id),
+                        text: format!("x {}", m.remaining),
+                    });
+                }
+                let runs_for_marks = marks.iter().map(|m| m.remaining).max().unwrap_or(0);
+                let extra_portals = v.dungeon_runs - runs_for_marks;
                 if extra_portals > 0 {
                     segs.push(ChipSeg {
                         prefix: None,
@@ -6183,13 +6192,40 @@ mod tests {
         mark_count: i32,
         dungeon_runs: i32,
     ) -> crate::panels::taskbar::CombinedVariant {
+        combined_variant_marks(&[(mark_id, mark_count)], dungeon_runs)
+    }
+
+    fn combined_variant_marks(
+        marks: &[(i32, i32)],
+        dungeon_runs: i32,
+    ) -> crate::panels::taskbar::CombinedVariant {
         crate::panels::taskbar::CombinedVariant {
             dungeon_name: "Ocean Trench".to_string(),
             portal_icon: crate::panels::missions::ObjIcon::None,
-            mark_id,
+            marks: marks
+                .iter()
+                .map(
+                    |&(mark_id, remaining)| crate::panels::taskbar::VariantMark {
+                        mark_id,
+                        remaining,
+                    },
+                )
+                .collect(),
             dungeon_runs,
-            mark_count,
         }
+    }
+
+    #[test]
+    fn combined_split_lists_every_mark_the_dungeon_drops() {
+        // Two quests need a mark from the same dungeon: both marks show, and
+        // because the same runs drop both, only the larger requirement eats
+        // runs (4 runs, 3 marks needed -> one portal-only run left).
+        let groups = combined_chip_groups(&[combined_variant_marks(&[(50, 2), (60, 3)], 4)]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 3);
+        assert_eq!(groups[0][0].text, "x 2");
+        assert_eq!(groups[0][1].text, "x 3");
+        assert_eq!(groups[0][2].text, "x 1");
     }
 
     #[test]
@@ -7761,6 +7797,25 @@ mod tests {
         // The copy is handed over once; afterwards the panel only tracks the
         // entry so it can release the clipboard later.
         assert_eq!(panel.poll_clipboard(), None);
+    }
+
+    // With names off, a dungeon whose modifiers clear no threshold still has a
+    // callout -- the join marker alone -- so the auto-clipboard must copy it.
+    #[test]
+    fn auto_clipboard_copies_name_less_callout_with_no_tags() {
+        let _assets = crate::test_support::modifier_assets();
+        let mut panel = LiveFeedPanel::new();
+        panel.apply_live_feed_settings(&realmhound_core::settings::LiveFeedSettings {
+            auto_clipboard_dungeon_calls: true,
+            dungeon_name_style: realmhound_core::settings::DungeonNameStyle::None,
+            ..Default::default()
+        });
+        // Snake Pit with no modifiers: no name, and no tag above its threshold.
+        panel.push_dungeon(7, "Snake Pit", &[], None);
+        assert_eq!(
+            panel.poll_clipboard(),
+            Some(ClipboardWrite::Copy("/p j".to_string()))
+        );
     }
 
     #[test]

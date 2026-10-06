@@ -186,6 +186,24 @@ static DUNGEON_DIFFICULTIES: &[(&str, f32)] = &[
     ("Lair of Shaitan", 6.0),
     ("Legacy Heroic Abyss of Demons", 5.0),
     ("Legacy Heroic Undead Lair", 5.0),
+    // Time Chamber Legacy dungeons (RealmEye wiki, Exalt 7.0.0.0, Sep 2026).
+    ("Legacy Abyss of Demons", 3.0),
+    ("Legacy Deadwater Docks", 5.0),
+    // The Trophy Hall's row for Deadwater Docks folds in the Grotto, which
+    // shares its completion counter, so the folded name is rated too.
+    ("Legacy Deadwater Docks & Grotto", 5.0),
+    ("Legacy Forest Maze", 1.0),
+    ("Legacy Lair of Draconis", 4.0),
+    // Likewise the Ivory Wyvern folds into the Lair of Draconis row.
+    ("Legacy Lair of Draconis & Ivory", 4.0),
+    ("Legacy Lair of Shaitan", 5.5),
+    ("Legacy Pirate Cave", 1.0),
+    ("Legacy Spider Den", 1.0),
+    ("Legacy Sprite World", 2.0),
+    ("Legacy The Crawling Depths", 5.0),
+    ("Legacy The Shatters", 5.0),
+    ("Legacy Undead Lair", 4.0),
+    ("Legacy Woodland Labyrinth", 5.0),
     ("Lost Halls", 8.0),
     ("Mad God Mayhem", 6.0),
     ("Mad Lab", 4.0),
@@ -281,5 +299,35 @@ mod key_pop_tier_tests {
     #[test]
     fn unknown_dungeon_is_none() {
         assert!(key_pop_tier("Totally Not A Dungeon").is_none());
+    }
+
+    /// The Time Chamber's Legacy dungeons carry the wiki's difficulty ratings
+    /// (Exalt 7.0.0.0, Sep 2026) so the Trophy Hall can sort and star them like
+    /// any other dungeon.
+    #[test]
+    fn legacy_dungeon_difficulties_match_the_wiki() {
+        for (name, diff) in [
+            ("Legacy Pirate Cave", 1.0),
+            ("Legacy Spider Den", 1.0),
+            ("Legacy Forest Maze", 1.0),
+            ("Legacy Sprite World", 2.0),
+            ("Legacy Abyss of Demons", 3.0),
+            ("Legacy Undead Lair", 4.0),
+            ("Legacy Lair of Draconis", 4.0),
+            ("Legacy Deadwater Docks & Grotto", 5.0),
+            ("Legacy The Crawling Depths", 5.0),
+            ("Legacy Woodland Labyrinth", 5.0),
+            ("Legacy The Shatters", 5.0),
+            ("Legacy Lair of Shaitan", 5.5),
+            // Combined row names, which is what the Trophy Hall lists.
+            ("Legacy Lair of Draconis & Ivory", 4.0),
+            // The Legacy Heroic reskins were already rated.
+            ("Legacy Heroic Abyss of Demons", 5.0),
+            ("Legacy Heroic Undead Lair", 5.0),
+        ] {
+            assert_eq!(dungeon_difficulty(name), Some(diff), "{name}");
+        }
+        // Lookup stays case-insensitive, like the rest of the table.
+        assert_eq!(dungeon_difficulty("legacy spider den"), Some(1.0));
     }
 }
