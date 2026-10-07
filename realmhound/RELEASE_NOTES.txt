@@ -20,7 +20,7 @@
 - RealmShark imports now merge into RealmHound's dungeon rows by name instead of only matching identical spellings.
 
 # Items
-- New OWNED pill on item tooltips for blueprints, slotted skins, emotes and pet skins.
+- New OWNED pill on item tooltips for blueprints, character skins, emotes and pet skins.
 
 # Fixes
 - Fixed gift-chest live updates in the Vault.
