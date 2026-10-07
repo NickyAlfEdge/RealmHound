@@ -1,24 +1,27 @@
-# Live Feed
-- Dungeon callouts now have more flexible settings.
-- A new option to learn and disable callouts for guaranteed special and unique dungeon mods during Deca's events.
-- Realm status callout: name a closing realm past 90% or show "in X% realm" from your own threshold.
-- Nexus callout: a new option to label dungeons opened in Nexus/Guild Hall/Vault/Bazaar as "nexus".
-- Live Feed settings are regrouped into sub-tabs.
-- Automatic copy to clipboard feature for dungeon callouts.
-- Optional sound pings for your character name and custom chat words.
-
 # Combat History
-- MV fight card now tracks the spirits collected in a run.
-- Fixed MV loot attribution.
-- MV fight card no longer caps party damage by the boss's HP.
-- Labels for special MV modes: "(Leisurely)" and "(Petless)".
-- The Shatters hard mode is detected and its fight cards are titled "(HM)".
-- Fixed Shatters HM extra loot bag attribution.
-- Labels for Spec Pen hard mode in fight cards.
-- Goblin Patriarch's and Legion Colonel's minions are no longer tracked, and the Demonic Effigy is tracked.
+- Fixed some bosses sometimes incorrectly marked as Escaped when they were actually completed.
+- Fight cards completed by a loot update now update in place instead of showing as Escaped until a reload.
+- Fixed MV still marked as completed sometimes when the player nexused.
+
+# Taskbar & Missions
+- Advanced dungeon variants no longer advance the base dungeon's mission.
+- Multi-dungeon mark quests now fuse with matching missions when a dungeon overlaps.
+- Two quests that share a dungeon now share a single pill.
+- Improved tooltips for missions with multiple dungeons.
+- Fixed character-exclusive missions to work correctly for Druid.
+- After a season rollover, locked missions are no longer listed as "In progress".
+- The season and battlepass countdowns now use the game's authoritative dates instead of estimating.
+- Fixed dungeon callouts with dungeon names set to "none" to work with the auto copy-to-clipboard feature.
+
+# Trophy Hall
+- Legacy dungeons now have their retro collections, with a "Legacy Dungeons" filter.
+- Redesigned the dungeon page with a header and a navigation row.
+- The icon view shows per-dungeon collection completion with keyboard navigation.
+- RealmShark imports now merge into RealmHound's dungeon rows by name instead of only matching identical spellings.
+
+# Items
+- New OWNED pill on item tooltips for blueprints, slotted skins, emotes and pet skins.
 
 # Fixes
-- RealmHound recovers its windows after display changes.
-- Security enhancements.
-- Added loopback VPN traffic support.
-- RealmShark imports work in offline mode again.
+- Fixed gift-chest live updates in the Vault.
+- The Season 31 shinies are wired into their dungeon collections.
