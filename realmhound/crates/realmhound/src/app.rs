@@ -6541,7 +6541,7 @@ impl RealmHoundApp {
     /// Render the `📂` button that opens a file dialog to choose a custom sound,
     /// copies it into the custom-sounds directory, and records both the on-disk
     /// filename and the original display name. Returns `true` when a file was
-    /// chosen.
+    /// successfully imported.
     fn render_custom_sound_picker(
         &self,
         ui: &mut egui::Ui,
@@ -6559,15 +6559,35 @@ impl RealmHoundApp {
                 .add_filter("Audio", &["wav", "mp3", "ogg", "flac"])
                 .pick_file()
             {
-                // Reject files larger than 2 MB
-                let too_large = fs::metadata(&picked)
-                    .map(|m| m.len() > crate::sound::MAX_CUSTOM_SOUND_BYTES)
-                    .unwrap_or(true);
-                if too_large {
+                let metadata = match fs::metadata(&picked) {
+                    Ok(metadata) => metadata,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[SOUND] Failed to inspect custom sound {}: {}",
+                            picked.display(),
+                            e
+                        );
+                        rfd::MessageDialog::new()
+                            .set_title("Cannot import custom sound")
+                            .set_description(format!("Could not read the selected file: {}", e))
+                            .set_level(rfd::MessageLevel::Error)
+                            .show();
+                        return false;
+                    }
+                };
+                if metadata.len() > crate::sound::MAX_CUSTOM_SOUND_BYTES {
                     tracing::warn!(
                         "[SOUND] Rejected custom sound (too large): {}",
                         picked.display()
                     );
+                    rfd::MessageDialog::new()
+                        .set_title("Custom sound is too large")
+                        .set_description(format!(
+                            "Choose a sound file that is {} MiB or smaller.",
+                            crate::sound::MAX_CUSTOM_SOUND_BYTES / (1024 * 1024)
+                        ))
+                        .set_level(rfd::MessageLevel::Warning)
+                        .show();
                 } else if let Some(dir) = custom_sounds_dir() {
                     if let Err(e) = fs::create_dir_all(&dir) {
                         tracing::warn!("[SOUND] Failed to create custom sounds dir: {}", e);
