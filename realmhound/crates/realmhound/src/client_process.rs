@@ -518,8 +518,7 @@ mod tests {
         }
     }
 
-    /// The scenario from the review: an older client that cannot be read must
-    /// not be masked by a newer one that can.
+    /// an older client that cannot be read must not be masked by a newer one that can.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_unreadable_client_is_not_reported_as_a_relaunch() {
@@ -543,8 +542,8 @@ mod tests {
         assert_eq!(resolve(None, false), ClientStart::NoneRunning);
     }
 
-    /// The other half of the rule: only a candidate that is *still there* counts
-    /// as unchecked, so a process that exited mid-scan cannot block the guard.
+    /// only a candidate that is *still there* counts as unchecked,
+    /// so a process that exited mid-scan cannot block the guard.
     #[cfg(target_os = "macos")]
     #[test]
     fn only_live_candidates_count_as_unchecked() {
