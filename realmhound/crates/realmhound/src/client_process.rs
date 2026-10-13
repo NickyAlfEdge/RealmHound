@@ -53,7 +53,7 @@ pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
 
 /// Unix timestamp (seconds) of the *earliest* creation time among all running
 /// RotMG client processes, identified by an active TCP connection to a game
-/// server (remote port 2050). `None` if no such connection/process is found.
+/// server (remote port 2050).
 ///
 /// This lets the guard detect a relaunch even when RealmHound was started
 /// mid-game and hasn't yet observed a Hello (which only arrives on connect or
@@ -64,8 +64,22 @@ pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
 /// the guard stays locked. It only reports a post-reset time when *every*
 /// running client started after the reset -- in which case the tracked main
 /// account, whichever client it is, must also have relaunched.
-pub fn earliest_rotmg_client_start_unix() -> Option<i64> {
+pub fn earliest_rotmg_client_start_unix() -> ClientStart {
     platform::earliest_client_start_unix()
+}
+
+/// What a scan of the running game clients could establish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientStart {
+    /// No running process holds a game-server connection.
+    NoneRunning,
+    /// Earliest creation time (Unix seconds) across every running client, all
+    /// of which could be read.
+    Earliest(i64),
+    /// A candidate could not be inspected. Its start time may well predate the
+    /// reset, so the scan proves nothing and must not stand in for a relaunch.
+    /// Only the macOS scan can tell this apart from "nothing is running".
+    Indeterminate,
 }
 
 /// The MIB and `libproc` port fields both store the port in network byte order
@@ -84,6 +98,7 @@ fn decode_addr(raw: u32) -> std::net::Ipv4Addr {
 
 #[cfg(not(any(windows, target_os = "macos")))]
 mod unsupported {
+    use super::ClientStart;
     use realmhound_core::stream::ConnectionKey;
 
     pub(super) fn owning_pid(_conn: &ConnectionKey) -> Option<u32> {
@@ -94,14 +109,14 @@ mod unsupported {
         None
     }
 
-    pub(super) fn earliest_client_start_unix() -> Option<i64> {
-        None
+    pub(super) fn earliest_client_start_unix() -> ClientStart {
+        ClientStart::NoneRunning
     }
 }
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{decode_addr, decode_port, filetime_to_unix_secs, GAME_SERVER_PORT};
+    use super::{decode_addr, decode_port, filetime_to_unix_secs, ClientStart, GAME_SERVER_PORT};
     use realmhound_core::stream::ConnectionKey;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -181,7 +196,15 @@ mod windows_impl {
     /// Earliest process creation time (Unix seconds) among all processes that
     /// currently own a TCP connection to a RotMG game server (remote port
     /// 2050).
-    pub(super) fn earliest_client_start_unix() -> Option<i64> {
+    ///
+    /// Never reports `Indeterminate`: the table lists TIME_WAIT sockets with an
+    /// owning pid of 0, which no process can answer for, so an unreadable pid is
+    /// not evidence of an unchecked client here the way it is on macOS.
+    pub(super) fn earliest_client_start_unix() -> ClientStart {
+        earliest_start().map_or(ClientStart::NoneRunning, ClientStart::Earliest)
+    }
+
+    fn earliest_start() -> Option<i64> {
         let pids: Vec<u32> = with_tcp_rows(|rows| {
             let mut pids: Vec<u32> = rows
                 .iter()
@@ -239,7 +262,7 @@ mod windows_impl {
 
 #[cfg(target_os = "macos")]
 mod macos_impl {
-    use super::{decode_addr, decode_port, GAME_SERVER_PORT};
+    use super::{decode_addr, decode_port, ClientStart, GAME_SERVER_PORT};
     use libproc::bsd_info::BSDInfo;
     use libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
     use libproc::net_info::{SocketFDInfo, SocketInfoKind};
@@ -252,52 +275,56 @@ mod macos_impl {
     const INI_IPV4: u8 = 0x1;
 
     /// The IPv4 TCP endpoints of a process's sockets, as (local, remote) pairs
-    /// of `(address, port)`.
+    /// of `(address, port)`, or `None` when the process cannot be inspected.
     ///
     /// macOS has no global socket table, so each process is asked for its own
-    /// descriptors. Processes owned by another user are not inspectable and are
-    /// skipped, which is fine: the game client runs as the same user we do.
-    fn tcp_endpoints(pid: u32) -> Vec<(std::net::Ipv4Addr, u16, std::net::Ipv4Addr, u16)> {
-        let Ok(info) = pidinfo::<BSDInfo>(pid as i32, 0) else {
-            return Vec::new();
-        };
-        let Ok(fds) = listpidinfo::<ListFDs>(pid as i32, info.pbi_nfiles as usize) else {
-            return Vec::new();
-        };
+    /// descriptors. An individual descriptor that cannot be read is skipped: it
+    /// closed between the listing and the query, and a live client never closes
+    /// the game-server socket it is playing on.
+    fn tcp_endpoints(pid: u32) -> Option<Vec<(std::net::Ipv4Addr, u16, std::net::Ipv4Addr, u16)>> {
+        let info = pidinfo::<BSDInfo>(pid as i32, 0).ok()?;
+        // `listpidinfo` reports an empty descriptor table as an error, so a
+        // process holding nothing open is answered without asking.
+        if info.pbi_nfiles == 0 {
+            return Some(Vec::new());
+        }
+        let fds = listpidinfo::<ListFDs>(pid as i32, info.pbi_nfiles as usize).ok()?;
 
-        fds.iter()
-            .filter(|fd| matches!(ProcFDType::from(fd.proc_fdtype), ProcFDType::Socket))
-            .filter_map(|fd| pidfdinfo::<SocketFDInfo>(pid as i32, fd.proc_fd).ok())
-            .filter(|socket| {
-                matches!(
-                    SocketInfoKind::from(socket.psi.soi_kind),
-                    SocketInfoKind::Tcp
-                )
-            })
-            .filter_map(|socket| {
-                // SAFETY: the union member is selected by `soi_kind`, which the
-                // filter above has already confirmed to be TCP.
-                let tcp = unsafe { socket.psi.soi_proto.pri_tcp };
-                let endpoint = tcp.tcpsi_ini;
-                if endpoint.insi_vflag & INI_IPV4 == 0 {
-                    return None;
-                }
-                // SAFETY: `insi_vflag` selects the v4 member of both unions,
-                // checked immediately above.
-                let (local, remote) = unsafe {
-                    (
-                        endpoint.insi_laddr.ina_46.i46a_addr4.s_addr,
-                        endpoint.insi_faddr.ina_46.i46a_addr4.s_addr,
+        Some(
+            fds.iter()
+                .filter(|fd| matches!(ProcFDType::from(fd.proc_fdtype), ProcFDType::Socket))
+                .filter_map(|fd| pidfdinfo::<SocketFDInfo>(pid as i32, fd.proc_fd).ok())
+                .filter(|socket| {
+                    matches!(
+                        SocketInfoKind::from(socket.psi.soi_kind),
+                        SocketInfoKind::Tcp
                     )
-                };
-                Some((
-                    decode_addr(local),
-                    decode_port(endpoint.insi_lport as u32),
-                    decode_addr(remote),
-                    decode_port(endpoint.insi_fport as u32),
-                ))
-            })
-            .collect()
+                })
+                .filter_map(|socket| {
+                    // SAFETY: the union member is selected by `soi_kind`, which the
+                    // filter above has already confirmed to be TCP.
+                    let tcp = unsafe { socket.psi.soi_proto.pri_tcp };
+                    let endpoint = tcp.tcpsi_ini;
+                    if endpoint.insi_vflag & INI_IPV4 == 0 {
+                        return None;
+                    }
+                    // SAFETY: `insi_vflag` selects the v4 member of both unions,
+                    // checked immediately above.
+                    let (local, remote) = unsafe {
+                        (
+                            endpoint.insi_laddr.ina_46.i46a_addr4.s_addr,
+                            endpoint.insi_faddr.ina_46.i46a_addr4.s_addr,
+                        )
+                    };
+                    Some((
+                        decode_addr(local),
+                        decode_port(endpoint.insi_lport as u32),
+                        decode_addr(remote),
+                        decode_port(endpoint.insi_fport as u32),
+                    ))
+                })
+                .collect(),
+        )
     }
 
     /// Find the PID owning the TCP connection matching `conn`.
@@ -309,14 +336,16 @@ mod macos_impl {
                 // Match the full 4-tuple for the same reason Windows does: on a
                 // multihomed or VPN host a different process may share the local
                 // port to the same remote via a different local address.
-                tcp_endpoints(pid).iter().any(
-                    |&(local_addr, local_port, remote_addr, remote_port)| {
-                        local_port == conn.client_port
-                            && local_addr == conn.client_ip
-                            && remote_port == conn.server_port
-                            && remote_addr == conn.server_ip
-                    },
-                )
+                tcp_endpoints(pid).is_some_and(|endpoints| {
+                    endpoints
+                        .iter()
+                        .any(|&(local_addr, local_port, remote_addr, remote_port)| {
+                            local_port == conn.client_port
+                                && local_addr == conn.client_ip
+                                && remote_port == conn.server_port
+                                && remote_addr == conn.server_ip
+                        })
+                })
             })
     }
 
@@ -329,18 +358,77 @@ mod macos_impl {
 
     /// Earliest process creation time (Unix seconds) among all processes that
     /// currently own a TCP connection to a RotMG game server.
-    pub(super) fn earliest_client_start_unix() -> Option<i64> {
-        pids_by_type(ProcFilter::All)
-            .ok()?
-            .into_iter()
-            .filter(|&pid| {
-                tcp_endpoints(pid)
-                    .iter()
-                    .any(|&(_, _, _, remote_port)| remote_port == GAME_SERVER_PORT)
-            })
-            .filter_map(process_creation_unix)
-            .filter(|&t| t > 0)
-            .min()
+    ///
+    /// Only this user's processes are considered: the game client runs as we do,
+    /// and another user's processes are not inspectable at all, so including
+    /// them would make every scan indeterminate. Within that set an unreadable
+    /// process is a candidate we failed to rule out, not one that isn't there.
+    pub(super) fn earliest_client_start_unix() -> ClientStart {
+        let uid = own_uid();
+        let Ok(pids) = pids_by_type(ProcFilter::ByUID { uid }) else {
+            return ClientStart::Indeterminate;
+        };
+
+        let mut earliest: Option<i64> = None;
+        let mut unreadable: Vec<u32> = Vec::new();
+        for pid in pids {
+            let Some(endpoints) = tcp_endpoints(pid) else {
+                unreadable.push(pid);
+                continue;
+            };
+            if !endpoints
+                .iter()
+                .any(|&(_, _, _, remote_port)| remote_port == GAME_SERVER_PORT)
+            {
+                continue;
+            }
+            match process_creation_unix(pid) {
+                Some(start) if start > 0 => {
+                    earliest = Some(earliest.map_or(start, |best: i64| best.min(start)))
+                }
+                None | Some(_) => unreadable.push(pid),
+            }
+        }
+
+        if any_still_running(&unreadable, uid) {
+            return ClientStart::Indeterminate;
+        }
+        resolve(earliest, false)
+    }
+
+    /// Decide the scan result from what the pass over the candidates found.
+    ///
+    /// `earliest` is the oldest start among the clients that could be read, and
+    /// `unchecked` whether a process we failed to inspect is still running. The
+    /// two are kept apart from the syscalls so the rule itself can be tested.
+    pub(super) fn resolve(earliest: Option<i64>, unchecked: bool) -> ClientStart {
+        if unchecked {
+            return ClientStart::Indeterminate;
+        }
+        earliest.map_or(ClientStart::NoneRunning, ClientStart::Earliest)
+    }
+
+    /// Whether any of `pids` is still listed. Most inspection failures are a
+    /// process that exited between the listing and the query, and a process
+    /// that is gone is not a client we failed to check.
+    pub(super) fn any_still_running(pids: &[u32], uid: u32) -> bool {
+        if pids.is_empty() {
+            return false;
+        }
+        match pids_by_type(ProcFilter::ByUID { uid }) {
+            Ok(live) => pids.iter().any(|pid| live.contains(pid)),
+            // Cannot tell any more; assume the candidates are still there.
+            Err(_) => true,
+        }
+    }
+
+    /// This process's effective user id, read through `libproc` so no separate
+    /// `libc` dependency is needed. `u32::MAX` matches no process, which keeps
+    /// an unreadable self indeterminate rather than silently "no clients".
+    pub(super) fn own_uid() -> u32 {
+        pidinfo::<BSDInfo>(std::process::id() as i32, 0)
+            .map(|info| info.pbi_uid)
+            .unwrap_or(u32::MAX)
     }
 }
 
@@ -420,12 +508,57 @@ mod tests {
     #[test]
     fn earliest_client_scan_does_not_panic() {
         // No RotMG client is expected in the test environment, so this is
-        // normally None; if some process happens to hold a :2050 connection the
-        // time must at least be plausible. Either way it must not panic or
-        // return a bogus value -- this exercises the shared scan on every
-        // platform, including the stub.
-        if let Some(t) = earliest_rotmg_client_start_unix() {
+        // normally NoneRunning; if some process happens to hold a :2050
+        // connection the time must at least be plausible, and a candidate we
+        // could not read must report Indeterminate rather than NoneRunning.
+        // Either way it must not panic or return a bogus value -- this exercises
+        // the shared scan on every platform, including the stub.
+        if let ClientStart::Earliest(t) = earliest_rotmg_client_start_unix() {
             assert!(t > 1_577_836_800, "scan returned implausible time: {t}");
         }
+    }
+
+    /// The scenario from the review: an older client that cannot be read must
+    /// not be masked by a newer one that can.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreadable_client_is_not_reported_as_a_relaunch() {
+        use super::macos_impl::resolve;
+
+        const YESTERDAY: i64 = 1_700_000_000;
+        const TODAY: i64 = 1_700_086_400;
+
+        // Client A started yesterday but is unreadable; client B started today
+        // and is readable. The minimum over the readable ones alone says
+        // "today", which is exactly what must not be believed.
+        assert_eq!(resolve(Some(TODAY), true), ClientStart::Indeterminate);
+
+        // Every candidate accounted for: the earliest start is trustworthy.
+        assert_eq!(
+            resolve(Some(YESTERDAY), false),
+            ClientStart::Earliest(YESTERDAY)
+        );
+
+        // Nothing running is a fact, not a gap in what we could check.
+        assert_eq!(resolve(None, false), ClientStart::NoneRunning);
+    }
+
+    /// The other half of the rule: only a candidate that is *still there* counts
+    /// as unchecked, so a process that exited mid-scan cannot block the guard.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_live_candidates_count_as_unchecked() {
+        use super::macos_impl::{any_still_running, own_uid};
+
+        let uid = own_uid();
+        assert!(!any_still_running(&[], uid), "nothing unreadable to weigh");
+        assert!(
+            any_still_running(&[std::process::id()], uid),
+            "this test process is running and owned by us"
+        );
+        assert!(
+            !any_still_running(&[u32::MAX], uid),
+            "a pid that does not exist is not a client we failed to check"
+        );
     }
 }
