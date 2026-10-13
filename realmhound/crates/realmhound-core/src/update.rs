@@ -473,16 +473,13 @@ impl SelfUpdater {
         let state = Arc::clone(&self.state);
         let new_exe_path = Arc::clone(&self.new_exe_path);
 
-        // macOS ships only the .app bundle, so a loose build has nothing to
-        // swap itself into. Checked after the manifest so a malformed entry is
-        // still reported the same way everywhere, but before the download.
+        // macOS ships only the .app bundle, so a loose or unwritable install
+        // has nothing it can swap itself into. Checked after the manifest so a
+        // malformed entry is still reported the same way everywhere, but before
+        // the download.
         #[cfg(target_os = "macos")]
-        if installed_bundle().is_none() {
-            *state.lock().unwrap() = SelfUpdateState::Failed(
-                "RealmHound can only update itself when run from RealmHound.app. \
-                 Download the latest release and replace your copy."
-                    .to_string(),
-            );
+        if let Some(blocker) = bundle_update_blocker() {
+            *state.lock().unwrap() = SelfUpdateState::Failed(blocker);
             return;
         }
 
@@ -573,6 +570,73 @@ fn bundle_root_of(exe: &std::path::Path) -> Option<std::path::PathBuf> {
 #[cfg(target_os = "macos")]
 pub fn installed_bundle() -> Option<std::path::PathBuf> {
     bundle_root_of(&std::env::current_exe().ok()?)
+}
+
+/// Why this install cannot replace itself, if it cannot.
+///
+/// Checked before downloading, so the user is told what to fix instead of
+/// spending a download on an update that could never be applied.
+#[cfg(target_os = "macos")]
+fn bundle_update_blocker() -> Option<String> {
+    let Some(bundle) = installed_bundle() else {
+        return Some(
+            "RealmHound can only update itself when run from RealmHound.app. \
+             Download the latest release and replace your copy."
+                .to_string(),
+        );
+    };
+    // Gatekeeper runs a quarantined bundle from a read-only copy at a random
+    // path, so the bundle we can see is not the one the user installed.
+    if bundle
+        .components()
+        .any(|part| part.as_os_str() == "AppTranslocation")
+    {
+        return Some(
+            "macOS is running RealmHound from a temporary read-only copy. Move \
+             RealmHound.app to Applications and open it from there."
+                .to_string(),
+        );
+    }
+    let parent = bundle.parent()?;
+    if !can_write_in(parent) {
+        return Some(format!(
+            "RealmHound.app is in {}, which this account cannot write to. Move \
+             it somewhere you can write to, or update it manually.",
+            parent.display()
+        ));
+    }
+    None
+}
+
+/// Whether this process can create files in `dir`. Probing is the only reliable
+/// answer on macOS, where ACLs and SIP both override the mode bits.
+#[cfg(target_os = "macos")]
+fn can_write_in(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".realmhound-update-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Phrase a filesystem failure during the swap so the user can act on it.
+#[cfg(target_os = "macos")]
+fn swap_error(path: &std::path::Path, error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => format!(
+            "No permission to replace {}. Move RealmHound.app somewhere you can \
+             write to, or update it manually.",
+            path.display()
+        ),
+        std::io::ErrorKind::NotFound => format!(
+            "{} is no longer where RealmHound expected it. Update it manually.",
+            path.display()
+        ),
+        _ => format!("Could not replace {}: {}", path.display(), error),
+    }
 }
 
 /// Where the downloaded artifact is written.
@@ -775,9 +839,24 @@ fn stage_bundle_swap_at(
     let old_path = sibling_with_suffix(bundle, ".old")
         .ok_or_else(|| "Cannot determine backup path".to_string())?;
 
+    // Everything below extracts and renames inside this directory, so check it
+    // once here rather than letting ditto or rename report a bare errno.
+    let parent = bundle.parent().unwrap_or(bundle);
+    if !parent.exists() {
+        return Err(swap_error(
+            bundle,
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+    }
+    if !can_write_in(parent) {
+        return Err(swap_error(
+            bundle,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+    }
+
     if staging.exists() {
-        std::fs::remove_dir_all(&staging)
-            .map_err(|e| format!("Cannot clear {}: {}", staging.display(), e))?;
+        std::fs::remove_dir_all(&staging).map_err(|e| swap_error(&staging, &e))?;
     }
     extract_archive(archive, &staging)?;
 
@@ -793,18 +872,16 @@ fn stage_bundle_swap_at(
     }
 
     if old_path.exists() {
-        std::fs::remove_dir_all(&old_path)
-            .map_err(|e| format!("Cannot remove old backup ({}): {}", old_path.display(), e))?;
+        std::fs::remove_dir_all(&old_path).map_err(|e| swap_error(&old_path, &e))?;
     }
 
     info!("Applying update: swapping {:?}", bundle);
 
-    std::fs::rename(bundle, &old_path)
-        .map_err(|e| format!("Failed to rename current bundle to .old: {}", e))?;
+    std::fs::rename(bundle, &old_path).map_err(|e| swap_error(bundle, &e))?;
 
     if let Err(e) = std::fs::rename(&extracted, bundle) {
         let _ = std::fs::rename(&old_path, bundle);
-        return Err(format!("Failed to rename new bundle into place: {}", e));
+        return Err(swap_error(bundle, &e));
     }
 
     Ok(StagedSwap {
@@ -1101,6 +1178,76 @@ mod tests {
             .status()
             .expect("ditto")
             .success());
+    }
+
+    /// A read-only install directory must be reported as something the user can
+    /// fix, not as a raw errno.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unwritable_install_is_explained_rather_than_attempted() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let install_dir = temp.path().join("Applications");
+        std::fs::create_dir(&install_dir).expect("mkdir");
+
+        let installed = install_dir.join(BUNDLE_NAME);
+        std::fs::create_dir_all(installed.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(installed.join(BUNDLE_EXE), b"old exe").expect("write exe");
+
+        let source = temp.path().join("source").join(BUNDLE_NAME);
+        std::fs::create_dir_all(source.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(source.join(BUNDLE_EXE), b"new exe").expect("write exe");
+        let archive = temp.path().join("update.zip");
+        zip_bundle(&source, &archive);
+
+        assert!(can_write_in(&install_dir), "writable before the chmod");
+        std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        assert!(
+            !can_write_in(&install_dir),
+            "a read-only directory must not look writable"
+        );
+
+        let error = stage_bundle_swap_at(&archive, &installed)
+            .map(|_| ())
+            .expect_err("swap must fail");
+        assert!(
+            error.contains("No permission to replace"),
+            "unhelpful error: {error}"
+        );
+        assert!(
+            !error.contains("os error"),
+            "raw errno leaked to the user: {error}"
+        );
+
+        // Leave the directory writable so the temp dir can be torn down.
+        std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        assert_eq!(
+            std::fs::read(installed.join(BUNDLE_EXE)).expect("exe"),
+            b"old exe",
+            "the install must survive a refused update"
+        );
+    }
+
+    /// A bundle that vanished between the check and the swap.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_missing_install_is_explained_rather_than_reported_as_an_errno() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        let source = temp.path().join("source").join(BUNDLE_NAME);
+        std::fs::create_dir_all(source.join("Contents/MacOS")).expect("mkdir");
+        std::fs::write(source.join(BUNDLE_EXE), b"new exe").expect("write exe");
+        let archive = temp.path().join("update.zip");
+        zip_bundle(&source, &archive);
+
+        let absent = temp.path().join("gone").join(BUNDLE_NAME);
+        let error = stage_bundle_swap_at(&archive, &absent)
+            .map(|_| ())
+            .expect_err("swap must fail");
+        assert!(!error.contains("os error"), "raw errno leaked: {error}");
     }
 
     #[cfg(target_os = "macos")]
