@@ -36,6 +36,9 @@ enum Claim {
     /// Another RealmHound instance holds the claim.
     AlreadyRunning,
     /// The claim could not be evaluated -- permissions, filesystem, OS error.
+    /// Only the lock-file platforms produce this; the Windows mutex starts the
+    /// app anyway when it cannot be created.
+    #[cfg_attr(windows, allow(dead_code))]
     Failed(String),
 }
 
