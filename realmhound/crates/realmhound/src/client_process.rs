@@ -68,9 +68,14 @@ pub fn connection_process_start_unix(_conn: &ConnectionKey) -> Option<i64> {
 /// the guard stays locked. It only reports a post-reset time when *every*
 /// running client started after the reset -- in which case the tracked main
 /// account, whichever client it is, must also have relaunched.
+///
+/// Windows never reports `Indeterminate`: the table lists TIME_WAIT sockets
+/// owned by pid 0, which no process can answer for, so an unreadable pid is not
+/// evidence of an unchecked client the way it is on macOS.
 #[cfg(windows)]
 pub fn earliest_rotmg_client_start_unix() -> ClientStart {
     windows_impl::earliest_client_start_unix()
+        .map_or(ClientStart::NoneRunning, ClientStart::Earliest)
 }
 
 #[cfg(target_os = "macos")]
@@ -122,7 +127,7 @@ fn decode_addr(raw: u32) -> std::net::Ipv4Addr {
 
 #[cfg(windows)]
 mod windows_impl {
-    use super::{decode_addr, decode_port, filetime_to_unix_secs, ClientStart, GAME_SERVER_PORT};
+    use super::{decode_addr, decode_port, filetime_to_unix_secs, GAME_SERVER_PORT};
     use realmhound_core::stream::ConnectionKey;
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -202,15 +207,7 @@ mod windows_impl {
     /// Earliest process creation time (Unix seconds) among all processes that
     /// currently own a TCP connection to a RotMG game server (remote port
     /// 2050).
-    ///
-    /// Never reports `Indeterminate`: the table lists TIME_WAIT sockets with an
-    /// owning pid of 0, which no process can answer for, so an unreadable pid is
-    /// not evidence of an unchecked client here the way it is on macOS.
-    pub(super) fn earliest_client_start_unix() -> ClientStart {
-        earliest_start().map_or(ClientStart::NoneRunning, ClientStart::Earliest)
-    }
-
-    fn earliest_start() -> Option<i64> {
+    pub(super) fn earliest_client_start_unix() -> Option<i64> {
         let pids: Vec<u32> = with_tcp_rows(|rows| {
             let mut pids: Vec<u32> = rows
                 .iter()
