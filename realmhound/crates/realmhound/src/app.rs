@@ -138,7 +138,23 @@ fn open_in_file_explorer(path: &std::path::Path) {
 }
 
 #[cfg(not(windows))]
-fn open_in_file_explorer(_path: &std::path::Path) {}
+fn open_in_file_explorer(path: &std::path::Path) {
+    // `open` on macOS and `xdg-open` on every other Unix desktop are the
+    // standard "hand this to the user's file manager" entry points, and both
+    // return immediately rather than blocking on the spawned browser.
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+
+    if let Err(error) = std::process::Command::new(opener).arg(path).spawn() {
+        tracing::warn!(
+            "[UI] Could not open {} with {opener}: {error}",
+            path.display()
+        );
+    }
+}
 
 /// Roman-numeral label (I-IV) for an enchantment tier number 1-4.
 fn roman_tier(tier: u8) -> &'static str {
@@ -1466,17 +1482,24 @@ impl RealmHoundApp {
     /// Surface a fatal relaunch failure and quit; the worker is already stopped.
     fn abort_relaunch(&self, reason: &str) {
         tracing::error!("[RELAUNCH] aborted: {reason}");
+        let message = format!("Restart failed and RealmHound must close:\n\n{reason}");
         #[cfg(windows)]
         {
             use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
             let title: Vec<u16> = "RealmHound\0".encode_utf16().collect();
-            let msg: Vec<u16> = format!("Restart failed and RealmHound must close:\n\n{reason}\0")
-                .encode_utf16()
-                .collect();
+            let msg: Vec<u16> = format!("{message}\0").encode_utf16().collect();
             unsafe {
                 MessageBoxW(0, msg.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
             }
         }
+        // The window is already gone by this point, so without a dialog the exit
+        // would look like a silent crash.
+        #[cfg(not(windows))]
+        rfd::MessageDialog::new()
+            .set_title("RealmHound")
+            .set_description(&message)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
         std::process::exit(1);
     }
 
@@ -1581,12 +1604,9 @@ impl RealmHoundApp {
             match write {
                 crate::panels::live_feed::ClipboardWrite::Copy(text) => ctx.copy_text(text),
                 crate::panels::live_feed::ClipboardWrite::ClearIfUnchanged(copied) => {
-                    // Only drop the callout this panel copied. If the clipboard
-                    // holds anything else, the user copied something in the
-                    // meantime and it stays untouched.
-                    if crate::clipboard::still_holds(&copied) {
-                        ctx.copy_text(String::new());
-                    }
+                    // Checked and cleared in one clipboard session, so anything
+                    // the user copies meanwhile cannot be caught in between.
+                    crate::clipboard::clear_if_ours(&copied);
                 }
             }
         }
@@ -1877,7 +1897,7 @@ impl RealmHoundApp {
             .and_then(|conn| crate::client_process::connection_process_start_unix(&conn))
             .filter(|&s| s > 0)
             .or_else(|| {
-                crate::client_process::earliest_rotmg_client_start_unix().filter(|&s| s > 0)
+                crate::client_process::earliest_rotmg_client_start_unix().confirmed_start()
             });
         let Some(start) = start else {
             return;
@@ -2108,8 +2128,7 @@ impl RealmHoundApp {
                                             .clicked()
                                         {
                                             self.self_updater.start_download(
-                                                manifest.download_url.clone(),
-                                                manifest.sha256.clone(),
+                                                manifest.artifact_for_this_platform(),
                                             );
                                         }
                                     }
