@@ -1604,12 +1604,9 @@ impl RealmHoundApp {
             match write {
                 crate::panels::live_feed::ClipboardWrite::Copy(text) => ctx.copy_text(text),
                 crate::panels::live_feed::ClipboardWrite::ClearIfUnchanged(copied) => {
-                    // Only drop the callout this panel copied. If the clipboard
-                    // holds anything else, the user copied something in the
-                    // meantime and it stays untouched.
-                    if crate::clipboard::still_holds(&copied) {
-                        ctx.copy_text(String::new());
-                    }
+                    // Checked and cleared in one clipboard session, so anything
+                    // the user copies meanwhile cannot be caught in between.
+                    crate::clipboard::clear_if_ours(&copied);
                 }
             }
         }
