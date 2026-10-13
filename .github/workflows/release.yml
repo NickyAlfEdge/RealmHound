@@ -87,10 +87,9 @@ jobs:
         run: |
           set -euo pipefail
           # A bare Mach-O cannot carry an icon, so Finder shows the generic
-          # executable icon and a double-click opens Terminal. Ship the same
-          # universal binary inside a bundle as well, for the icon and a plain
-          # double-click launch. ditto (not zip) keeps the bundle's permissions
-          # and ad-hoc signature intact.
+          # executable icon and a double-click opens Terminal. The bundle is
+          # the only macOS artifact released. ditto (not zip) keeps the
+          # bundle's permissions and ad-hoc signature intact.
           bash tools/macos/make-app-bundle.sh \
             realmhound/target/release/RealmHound-macos \
             realmhound/target/release
@@ -124,7 +123,6 @@ jobs:
         with:
           name: macos-binary
           path: |
-            realmhound/target/release/RealmHound-macos
             realmhound/target/release/RealmHound-macos-app.zip
           if-no-files-found: error
           retention-days: 1
@@ -288,15 +286,11 @@ jobs:
           "$hash  RealmHound.exe" | Set-Content "realmhound/target/release/RealmHound.exe.sha256"
           "SHA256=$hash" >> $env:GITHUB_OUTPUT
 
-          $macos = "realmhound/target/release/RealmHound-macos"
-          $macosHash = (Get-FileHash -Algorithm SHA256 $macos).Hash.ToLowerInvariant()
-          "$macosHash  RealmHound-macos" | Set-Content "realmhound/target/release/RealmHound-macos.sha256"
-          "MACOS_SHA256=$macosHash" >> $env:GITHUB_OUTPUT
-
           $macosApp = "realmhound/target/release/RealmHound-macos-app.zip"
           $macosAppHash = (Get-FileHash -Algorithm SHA256 $macosApp).Hash.ToLowerInvariant()
           "$macosAppHash  RealmHound-macos-app.zip" |
             Set-Content "realmhound/target/release/RealmHound-macos-app.zip.sha256"
+          "MACOS_SHA256=$macosAppHash" >> $env:GITHUB_OUTPUT
 
       - name: Create GitHub release
         if: github.event_name == 'push' && github.event.repository.private == false
@@ -308,8 +302,6 @@ jobs:
           files: |
             realmhound/target/release/RealmHound.exe
             realmhound/target/release/RealmHound.exe.sha256
-            realmhound/target/release/RealmHound-macos
-            realmhound/target/release/RealmHound-macos.sha256
             realmhound/target/release/RealmHound-macos-app.zip
             realmhound/target/release/RealmHound-macos-app.zip.sha256
             LICENSE
@@ -340,7 +332,7 @@ jobs:
               `/releases/download/${process.env.GITHUB_REF_NAME}/RealmHound.exe`;
             const macosDownloadUrl =
               `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}` +
-              `/releases/download/${process.env.GITHUB_REF_NAME}/RealmHound-macos`;
+              `/releases/download/${process.env.GITHUB_REF_NAME}/RealmHound-macos-app.zip`;
 
             const gist = await github.rest.gists.get({ gist_id: gistId });
             const manifest = JSON.parse(gist.data.files['version.json'].content);

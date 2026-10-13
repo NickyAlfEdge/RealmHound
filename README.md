@@ -51,18 +51,17 @@ Releases ship a build for each platform:
 | Platform | Download | Notes |
 | --- | --- | --- |
 | Windows | `RealmHound.exe` | Download and run it. |
-| macOS | `RealmHound-macos-app.zip` | Universal (Apple Silicon and Intel). Unzip and drag `RealmHound.app` to Applications. Recommended: it carries the RealmHound icon and opens on a double-click. |
-| macOS | `RealmHound-macos` | The same universal binary, unwrapped, for running from a terminal. Run `chmod +x RealmHound-macos` before the first launch. |
+| macOS | `RealmHound-macos-app.zip` | Universal (Apple Silicon and Intel). Unzip and drag `RealmHound.app` to Applications. |
 
 macOS quarantines anything downloaded through a browser, so the first launch is
 blocked with "cannot be opened because the developer cannot be verified". Clear
-it once with `xattr -dr com.apple.quarantine RealmHound.app` (or
-`RealmHound-macos`), or right-click in Finder and choose **Open**. Updates
-applied from inside the app are not quarantined and need neither step.
+it once with `xattr -dr com.apple.quarantine RealmHound.app`, or right-click in
+Finder and choose **Open**. Updates applied from inside the app are not
+quarantined and need neither step.
 
-The in-app updater works with either download: it replaces the executable in
-place, which inside the bundle is `RealmHound.app/Contents/MacOS/RealmHound`, so
-the icon survives an update.
+The in-app updater replaces the whole `RealmHound.app`, so the icon, `Info.plist`
+and signature always match the version you are running. It updates only a copy
+running from `RealmHound.app`; a binary built from source has to be rebuilt.
 
 ## Requirements
 

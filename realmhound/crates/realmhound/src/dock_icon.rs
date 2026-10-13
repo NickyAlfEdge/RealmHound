@@ -1,14 +1,14 @@
 //! Dock icon for the plain-binary macOS build.
 //!
-//! macOS reads an application icon from a bundle's `Info.plist`, which the bare
-//! Mach-O published as `RealmHound-macos` does not have, so it lands in the Dock
+//! macOS reads an application icon from a bundle's `Info.plist`, which a bare
+//! Mach-O built straight from source does not have, so it lands in the Dock
 //! and the app switcher wearing the generic executable icon. There is no Mach-O
 //! equivalent of the Windows resource icon `build.rs` embeds, but a running
 //! process may override its own Dock tile, so do that instead.
 //!
-//! `tools/macos/make-app-bundle.sh` builds a real bundle around the same
-//! `icon.icns`, and its icon is visible in Finder before launch, so this module
-//! stands aside for it.
+//! `tools/macos/make-app-bundle.sh` builds the real bundle that releases ship
+//! around the same `icon.icns`, and its icon is visible in Finder before
+//! launch, so this module stands aside for it.
 
 use objc2::rc::Retained;
 use objc2::{AnyThread, MainThreadMarker};

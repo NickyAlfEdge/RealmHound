@@ -3,12 +3,12 @@
 # Assemble RealmHound.app around an already-built macOS binary.
 #
 # A bare Mach-O has nowhere to carry an icon, so Finder shows it as a generic
-# executable and double-clicking it opens Terminal. Wrapping the very same
-# universal binary in a bundle gives it the RealmHound icon, a real Dock entry,
-# and a plain double-click launch.
+# executable and double-clicking it opens Terminal. Wrapping the universal
+# binary in a bundle gives it the RealmHound icon, a real Dock entry, and a
+# plain double-click launch. The bundle is the only macOS artifact released.
 #
-# The self-updater is unaffected: it rewrites `current_exe()`, which inside a
-# bundle is Contents/MacOS/RealmHound, leaving Info.plist and the icon in place.
+# The self-updater replaces this whole directory, so Info.plist and the icon are
+# always the ones that shipped with the running executable.
 #
 # Usage: tools/macos/make-app-bundle.sh <binary> <output-directory>
 
