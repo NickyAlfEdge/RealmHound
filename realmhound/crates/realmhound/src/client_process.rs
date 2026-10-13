@@ -20,16 +20,8 @@ use realmhound_core::stream::ConnectionKey;
 /// install -- talks to the world server on this port, and effectively nothing
 /// else on the machine connects out to it, so it reliably marks a socket as
 /// belonging to a RotMG client without matching any file name.
+#[cfg(any(windows, target_os = "macos"))]
 const GAME_SERVER_PORT: u16 = 2050;
-
-#[cfg(windows)]
-use windows_impl as platform;
-
-#[cfg(target_os = "macos")]
-use macos_impl as platform;
-
-#[cfg(not(any(windows, target_os = "macos")))]
-use unsupported as platform;
 
 /// Convert a Windows `FILETIME` (100-ns intervals since 1601-01-01 UTC, split
 /// into low/high 32-bit halves) to a Unix timestamp in seconds.
@@ -46,9 +38,21 @@ pub(crate) fn filetime_to_unix_secs(low: u32, high: u32) -> i64 {
 /// given main game-client connection, or `None` if it can't be determined
 /// (connection not found in the OS tables, access denied, or the process exited
 /// between the two lookups).
+#[cfg(windows)]
 pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
-    let pid = platform::owning_pid(conn)?;
-    platform::process_creation_unix(pid)
+    let pid = windows_impl::owning_pid(conn)?;
+    windows_impl::process_creation_unix(pid)
+}
+
+#[cfg(target_os = "macos")]
+pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
+    let pid = macos_impl::owning_pid(conn)?;
+    macos_impl::process_creation_unix(pid)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn connection_process_start_unix(_conn: &ConnectionKey) -> Option<i64> {
+    None
 }
 
 /// Unix timestamp (seconds) of the *earliest* creation time among all running
@@ -64,8 +68,19 @@ pub fn connection_process_start_unix(conn: &ConnectionKey) -> Option<i64> {
 /// the guard stays locked. It only reports a post-reset time when *every*
 /// running client started after the reset -- in which case the tracked main
 /// account, whichever client it is, must also have relaunched.
+#[cfg(windows)]
 pub fn earliest_rotmg_client_start_unix() -> ClientStart {
-    platform::earliest_client_start_unix()
+    windows_impl::earliest_client_start_unix()
+}
+
+#[cfg(target_os = "macos")]
+pub fn earliest_rotmg_client_start_unix() -> ClientStart {
+    macos_impl::earliest_client_start_unix()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn earliest_rotmg_client_start_unix() -> ClientStart {
+    ClientStart::NoneRunning
 }
 
 /// What a scan of the running game clients could establish.
@@ -78,13 +93,11 @@ pub enum ClientStart {
     Earliest(i64),
     /// A candidate could not be inspected. Its start time may well predate the
     /// reset, so the scan proves nothing and must not stand in for a relaunch.
-    /// Only the macOS scan can tell this apart from "nothing is running".
     Indeterminate,
 }
 
 impl ClientStart {
-    /// The start time only when every running client was accounted for. Neither
-    /// "nothing running" nor "could not check a client" proves a relaunch.
+    /// The start time only when every running client was accounted for.
     pub fn confirmed_start(self) -> Option<i64> {
         match self {
             ClientStart::Earliest(start) if start > 0 => Some(start),
@@ -105,24 +118,6 @@ fn decode_port(raw: u32) -> u16 {
 #[cfg(any(windows, target_os = "macos"))]
 fn decode_addr(raw: u32) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::from(raw.to_ne_bytes())
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-mod unsupported {
-    use super::ClientStart;
-    use realmhound_core::stream::ConnectionKey;
-
-    pub(super) fn owning_pid(_conn: &ConnectionKey) -> Option<u32> {
-        None
-    }
-
-    pub(super) fn process_creation_unix(_pid: u32) -> Option<i64> {
-        None
-    }
-
-    pub(super) fn earliest_client_start_unix() -> ClientStart {
-        ClientStart::NoneRunning
-    }
 }
 
 #[cfg(windows)]
@@ -468,15 +463,19 @@ mod tests {
         assert_eq!(filetime_to_unix_secs(low, high), 1_609_459_200);
     }
 
+    #[cfg(target_os = "macos")]
+    use super::macos_impl::{owning_pid, process_creation_unix};
     /// The remaining tests exercise the real platform lookups (table/descriptor
     /// parse, port and address decoding, process start time) against a live
     /// loopback socket and this test process, so struct-layout, byte-order and
     /// field-offset bugs surface at runtime rather than in the field.
+    #[cfg(windows)]
+    use super::windows_impl::{owning_pid, process_creation_unix};
+
     #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn resolves_own_process_creation_time() {
-        let start =
-            platform::process_creation_unix(std::process::id()).expect("own process start time");
+        let start = process_creation_unix(std::process::id()).expect("own process start time");
         // Plausible: after 2020-01-01 and not in the future.
         assert!(start > 1_577_836_800, "start too old: {start}");
         assert!(
@@ -508,7 +507,7 @@ mod tests {
         );
 
         assert_eq!(
-            platform::owning_pid(&conn),
+            owning_pid(&conn),
             Some(std::process::id()),
             "loopback connection should be owned by this test process"
         );
