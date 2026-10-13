@@ -1896,14 +1896,9 @@ impl RealmHoundApp {
             .main_connection
             .and_then(|conn| crate::client_process::connection_process_start_unix(&conn))
             .filter(|&s| s > 0)
-            .or_else(
-                || match crate::client_process::earliest_rotmg_client_start_unix() {
-                    crate::client_process::ClientStart::Earliest(s) if s > 0 => Some(s),
-                    // Neither "nothing running" nor "could not check a client"
-                    // is proof of a relaunch.
-                    _ => None,
-                },
-            );
+            .or_else(|| {
+                crate::client_process::earliest_rotmg_client_start_unix().confirmed_start()
+            });
         let Some(start) = start else {
             return;
         };

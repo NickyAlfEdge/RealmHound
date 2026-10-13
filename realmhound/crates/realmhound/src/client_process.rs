@@ -82,6 +82,17 @@ pub enum ClientStart {
     Indeterminate,
 }
 
+impl ClientStart {
+    /// The start time only when every running client was accounted for. Neither
+    /// "nothing running" nor "could not check a client" proves a relaunch.
+    pub fn confirmed_start(self) -> Option<i64> {
+        match self {
+            ClientStart::Earliest(start) if start > 0 => Some(start),
+            _ => None,
+        }
+    }
+}
+
 /// The MIB and `libproc` port fields both store the port in network byte order
 /// in the low 16 bits; decode to a host-order `u16`.
 #[cfg(any(windows, target_os = "macos"))]
@@ -516,6 +527,20 @@ mod tests {
         if let ClientStart::Earliest(t) = earliest_rotmg_client_start_unix() {
             assert!(t > 1_577_836_800, "scan returned implausible time: {t}");
         }
+    }
+
+    /// Only a fully accounted-for scan yields a start time to the caller.
+    #[test]
+    fn only_a_complete_scan_confirms_a_start_time() {
+        assert_eq!(
+            ClientStart::Earliest(1_700_000_000).confirmed_start(),
+            Some(1_700_000_000)
+        );
+        assert_eq!(ClientStart::NoneRunning.confirmed_start(), None);
+        assert_eq!(ClientStart::Indeterminate.confirmed_start(), None);
+        // An implausible timestamp is no better than no answer.
+        assert_eq!(ClientStart::Earliest(0).confirmed_start(), None);
+        assert_eq!(ClientStart::Earliest(-1).confirmed_start(), None);
     }
 
     /// an older client that cannot be read must not be masked by a newer one that can.
