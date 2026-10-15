@@ -46,3 +46,6 @@ realmhound/crates/realmhound/assets/sounds/events/veteran.mp3
 tools/realmeye-scraper/.cache/
 tools/macos/build-universal.sh
 __pycache__/
+
+# Build scripts
+tools/macos/build-universal.sh

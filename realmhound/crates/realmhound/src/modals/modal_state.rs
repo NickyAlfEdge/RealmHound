@@ -19,6 +19,7 @@ pub enum SettingsCategory {
     CombatHistory,
     WidgetBar,
     Taskbar,
+    Overlays,
 }
 
 impl SettingsCategory {
@@ -36,6 +37,7 @@ impl SettingsCategory {
             SettingsCategory::CombatHistory => "combat_history",
             SettingsCategory::WidgetBar => "widget_bar",
             SettingsCategory::Taskbar => "taskbar",
+            SettingsCategory::Overlays => "overlays",
         }
     }
 
@@ -52,6 +54,7 @@ impl SettingsCategory {
             "combat_history" => SettingsCategory::CombatHistory,
             "widget_bar" => SettingsCategory::WidgetBar,
             "taskbar" => SettingsCategory::Taskbar,
+            "overlays" => SettingsCategory::Overlays,
             _ => SettingsCategory::Loot,
         }
     }

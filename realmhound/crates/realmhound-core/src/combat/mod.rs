@@ -26,5 +26,5 @@ pub use manager::CombatManager;
 pub use tracker::{is_groupable_dungeon, normalize_dungeon, sanitize_player_name, CombatTracker};
 pub use types::{
     CompletedFight, DamageProvenance, DamageTakenProvenance, FightParticipant, FightSelection,
-    ParticipantEndStatus, PetInfo,
+    LiveFightSnapshot, ParticipantEndStatus, PetInfo,
 };
