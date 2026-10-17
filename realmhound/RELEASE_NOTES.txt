@@ -1,39 +1,46 @@
+# Platform
+* Added macOS support.
+
 # Combat History
-- A fight's stats now show the Blood Ritual and Crucible state saved with the fight -- taken while it was fought -- instead of whatever is active when you open the card, and the pet on the card is the pet itself (its name and sprite) rather than a placeholder, saved the same way.
-- Fixed a pet or summon whose damage was credited to the wrong ability, and named the item that created a summon in the row.
-- Your own weapon damage in a fight now includes your Class Mastery and the seasonal Crucible / Blood Ritual damage bonuses, so a fight you solo no longer under-reports the damage you did.
-- Pet and summon damage the game credits to you is now split out in My Performance: a pet's hits appear on the pet's own row, and damage from a creature an ability spawns (a Flowering Kimono's spirits, a Summoner mace's bear) appears on that creature's row with its sprite and the item it came from, instead of being left unattributed.
-- In a group fight, a teammate's pet standing beside you no longer claims your damage as its own; only a pet of your own can be credited with what the server reports to you.
-- Damage a dungeon mechanic deals to the boss for you is now listed: barrels pushed into a Parasite Chambers boss (or the Galleon's cannonballs) appear in "Pets, Summons and other sources" with the object's own name and sprite, instead of going unlisted.
-- Fixed the theoretical pet DPS readout: Savage was credited damage it does not deal, and the close / mid / far attack abilities were attributed to the wrong ones.
-- Fixed some bosses sometimes incorrectly marked as Escaped when they were actually completed.
-- Fight cards completed by a loot update now update in place instead of showing as Escaped until a reload.
-- Fixed MV still marked as completed sometimes when the player nexused.
-- A player who dies in a fight is no longer shown as having nexused, even when the death is announced just after the fight was recorded, and clustered deaths now claim their own gravestone.
-- Dead characters now show their last-seen skin and dyes across Combat History and Loot History, including the character filter pill.
+* New My Performance tab breaks down everything that contributed to your damage, with your stats and gear saved at the time of the fight.
+* Fixed bosses sometimes shown as escaped even though their loot confirmed the kill.
+* Fixed a stale local nexus marker on a fight completed by loot.
+* The escape and nexus marker now applies only to the section it belongs to.
+* Fixed dead allies being recorded as Escaped instead of Dead.
+* Dead characters now show their last seen skin and dyes in Combat History and Loot History.
 
-# Taskbar & Missions
-- Advanced dungeon variants no longer advance the base dungeon's mission.
-- Multi-dungeon mark quests now fuse with matching missions when a dungeon overlaps.
-- Two quests that share a dungeon now share a single pill.
-- Improved tooltips for missions with multiple dungeons.
-- Fixed character-exclusive missions to work correctly for Druid.
-- After a season rollover, locked missions are no longer listed as "In progress".
-- Repeatable missions that came off cooldown no longer show as "Locked", and the missions behind them stay unlocked once completed.
-- The season and battlepass countdowns now use the game's authoritative dates instead of estimating.
-- Fixed dungeon callouts with dungeon names set to "none" to work with the auto copy-to-clipboard feature.
+# Damage Tracking
+* Fixed items scaled by Vitality or Speed not counting toward your damage.
+* Fixed ability damage sometimes being credited to the wrong ability after using another one.
+* Fixed your own damage not including damage multipliers.
+* Fixed longbows disabling damage tracking for the rest of the map.
+* Fixed theoretical DPS calc crediting Savage with damage.
 
-# Trophy Hall
-- Legacy dungeons now have their retro collections, with a "Legacy Dungeons" filter.
-- Redesigned the dungeon page with a header and a navigation row.
-- The icon view shows per-dungeon collection completion with keyboard navigation.
-- RealmShark imports now merge into RealmHound's dungeon rows by name instead of only matching identical spellings.
+# Character and Stats
+* Fixed Season 31 Crucible bonuses not applying on the Character Stats page.
+* Fixed stale Crucible markers from the previous season on characters.
+* Added Blood Ritual to the Character Stats page and to your own damage in Combat History.
+* Redesigned character cards to show Blood Ritual and Crucible tags and bonuses alongside stats.
+* Fixed the Legacy dungeon completion counter mapping on the Character Stats page.
 
-# Items
-- New OWNED pill on item tooltips for blueprints, character skins, emotes and pet skins.
+# Loot and History
+* Fixed loot boost timer display in character cards.
+* Fixed reskinned Janus bags not linking to the fight where that Janus was killed.
+* Reskinned Stone Guardians and Janus are now correctly labeled as Oryx's Castle and grouped into one card.
+* Unified reskinned Realm encounters with their original variants in search and filters, so both names find them and the sprite matches the current live variant.
+* Reskinned Oryx the Mad God 1 and 2 now map to Oryx's Chamber and Wine Cellar.
+
+# Live Feed
+* Added proximity-based Mysterious Crystal and Spectral Jailer entries to the Live Feed, with optional event sounds.
+
+# Missions
+* Repeatable missions that come off cooldown return to In Progress, and missions behind them stay unlocked.
+
+# Sounds and Debug
+* Raised the custom sound file limit to 15 MiB and added a warning when a file is too large.
+* Added Shiny white bag, Shiny teal bag, and Shiny pet skins toggles under Settings->Sound->Loot bags, off by default.
+* Added a Debug tab with a .rhcap recording toggle for testing purposes.
+* Added app resolution settings for reproducing layout issues.
 
 # Fixes
-- Packet captures (`.rhcap`) no longer record the client's `Hello` frame: it carries your session ticket, and a capture is readable by anyone holding the file, so it is dropped before it reaches the disk. The server's frames are kept, so a capture still replays.
-- Fixed gift-chest live updates in the Vault.
-- The Season 31 shinies are wired into their dungeon collections.
-- Weapon fire-rate enchantments now count toward the theoretical DPS readout.
+* Security enhancements related to API requests.
