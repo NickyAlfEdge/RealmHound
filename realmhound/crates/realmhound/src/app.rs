@@ -1645,7 +1645,34 @@ impl RealmHoundApp {
             }
             UiPayload::BossCall { boss_id, text } => {
                 let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                self.maybe_play_realm_event(boss_id, &text, should_sound);
+                self.maybe_play_realm_event(boss_id, &text, should_sound, None);
+            }
+            UiPayload::RealmDiscovery(event) => {
+                use crate::processing::realm_discovery::{
+                    DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE,
+                };
+
+                let notification = match &event {
+                    DiscoveryEvent::Discovered {
+                        object_id,
+                        object_type: JAILER_TYPE,
+                        notify,
+                        ..
+                    } => Some((JAILER_TYPE, "Spectral Jailer", *notify, Some(*object_id))),
+                    DiscoveryEvent::Discovered {
+                        object_type: CRYSTAL_TYPE,
+                        notify,
+                        ..
+                    }
+                    | DiscoveryEvent::CrystalMessage { notify, .. } => {
+                        Some((CRYSTAL_TYPE, "Mysterious Crystal", *notify, None))
+                    }
+                    _ => None,
+                };
+                self.live_feed_panel.apply_realm_discovery(event);
+                if let Some((boss_id, name, notify, instance_id)) = notification {
+                    self.maybe_play_realm_event(boss_id, name, notify, instance_id);
+                }
             }
             UiPayload::KeyperEvent { towers } => {
                 use realmhound_core::keyper::{KEYPER_BOSS_ID, KEYPER_TOWER_SPRITE_ID};
@@ -1660,7 +1687,7 @@ impl RealmHoundApp {
                 let should_sound = self
                     .live_feed_panel
                     .push_boss_call(boss_id, name.to_string());
-                self.maybe_play_realm_event(boss_id, name, should_sound);
+                self.maybe_play_realm_event(boss_id, name, should_sound, None);
             }
             UiPayload::RealmClosed => {
                 use crate::panels::live_feed::WarningSeverity;
@@ -5466,6 +5493,7 @@ impl RealmHoundApp {
                     self.audio_tx.send(AudioCommand::PlayEvent {
                         sound: ENCHANT_SOUND,
                         custom_key: format!("enchant:{}:default", prefix),
+                        instance_id: None,
                         volume: section.default_volume,
                     });
                 }
@@ -5576,6 +5604,7 @@ impl RealmHoundApp {
                             self.audio_tx.send(AudioCommand::PlayEvent {
                                 sound: ENCHANT_SOUND,
                                 custom_key: key.clone(),
+                                instance_id: None,
                                 volume: entry.volume,
                             });
                         }
@@ -6148,6 +6177,7 @@ impl RealmHoundApp {
                     self.audio_tx.send(AudioCommand::PlayEvent {
                         sound: default_sound,
                         custom_key: format!("event:{}:default", prefix),
+                        instance_id: None,
                         volume: section.default_volume,
                     });
                 }
@@ -6226,6 +6256,7 @@ impl RealmHoundApp {
                             self.audio_tx.send(AudioCommand::PlayEvent {
                                 sound: default_sound,
                                 custom_key: key.clone(),
+                                instance_id: None,
                                 volume: ov.volume,
                             });
                         }
@@ -6354,6 +6385,7 @@ impl RealmHoundApp {
                         self.audio_tx.send(AudioCommand::PlayEvent {
                             sound,
                             custom_key: key.to_string(),
+                            instance_id: None,
                             volume: *volume,
                         });
                     }
@@ -6378,7 +6410,13 @@ impl RealmHoundApp {
 
     /// Play a realm-event notification sound for a Live Feed boss call, if the
     /// matching section is enabled (see [`crate::realm_event_sound`]).
-    fn maybe_play_realm_event(&self, boss_id: i32, text: &str, should_sound: bool) {
+    fn maybe_play_realm_event(
+        &self,
+        boss_id: i32,
+        text: &str,
+        should_sound: bool,
+        instance_id: Option<i32>,
+    ) {
         let (events, custom_sounds, log_events) = match self.settings.read() {
             Ok(s) => (
                 s.sound.realm_events.clone(),
@@ -6403,6 +6441,7 @@ impl RealmHoundApp {
                 self.audio_tx.send(AudioCommand::PlayEvent {
                     sound: t.sound,
                     custom_key: t.custom_key,
+                    instance_id,
                     volume: t.volume,
                 });
             }
@@ -9363,7 +9402,7 @@ impl RealmHoundApp {
                 }
                 AppAction::PushBossCall { boss_id, text } => {
                     let should_sound = self.live_feed_panel.push_boss_call(boss_id, text.clone());
-                    self.maybe_play_realm_event(boss_id, &text, should_sound);
+                    self.maybe_play_realm_event(boss_id, &text, should_sound, None);
                 }
                 AppAction::CharacterCacheChanged => {
                     // The processor owns the canonical character cache now; this
