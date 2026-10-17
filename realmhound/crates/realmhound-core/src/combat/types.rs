@@ -360,6 +360,8 @@ impl CompletedFight {
 pub struct LiveFightSnapshot {
     /// World object id of the boss this snapshot is for.
     pub boss_object_id: i32,
+    /// Object type of the boss, so a consumer can resolve its encounter group.
+    pub boss_object_type: i32,
     /// Resolved boss display name.
     pub boss_name: String,
     /// Normalized dungeon name the fight is taking place in.

@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::api::character::parse_enchant_ids;
+use crate::assets::encounter_for_boss_type;
 use crate::assets::get_asset_manager;
 use crate::assets::LethalStrikeParams;
 use crate::loot::class_ids;
@@ -885,6 +886,10 @@ impl CombatTracker {
     /// empties on a map change or disconnect. Participants are sorted by damage
     /// descending, matching the order the overlay renders them in.
     ///
+    /// Outside a dungeon the list is narrowed to the encounter the player is
+    /// currently on (see [`retain_current_encounter`]): the realm has no fixed
+    /// boss roster, so accumulating one tab per boss grows without bound.
+    ///
     /// Frozen entries are shared rather than deep-copied: this runs on every
     /// publish and again on every UI frame, and a finished fight never changes.
     pub fn live_snapshots(&self, now_ms: i64) -> Vec<Arc<LiveFightSnapshot>> {
@@ -903,6 +908,9 @@ impl CombatTracker {
             }
         }
         out.sort_by_key(|fight| fight.started_at);
+        if !is_groupable_dungeon(&normalize_dungeon(&self.current_map)) {
+            retain_current_encounter(&mut out);
+        }
         out
     }
 
@@ -951,6 +959,7 @@ impl CombatTracker {
 
         LiveFightSnapshot {
             boss_object_id: boss_id,
+            boss_object_type: fight.boss_object_type,
             boss_name,
             dungeon: normalize_dungeon(&self.current_map),
             boss_hp,
@@ -3925,6 +3934,34 @@ pub fn normalize_dungeon(name: &str) -> String {
     }
 }
 
+/// Narrow an open-world fight list down to the encounter the player is on.
+///
+/// A dungeon has a fixed, small boss roster, so letting the overlay accumulate
+/// a tab per boss is fine. The realm does not: the player can keep finding
+/// bosses for as long as they stay, so everything but the current encounter is
+/// dropped and a newly engaged boss replaces what was on screen.
+///
+/// The anchor is the boss the player most recently hit, falling back to the
+/// most recently started fight before they have hit anything. Multi-boss
+/// encounters (the Jade and Garnet Statues, the Pentaract's towers) keep every
+/// member, so their tabs survive together; anything else collapses to one tab.
+fn retain_current_encounter(fights: &mut Vec<Arc<LiveFightSnapshot>>) {
+    let anchor = fights
+        .iter()
+        .filter(|f| f.last_local_hit_at > 0)
+        .max_by_key(|f| f.last_local_hit_at)
+        .or_else(|| fights.iter().max_by_key(|f| f.started_at));
+    let Some(anchor) = anchor else {
+        return;
+    };
+    let group = encounter_for_boss_type(anchor.boss_object_type).map(|e| e.id);
+    let anchor_object = anchor.boss_object_id;
+    fights.retain(|fight| match group {
+        Some(id) => encounter_for_boss_type(fight.boss_object_type).is_some_and(|e| e.id == id),
+        None => fight.boss_object_id == anchor_object,
+    });
+}
+
 /// Whether a (normalized) map name is a dungeon instance whose bosses should be
 /// folded into one per-run card. Excludes the open world and hub/social spaces
 /// (Realm, Nexus, Vault, Guild Hall, Pet Yard, marketplaces, tutorial), which
@@ -4279,6 +4316,60 @@ mod tests {
         // Leaving the instance is the only thing that clears the overlay.
         t.on_map_change("Nexus", 2, 200);
         assert!(t.live_snapshots(300).is_empty());
+    }
+
+    #[test]
+    fn a_new_realm_boss_replaces_the_previous_one() {
+        // The realm has no fixed boss roster, so the overlay must not keep
+        // adding a tab per boss the way a dungeon does.
+        let mut t = CombatTracker::new();
+        t.on_map_change("{s.rotmg}", 1, 0);
+        t.on_player_loaded(1000, 1);
+        for (boss, obj_type, at) in [(500, 0x5000, 10), (700, 0x5001, 60)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                at,
+            );
+            t.on_damage(boss, 1000, 100_000, at + 10);
+        }
+        // The first boss dies, which in a dungeon would leave its tab frozen.
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+        t.on_object_removed(500, 40);
+
+        let fights = t.live_snapshots(100);
+        assert_eq!(fights.len(), 1, "the old realm boss kept its tab");
+        assert_eq!(fights[0].boss_object_id, 700);
+    }
+
+    #[test]
+    fn a_multi_boss_realm_encounter_keeps_every_tab() {
+        // Two Beehemoths of the same Killer Bee Nest event: both are relevant
+        // to the encounter the player is on, so neither evicts the other.
+        let mut t = CombatTracker::new();
+        t.on_map_change("{s.rotmg}", 1, 0);
+        t.on_player_loaded(1000, 1);
+        for (boss, obj_type, at) in [(500, 4324, 10), (700, 4325, 60)] {
+            t.on_object_spawn(
+                boss,
+                obj_type,
+                &status(
+                    boss,
+                    vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+                ),
+                at,
+            );
+            t.on_damage(boss, 1000, 100_000, at + 10);
+        }
+
+        let fights = t.live_snapshots(100);
+        assert_eq!(fights.len(), 2, "a grouped encounter lost a member");
+        assert_eq!(fights[0].boss_object_id, 500);
+        assert_eq!(fights[1].boss_object_id, 700);
     }
 
     fn participant(object_id: i32, is_local: bool) -> FightParticipant {

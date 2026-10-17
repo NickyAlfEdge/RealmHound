@@ -3,9 +3,10 @@
 //! Shows one boss fight of the map instance the player is in, with a tab per
 //! boss (phases included, since each phase is its own fight). The list is
 //! produced by
-//! [`realmhound_core::combat::CombatTracker::live_snapshots`] and only empties
-//! on a zone change, so hitting a second boss adds a tab instead of wiping the
-//! numbers that were on screen.
+//! [`realmhound_core::combat::CombatTracker::live_snapshots`]. In a dungeon it
+//! only empties on a zone change, so hitting a second boss adds a tab instead
+//! of wiping the numbers that were on screen; in the realm, where bosses never
+//! run out, it is narrowed to the encounter the player is currently on.
 //!
 //! Each tab is a mid-fight projection, so the local player's own damage can
 //! still be an estimate (see [`DamageProvenance`]) -- their row is tinted to say
@@ -397,7 +398,17 @@ fn row(
             );
         }
 
-        ui.label(row_text(&participant.name, color));
+        let name = ui.add(
+            egui::Label::new(row_text(&participant.name, color))
+                .sense(egui::Sense::click())
+                .selectable(false),
+        );
+        overlay_tooltip_with(ui, &name, || {
+            format!("Click to copy\n{}", callout(participant, rank, share))
+        });
+        if name.clicked() {
+            ui.ctx().copy_text(callout(participant, rank, share));
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(row_text(
@@ -448,9 +459,22 @@ fn elapsed(ms: i64) -> String {
     }
 }
 
+/// The one-line summary clicking a row's name puts on the clipboard, ready to
+/// be pasted into chat: rank, player, damage and share of the fight.
+fn callout(participant: &FightParticipant, rank: usize, share: f32) -> String {
+    format!(
+        "{rank}: {} {} {:.0}%",
+        participant.name,
+        thousands(participant.damage),
+        share * 100.0
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{elapsed, is_uncertain, row_color, truncate, Arc, DpsOverlay, NORMAL_COLOR};
+    use super::{
+        callout, elapsed, is_uncertain, row_color, truncate, Arc, DpsOverlay, NORMAL_COLOR,
+    };
     use realmhound_core::combat::{
         DamageProvenance, FightParticipant, LiveFightSnapshot, ParticipantEndStatus,
     };
@@ -487,6 +511,7 @@ mod tests {
     ) -> Arc<LiveFightSnapshot> {
         Arc::new(LiveFightSnapshot {
             boss_object_id: id,
+            boss_object_type: 0x10E4,
             boss_name: format!("Boss {id}"),
             dungeon: "Test Dungeon".to_string(),
             boss_hp: -1,
@@ -513,6 +538,12 @@ mod tests {
         assert_eq!(elapsed(9_000), "0:09");
         assert_eq!(elapsed(83_000), "1:23");
         assert_eq!(elapsed(3_723_000), "1:02:03");
+    }
+
+    #[test]
+    fn the_row_callout_carries_rank_name_damage_and_share() {
+        let who = participant(1, "Nicky", 1_234_567, true);
+        assert_eq!(callout(&who, 3, 0.4567), "3: Nicky 1,234,567 46%");
     }
 
     #[test]
