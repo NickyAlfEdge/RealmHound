@@ -97,6 +97,13 @@ If RealmHound reports that it may not open a capture device, the capture
 permission above has not been granted yet - the message names the fix for your
 platform.
 
+## Documentation
+
+- [Player damage sources: implementation status](https://pillarzz.github.io/RealmHound/research/damage-sources-status.html)
+  — interactive matrix of every effect that deals player damage, with its
+  theoretical-DPS and Combat History attribution status.
+  ([Markdown source](docs/research/damage-sources-status.md))
+
 ## Building from Source
 
 ### Prerequisites

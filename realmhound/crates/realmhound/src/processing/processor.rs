@@ -13,13 +13,13 @@ use std::path::PathBuf;
 use realmhound_core::{
     capture::{CaptureWriter, RawPacket},
     combat::CombatManager,
-    loot::{LootTracker, RecentBossKill},
+    loot::{shiny_bag_tier, LootTracker, RecentBossKill},
     protocol::{ip_to_server_name, parse_packet_with_status, Packet, ParsedPacket},
     session::{AccountVerifyResult, HelloAction},
     stats::{
-        extract_account_identity, extract_encounter_spawns, extract_inventory_changes,
-        extract_pet_identity, extract_pet_inventory_updates, parse_player_appearance,
-        parse_player_inventory,
+        exalt_proficiency::mastery_dmg_tenths, extract_account_identity, extract_encounter_spawns,
+        extract_inventory_changes, extract_pet_identity, extract_pet_inventory_updates,
+        parse_player_appearance, parse_player_inventory, shot_damage_bonus, ShotDamageBonus,
     },
     stream::{parse_tcp_segment, ConnectionKey, TcpReassembler},
     vault::{
@@ -167,14 +167,38 @@ fn parse_area_unlock(text: &str) -> Option<AreaUnlockMsg> {
 }
 
 /// Recognize a server death-broadcast line and extract the dead player's name
-/// (and killer). RotMG announces every death in an instance as a Text message
-/// like "Yumiho died at level 20, killed by Plagued Honey"; this is the reliable
-/// death signal for the combat tracker (position-based grave correlation
-/// mis-assigns graves when several players die in a tight cluster). Parses the
-/// name from the text; falls back to the packet `name` field when the line
-/// begins with "died at level". Returns `(player, killer)`.
+/// (and killer). RotMG announces every death in an instance, and that broadcast
+/// is the reliable death signal for the combat tracker (position-based grave
+/// correlation mis-assigns graves when several players die in a tight cluster).
+/// Returns `(player, killer)`.
+///
+/// The server sends the broadcast as the localized stringlist key with its
+/// placeholders, never the rendered sentence:
+/// `{"k":"s.death","t":{"player":"Yumiho","level":"20","enemy":"Plagued Honey"}}`
+/// (`s.death` renders as `{player} died at level {level}, killed by {enemy}`).
+/// The already-rendered sentence form is still accepted for robustness, and the
+/// packet `name` field is the fallback when it carries the victim (it is
+/// `#`-prefixed on server messages).
 fn parse_remote_death(sender: &str, text: &str) -> Option<(String, String)> {
     let text = text.trim();
+
+    if text.contains("\"s.death\"") {
+        let victim = ["player", "PLAYER", "Player"]
+            .into_iter()
+            .find_map(|key| extract_json_string_field(text, key))
+            .or_else(|| sender_name(sender))?;
+        // The killer is context for the log only, so a missing placeholder is fine.
+        let killer = ["enemy", "ENEMY", "Enemy"]
+            .into_iter()
+            .find_map(|key| extract_json_string_field(text, key))
+            .unwrap_or_default();
+        let victim = victim.trim();
+        if victim.is_empty() {
+            return None;
+        }
+        return Some((victim.to_string(), killer.trim().to_string()));
+    }
+
     // The name precedes " died at level "; when the text itself begins with
     // "died at level" the name lives in the packet's sender field instead.
     let (before, after) = if let Some(rest) = text.strip_prefix("died at level ") {
@@ -188,7 +212,7 @@ fn parse_remote_death(sender: &str, text: &str) -> Option<(String, String)> {
         .map(|(_, k)| k.trim().trim_end_matches('.').trim().to_string())
         .unwrap_or_default();
     let name = if before.is_empty() {
-        sender.trim().to_string()
+        sender_name(sender).unwrap_or_default()
     } else {
         before.trim().to_string()
     };
@@ -196,6 +220,13 @@ fn parse_remote_death(sender: &str, text: &str) -> Option<(String, String)> {
         return None;
     }
     Some((name, killer))
+}
+
+/// The victim carried in a Text packet's `name` field, if any. Server messages
+/// prefix it with `#` (e.g. `#Oryx the Mad God`), which is not part of the name.
+fn sender_name(sender: &str) -> Option<String> {
+    let name = sender.trim().trim_start_matches('#').trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// - `{"k":"s.dungeon_unlocked_by","t":{"name":"Wine Cellar","player":"Jeff",}}`
@@ -249,6 +280,16 @@ pub struct PacketProcessor {
     /// Currently playing character id (from CreateSuccess). Owned here so the
     /// character cache (in `account_data`) stays the single source of truth.
     live_char_id: Option<i32>,
+    /// Deadline (packet-clock ms) after which an unconfirmed empty `BloodRitual`
+    /// spawn snapshot clears the live character's ritual. The stat is re-sent
+    /// empty on every zone change while a ritual is active, so only silence after
+    /// the empty snapshot means the ritual was switched off. `None` when no ritual
+    /// question is open.
+    blood_ritual_clear_at: Option<i64>,
+    /// Characters whose current ritual came from the live `BloodRitual` stat (or
+    /// its live deactivation). An HTTP character-list refresh older than that
+    /// observation must not clear it, even when its payload has no ritual id.
+    live_blood_ritual_observed: std::collections::HashSet<i32>,
     /// Latest raw local-player stat values (id -> value), accumulated across the
     /// spawn `Update` (full snapshot) and `NewTick` deltas. Base character stats
     /// are derived from these (base = stat - boost) to keep the cached stats and
@@ -376,12 +417,20 @@ const REALM_JOIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(2)
 /// only a guard against unbounded growth on a connection that never verifies
 /// (e.g. a stuck mule); beyond it we stop buffering rather than leak memory.
 const PENDING_EVENT_CAP: usize = 4096;
-
 /// How long a tentative candidate may stay unverified before it is discarded.
 /// The identifying `Update` normally arrives within a second; a candidate that
 /// never identifies itself in this window is dropped so its buffered events are
 /// released and the main slot is freed for the next connection.
 const IDENTITY_TIMEOUT_MS: i64 = 60_000;
+
+/// How long after an empty `BloodRitual` spawn snapshot the game has to report the
+/// active id before the ritual is treated as switched off. Captures show the id
+/// arriving 4-118 ms after the empty spawn, so a deactivation is settled well
+/// inside this window, and a slow map load cannot be mistaken for one (see
+/// `PacketProcessor::apply_blood_ritual_stat`). A switch-off made while standing
+/// still arrives as an empty *delta* and is applied at once, so this only governs
+/// the fallback path.
+const BLOOD_RITUAL_SETTLE_MS: i64 = 1_500;
 
 impl PacketProcessor {
     /// Build a processor from flat-layout paths, degrading writer failures to
@@ -442,6 +491,8 @@ impl PacketProcessor {
             _test_account_root: None,
             settings,
             live_char_id: None,
+            blood_ritual_clear_at: None,
+            live_blood_ritual_observed: std::collections::HashSet::new(),
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -527,6 +578,8 @@ impl PacketProcessor {
             _test_account_root: None,
             settings,
             live_char_id: None,
+            blood_ritual_clear_at: None,
+            live_blood_ritual_observed: std::collections::HashSet::new(),
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -571,6 +624,8 @@ impl PacketProcessor {
             _test_account_root: Some(test_account_root),
             settings: Arc::new(RwLock::new(Settings::default())),
             live_char_id: None,
+            blood_ritual_clear_at: None,
+            live_blood_ritual_observed: std::collections::HashSet::new(),
             live_stat_raw: std::collections::HashMap::new(),
             pending_close_calls_by_char: std::collections::HashMap::new(),
             pending_close_call_totals: std::collections::HashMap::new(),
@@ -653,6 +708,8 @@ impl PacketProcessor {
             capture_queue_drops: metrics.queue_drops,
             mission_view_gen: self.mission_tracker.generation(),
             loot_boost_secs: self.session.player.loot_boost_secs,
+            map_pauses_boost_timers: self.live_char_id.is_none()
+                || self.session.map.pauses_boost_timers(),
         }
     }
 
@@ -776,10 +833,27 @@ impl PacketProcessor {
                 realmhound_core::capture::captures_dir().join(p)
             }
         };
+        self.start_recorder_at(path);
+    }
+
+    /// Start a raw-packet recorder writing a timestamped file to the captures
+    /// directory. Returns the file path when the writer opened successfully.
+    pub fn start_recorder(&mut self) -> Option<PathBuf> {
+        let name = format!(
+            "capture_{}.rhcap",
+            chrono::Utc::now().format("%Y-%m-%d_%H-%M-%S")
+        );
+        self.start_recorder_at(realmhound_core::capture::captures_dir().join(name))
+    }
+
+    /// Start a raw-packet recorder at an explicit path, replacing any current
+    /// recorder.
+    fn start_recorder_at(&mut self, path: PathBuf) -> Option<PathBuf> {
         match CaptureWriter::create(&path) {
             Ok(w) => {
                 tracing::info!("[RECORD] Recording raw packets to {}", path.display());
                 self.recorder = Some(w);
+                Some(path)
             }
             Err(e) => {
                 tracing::warn!(
@@ -787,7 +861,15 @@ impl PacketProcessor {
                     path.display(),
                     e
                 );
+                None
             }
+        }
+    }
+
+    /// Stop the raw-packet recorder, flushing any buffered frames.
+    pub fn stop_recorder(&mut self) {
+        if self.recorder.take().is_some() {
+            tracing::info!("[RECORD] Stopped raw-packet recording");
         }
     }
 
@@ -805,6 +887,15 @@ impl PacketProcessor {
         match msg {
             ControlMsg::ClearIgnored => {
                 self.reassembler.clear_ignored();
+            }
+            ControlMsg::SetCaptureRecording(on) => {
+                if on {
+                    if self.recorder.is_none() {
+                        self.start_recorder();
+                    }
+                } else {
+                    self.stop_recorder();
+                }
             }
             ControlMsg::SetLootTrackingSettings(settings) => {
                 self.loot_tracker.set_tracking_settings(&settings);
@@ -859,8 +950,51 @@ impl PacketProcessor {
                     );
                     return;
                 }
+                // The character list reports each character's Blood Ritual, which is
+                // what makes the ritual known for characters that are not the live
+                // one (issue #64). The list can lag behind the live status, so a
+                // live observation (set or cleared) takes precedence over it.
+                let live_char_id = self.live_char_id;
+                let mut challenge_changed = false;
+                for char in &data.characters {
+                    let is_live = Some(char.char_id) == live_char_id;
+                    // The Crucible marker is never taken from this list, in either
+                    // direction: it is only ever *set* by the character's own live
+                    // CRUCIBLE stat, and cleared by that same stat or a new season's
+                    // definitions (issue #63/#66). The list's `CrucibleActive` flag
+                    // is stale, so preserving the live-detected value in
+                    // `update_from_api` is what matters here.
+                    //
+                    // The live `BloodRitual` stat is fresher than any HTTP request
+                    // that started before it was observed. Give it precedence: do
+                    // not let an older list clear (or overwrite) it, including when
+                    // the list has no ritual id at all.
+                    let live_observed =
+                        is_live && self.live_blood_ritual_observed.contains(&char.char_id);
+                    if !(is_live && (char.blood_ritual_id.is_some() || live_observed)) {
+                        let ritual_id = char.blood_ritual_id.as_deref().unwrap_or("");
+                        challenge_changed |= self
+                            .account_data
+                            .characters
+                            .set_blood_ritual_for_char(Some(char.char_id), ritual_id);
+                    }
+                }
+                // Re-derive the per-character flags from the recorded ids, so the
+                // new season's tiers govern a roster that was already cached.
+                challenge_changed |= self.account_data.characters.sync_blood_ritual_flags();
+                // The character list is how a ritual already running at login becomes
+                // known; push the roster's state once it has been folded in, so a
+                // fight fought under it carries it.
+                self.push_local_snapshot();
+                if challenge_changed {
+                    self.account_data.mark_dirty();
+                }
                 self.account_data.characters.exaltation_stats = data.exaltation_stats;
                 self.account_data.characters.account_accelerators = data.accelerators;
+                // A refresh can change this character's class, exaltations,
+                // crucible marker or ritual tier; the engine needs the new
+                // multipliers before the next hit.
+                self.sync_shot_damage_bonus();
                 self.account_data.max_num_chars = data.max_num_chars;
                 self.account_data.next_char_slot_price = data.next_char_slot_price;
                 self.account_data.owned_skins_count = data.owned_skins_count;
@@ -1143,6 +1277,154 @@ impl PacketProcessor {
         }
     }
 
+    /// Fold the live character's `BloodRitual` stat into the character cache.
+    ///
+    /// The stat rides the player's own status as a string holding the active
+    /// tier's definition id. The two ways it arrives mean different things:
+    ///
+    /// - A **delta** (a `NewTick` status) is the server saying the stat changed, so
+    ///   an empty delta is a deactivation and the ritual is cleared at once.
+    /// - A **spawn** carries the character's whole stat set and is re-sent empty on
+    ///   every zone change *even while a ritual is active*, so an empty spawn only
+    ///   schedules a check: when one is active the game follows it with the real id
+    ///   within a few milliseconds, and only silence past the deadline means "none"
+    ///   (see [`Self::settle_blood_ritual`]).
+    fn apply_blood_ritual_stat(&mut self, id: &str, from_spawn: bool, now_ms: i64) {
+        if !id.trim().is_empty() {
+            // A live value answers the question an empty spawn asked.
+            self.blood_ritual_clear_at = None;
+            if let Some(char_id) = self.live_char_id {
+                self.live_blood_ritual_observed.insert(char_id);
+            }
+            if self
+                .account_data
+                .characters
+                .set_live_blood_ritual(self.live_char_id, id)
+            {
+                self.push_local_snapshot();
+                self.sync_shot_damage_bonus();
+                self.account_data.mark_dirty();
+                self.char_view_gen += 1;
+            }
+            return;
+        }
+        if from_spawn {
+            self.blood_ritual_clear_at = Some(now_ms + BLOOD_RITUAL_SETTLE_MS);
+            return;
+        }
+        self.blood_ritual_clear_at = None;
+        self.clear_live_blood_ritual();
+    }
+
+    /// Resolve an empty `BloodRitual` spawn once it has settled: an active ritual is
+    /// always reported as an id right after the empty snapshot, so silence means it
+    /// was switched off (or never was on).
+    fn settle_blood_ritual(&mut self, now_ms: i64) {
+        let Some(deadline) = self.blood_ritual_clear_at else {
+            return;
+        };
+        if now_ms < deadline {
+            return;
+        }
+        self.blood_ritual_clear_at = None;
+        self.clear_live_blood_ritual();
+    }
+
+    /// Drop the live character's ritual and re-derive the shot multipliers from it.
+    fn clear_live_blood_ritual(&mut self) {
+        if let Some(char_id) = self.live_char_id {
+            self.live_blood_ritual_observed.insert(char_id);
+        }
+        if self
+            .account_data
+            .characters
+            .clear_live_blood_ritual(self.live_char_id)
+        {
+            self.push_local_snapshot();
+            self.sync_shot_damage_bonus();
+            self.account_data.mark_dirty();
+            self.char_view_gen += 1;
+        }
+    }
+    /// Push the live character's Blood Ritual, Crucible and pet into the combat
+    /// engine, so a fight finalised from here on can be stamped with the state it
+    /// was fought under.
+    ///
+    /// None of the three rides the wire as a numeric stat the engine can see: the
+    /// ritual arrives as a string stat, the crucible as a marker, and a pet's
+    /// identity (skin, and the name that goes with it) lives only in the account
+    /// cache -- which is exactly what the ATTRIBUTES panel reads. Pushing it here
+    /// on every change (and every tick, so nothing depends on a state change having
+    /// been observed through one particular packet) keeps the engine's copy
+    /// current; the fight's own record is what the card reads back, which is what
+    /// stops it following the character's state *now*. That was the bug: a fight
+    /// fought with a ritual on showed none, and switching a ritual off later
+    /// rewrote a fight that had been fought with it on.
+    fn push_local_snapshot(&mut self) {
+        let Some(char_id) = self.live_char_id else {
+            return;
+        };
+        let (blood_ritual, crucible, pet_skin, pet_type) = {
+            let cache = &self.account_data.characters;
+            let Some(character) = cache.find_any_character(char_id) else {
+                return;
+            };
+            // The pet ATTRIBUTES shows. Its type id is what the wire reports for a
+            // pet, so it is what tells the character's own pet in the world from
+            // everyone else's; the sprite to draw is its skin, or its type where it
+            // has none -- the same choice ATTRIBUTES makes.
+            let pet = character
+                .pet_instance_id
+                .and_then(|id| cache.resolve_pet_identity(id, character.seasonal));
+            (
+                // The tier id, not just "on": the character's recorded tier is
+                // cleared when the ritual is switched off, so a fight keeps the id
+                // it was fought under and the card resolves the definition from it.
+                cache.blood_ritual_for_char(char_id).map(|tier| tier.id),
+                character.crucible_active,
+                pet.map(|p| if p.skin > 0 { p.skin } else { p.pet_type })
+                    .unwrap_or(0),
+                pet.map(|p| p.pet_type).unwrap_or(0),
+            )
+        };
+        self.combat
+            .tracker_mut()
+            .set_local_snapshot(blood_ritual, crucible, pet_skin, pet_type);
+    }
+
+    /// Push the live character's shot damage multipliers into the combat engine:
+    /// the class mastery from exaltations and the seasonal challenge multipliers
+    /// (Crucible x Blood Ritual tier). None of these ride the wire during a fight,
+    /// so the engine can only learn them from here; resolving them through the
+    /// same helper the theoretical DPS page uses is what keeps the two readouts
+    /// on the same numbers (issue #64).
+    fn sync_shot_damage_bonus(&mut self) {
+        let bonus = self
+            .live_char_id
+            .and_then(|char_id| self.account_data.characters.find_character(char_id))
+            .map(|ch| {
+                let cache = &self.account_data.characters;
+                let mastery_dmg_pct = cache
+                    .exaltation_stats
+                    .get(&(ch.class_id as i32))
+                    .map(|ex| mastery_dmg_tenths(ex) as f32 / 10.0)
+                    .unwrap_or(0.0);
+                // The Crucible season buffs apply only to characters carrying
+                // the marker, exactly as the character panel reads them.
+                let crucible = ch
+                    .crucible_active
+                    .then(|| cache.active_crucible.as_ref())
+                    .flatten();
+                shot_damage_bonus(
+                    mastery_dmg_pct,
+                    crucible,
+                    cache.blood_ritual_for_char(ch.char_id).as_ref(),
+                )
+            })
+            .unwrap_or_else(ShotDamageBonus::none);
+        self.combat.set_shot_damage_bonus(bonus);
+    }
+
     /// Merge the local player's stats from a status snapshot/delta into the raw
     /// accumulator, then derive base character stats (`base = stat - boost`) and
     /// push them into the cache so the maxed count and derived stats stay current
@@ -1218,7 +1500,10 @@ impl PacketProcessor {
         realmhound_core::prof_function!();
         for raw_packet in raw_packets {
             if let Some(rec) = self.recorder.as_mut() {
-                let _ = rec.write(&raw_packet);
+                if let Err(e) = rec.write(&raw_packet) {
+                    tracing::error!("[RECORD] Failed to write capture frame: {}", e);
+                    self.recorder = None;
+                }
             }
             // Parse TCP segment
             if let Some(segment) = parse_tcp_segment(&raw_packet) {
@@ -1277,6 +1562,11 @@ impl PacketProcessor {
                             segment.flags.rst
                         );
                         self.session.on_disconnect();
+                        self.live_char_id = None;
+                        self.live_stat_raw.clear();
+                        self.live_blood_ritual_observed.clear();
+                        self.blood_ritual_clear_at = None;
+                        self.char_view_gen += 1;
                         self.combat.on_disconnect(now_ms());
                         self.forward_dungeon_freeze();
                         self.realm_entered_at = None;
@@ -1291,6 +1581,12 @@ impl PacketProcessor {
                 let packets = self.reassembler.process_segment(&segment);
 
                 for packet in packets {
+                    if let Some(rec) = self.recorder.as_mut() {
+                        if let Err(e) = rec.classify_packet(&packet) {
+                            tracing::error!("[RECORD] Failed to write classified frames: {}", e);
+                            self.recorder = None;
+                        }
+                    }
                     // Parse packet for processing
                     let parsed = parse_packet_for_processing(&packet);
 
@@ -1437,7 +1733,12 @@ impl PacketProcessor {
         }
 
         if let Some(rec) = self.recorder.as_mut() {
-            let _ = rec.flush();
+            // Do not commit unresolved outgoing frames on a batch boundary: a
+            // Hello can complete in the next batch.
+            if let Err(e) = rec.flush_buffered() {
+                tracing::error!("[RECORD] Failed to flush capture: {}", e);
+                self.recorder = None;
+            }
         }
 
         // Keep mission tracking bound to the current main account so a mule's
@@ -1948,6 +2249,8 @@ impl PacketProcessor {
                 self.account_data
                     .characters
                     .update_crucible_status(char_id, is_active);
+                self.push_local_snapshot();
+                self.sync_shot_damage_bonus();
                 self.account_data.mark_dirty();
                 self.char_view_gen += 1;
             }
@@ -1964,6 +2267,18 @@ impl PacketProcessor {
             }
             GameEvent::CrucibleDefinitionsReceived(ref defs) => {
                 if self.account_data.characters.set_crucible_defs(defs.clone()) {
+                    self.sync_shot_damage_bonus();
+                    self.account_data.mark_dirty();
+                    self.char_view_gen += 1;
+                }
+            }
+            GameEvent::BloodRitualDefinitionsReceived(ref defs) => {
+                if self
+                    .account_data
+                    .characters
+                    .replace_blood_ritual_defs(defs.clone())
+                {
+                    self.sync_shot_damage_bonus();
                     self.account_data.mark_dirty();
                     self.char_view_gen += 1;
                 }
@@ -1988,6 +2303,7 @@ impl PacketProcessor {
                             .characters
                             .exaltation_stats
                             .insert(class_type, exaltation.clone());
+                        self.sync_shot_damage_bonus();
                         self.account_data.mark_dirty();
                         self.char_view_gen += 1;
                     }
@@ -2117,6 +2433,10 @@ impl PacketProcessor {
 
                 // Mark as live character
                 self.live_char_id = Some(char_id);
+                self.live_blood_ritual_observed.clear();
+                // The combat engine reads the mastery/seasonal shot multipliers
+                // from the character data, so it needs them for this character.
+                self.sync_shot_damage_bonus();
                 // Fresh character: drop any prior character's accumulated stats so
                 // base = stat - boost is derived from this character's snapshot.
                 self.live_stat_raw.clear();
@@ -2299,7 +2619,7 @@ impl PacketProcessor {
                     self.apply_area_unlock(msg);
                 }
 
-                // Server death broadcast ("<name> died at level N, killed by ...").
+                // Server death broadcast ("Player died at level N, killed by ...").
                 // Authoritative remote-death signal for the combat tracker.
                 if let Some((victim, killer)) = parse_remote_death(&text.name, &text.text) {
                     tracing::info!(
@@ -2307,7 +2627,16 @@ impl PacketProcessor {
                         victim,
                         killer
                     );
-                    self.combat.on_remote_death(&victim, now_ms());
+                    self.combat.on_remote_death(&victim, &killer, now_ms());
+                } else if text.text.contains("\"s.death\"") {
+                    // A death broadcast we could not decode: record the raw shape
+                    // so a payload change can be spotted instead of silently
+                    // dropping the authoritative death signal.
+                    tracing::warn!(
+                        "[COMBAT] Undecoded death broadcast: name='{}' text='{}'",
+                        text.name,
+                        text.text
+                    );
                 }
 
                 // Boss taunts drive the Marble Colossus survival-phase split off
@@ -2591,6 +2920,18 @@ impl PacketProcessor {
                         &obj.status,
                         time_ms as i64,
                     );
+
+                    // A spawn carries the character's full stat set, so this is where a login
+                    // reports a Blood Ritual tier that was set earlier in Nexus (stat 155's
+                    // string value is the definition id; empty means none).
+                    if Some(obj.object_id()) == self.session.player.object_id {
+                        for stat in &obj.status.stats {
+                            if stat.stat_type_id == 155 {
+                                let id = stat.string_stat_value.as_deref().unwrap_or("");
+                                self.apply_blood_ritual_stat(id, true, time_ms as i64);
+                            }
+                        }
+                    }
                 }
 
                 // A pet's full inventory + identity ride only in its spawn
@@ -2865,6 +3206,12 @@ impl PacketProcessor {
                 // Keep the live character's alive fame current from the observed
                 // CurrFame, rather than only after a full account refresh.
                 self.sync_live_fame();
+                // An empty BloodRitual spawn snapshot is only conclusive once the
+                // window in which the game reports the active id has passed.
+                self.settle_blood_ritual(time_ms as i64);
+                // Keep the engine's copy of the character's ritual, crucible and pet
+                // current, so the next fight finalised is stamped with them.
+                self.push_local_snapshot();
 
                 // Update entity positions/stats for loot tracking
                 for status in &new_tick.statuses {
@@ -2872,6 +3219,18 @@ impl PacketProcessor {
                         .on_object_update(status.object_id, status, time_ms);
                     self.combat
                         .on_object_status(status.object_id, status, time_ms as i64);
+                    // The Blood Ritual's active tier rides the player's own status as a string
+                    // stat (155) holding the definition id; empty means none is active. It is
+                    // only ever toggled in Nexus, so the last value seen is the one that applies
+                    // to any fight the character walks into afterwards.
+                    if Some(status.object_id) == self.session.player.object_id {
+                        for stat in &status.stats {
+                            if stat.stat_type_id == 155 {
+                                let id = stat.string_stat_value.as_deref().unwrap_or("");
+                                self.apply_blood_ritual_stat(id, false, time_ms as i64);
+                            }
+                        }
+                    }
                 }
 
                 // Fold deferred combat tallies onto the character cache.
@@ -2924,6 +3283,11 @@ impl PacketProcessor {
                     );
                     self.emit(UiPayload::PushLoot(drop.clone()));
                     self.emit(UiPayload::Audio(AudioCommand::PlayForBag(drop.bag_type)));
+                    // Shiny-loot notification keyed off the shiny item's own bag
+                    // tier (or the shiny pet-stone list).
+                    if let Some(tier) = shiny_bag_tier(drop.items.iter().map(|item| item.item_id)) {
+                        self.emit(UiPayload::Audio(AudioCommand::PlayForBagShiny(tier)));
+                    }
                     if let Some((ref settings, ref catalog)) = enchant_ctx {
                         self.play_enchant_sounds(drop, settings, catalog);
                     }
@@ -4197,6 +4561,32 @@ mod remote_death_tests {
     }
 
     #[test]
+    fn parses_the_stringlist_key_the_server_actually_sends() {
+        // `s.death` renders as "{player} died at level {level}, killed by {enemy}";
+        // the packet carries the key plus its placeholders, not the sentence.
+        let raw =
+            r#"{"k":"s.death","t":{"player":"Pillar","level":"20","enemy":"Oryx the Mad God"},}"#;
+        let (name, killer) = parse_remote_death("", raw).unwrap();
+        assert_eq!(name, "Pillar");
+        assert_eq!(killer, "Oryx the Mad God");
+    }
+
+    #[test]
+    fn death_key_falls_back_to_the_packet_sender() {
+        // Older/other payloads carry the victim in the packet name field, which
+        // server messages prefix with '#'.
+        let (name, killer) = parse_remote_death("#Pillar", r#"{"k":"s.death"}"#).unwrap();
+        assert_eq!(name, "Pillar");
+        assert_eq!(killer, "");
+    }
+
+    #[test]
+    fn death_key_without_any_victim_is_ignored() {
+        assert!(parse_remote_death("", r#"{"k":"s.death"}"#).is_none());
+        assert!(parse_remote_death("#", r#"{"k":"s.death","t":{"level":"20"}}"#).is_none());
+    }
+
+    #[test]
     fn falls_back_to_sender_when_text_starts_with_died() {
         let (name, _killer) =
             parse_remote_death("Bob", "died at level 5, killed by a Spider").unwrap();
@@ -4314,6 +4704,63 @@ mod isolation_gate_tests {
         p.session.connection.pending_account_verification = true;
         p.session.player.object_id = Some(1);
         p
+    }
+
+    fn disconnect_frame(port: u16, flags: u8) -> realmhound_core::capture::RawPacket {
+        let mut data = vec![0; 40];
+        data[0] = 0x45;
+        data[2..4].copy_from_slice(&40u16.to_be_bytes());
+        data[9] = 6;
+        data[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        data[16..20].copy_from_slice(&[127, 0, 0, 1]);
+        data[20..22].copy_from_slice(&port.to_be_bytes());
+        data[22..24].copy_from_slice(&2050u16.to_be_bytes());
+        data[32] = 0x50;
+        data[33] = flags;
+        realmhound_core::capture::RawPacket {
+            timestamp: chrono::Utc::now(),
+            packet_format: realmhound_core::capture::PacketFormat::RawIp,
+            #[cfg(feature = "latency-diagnostics")]
+            enqueued_at: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn main_connection_disconnect_publishes_a_paused_non_live_character() {
+        for flags in [0x11, 0x14] {
+            let mut p = tentative_with_saved_main("MAIN123");
+            p.live_char_id = Some(7);
+            p.session.player.loot_boost_secs = Some(600);
+            p.session.map.name = Some("Mad Lab".to_string());
+            let generation = p.view_state().char_view_gen;
+            assert!(!p.view_state().map_pauses_boost_timers);
+
+            p.process_available(vec![disconnect_frame(1000, flags)]);
+
+            assert_eq!(p.live_char_id(), None);
+            assert!(p.view_state().char_view_gen > generation);
+            assert!(p.view_state().map_pauses_boost_timers);
+            assert_eq!(p.view_state().loot_boost_secs, None);
+            assert_eq!(
+                p.session.connection.main_account_status,
+                MainAccountStatus::Disconnected
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_connection_disconnect_keeps_the_live_countdown_running() {
+        let mut p = tentative_with_saved_main("MAIN123");
+        p.live_char_id = Some(7);
+        p.session.player.loot_boost_secs = Some(600);
+        p.session.map.name = Some("Mad Lab".to_string());
+
+        p.process_available(vec![disconnect_frame(1001, 0x11)]);
+
+        assert_eq!(p.live_char_id(), Some(7));
+        assert!(!p.view_state().map_pauses_boost_timers);
+        assert_eq!(p.view_state().loot_boost_secs, Some(600));
     }
 
     /// A tentative connection's location must be buffered, not leaked to the UI.
@@ -4677,6 +5124,346 @@ mod isolation_gate_tests {
         );
     }
 
+    /// A deactivation is only ever reported by the character list, and the live
+    /// character was skipped entirely by it, so a ritual switched off in-game stuck
+    /// on that character until logout -- the reset of "[RITUAL] live" that issue #64
+    /// introduced. The list may clear the live character (it may not set it: the live
+    /// `BloodRitual` stat is fresher for that).
+    #[test]
+    fn api_account_data_clears_a_deactivated_live_blood_ritual() {
+        use realmhound_core::api::blood_ritual::BloodRitualDef;
+        use realmhound_core::api::RealmCharacter;
+
+        const CURRENT: &str = "5027802235043840";
+
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data
+            .characters
+            .set_blood_ritual_defs(vec![BloodRitualDef {
+                id: CURRENT.to_string(),
+                tier: 1,
+                hp_mult: 0.8,
+                damage_mult: 1.24,
+                loot_pct: 25.0,
+            }]);
+        // Live, ritual active.
+        p.live_char_id = Some(1);
+        assert!(p
+            .account_data
+            .characters
+            .set_blood_ritual_for_char(Some(1), CURRENT));
+        assert!(p.account_data.characters.blood_ritual_for_char(1).is_some());
+
+        // The list reports the tag as absent: the character deactivated it.
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            characters: vec![RealmCharacter {
+                char_id: 1,
+                blood_ritual_id: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert!(
+            p.account_data.characters.blood_ritual_for_char(1).is_none(),
+            "the list clears a ritual the live character switched off"
+        );
+    }
+
+    /// An older HTTP refresh must not revoke a ritual the live stat observed
+    /// after the request started; the live stat is the fresher source.
+    #[test]
+    fn api_account_data_does_not_revoke_a_newer_live_blood_ritual() {
+        use realmhound_core::api::blood_ritual::BloodRitualDef;
+        use realmhound_core::api::RealmCharacter;
+
+        const CURRENT: &str = "5027802235043840";
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data
+            .characters
+            .set_blood_ritual_defs(vec![BloodRitualDef {
+                id: CURRENT.to_string(),
+                tier: 1,
+                hp_mult: 0.8,
+                damage_mult: 1.24,
+                loot_pct: 25.0,
+            }]);
+        p.live_char_id = Some(1);
+        p.apply_blood_ritual_stat(CURRENT, false, 100);
+        assert!(p.account_data.characters.blood_ritual_for_char(1).is_some());
+
+        // The list response started before that activation and arrived after it.
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            characters: vec![RealmCharacter {
+                char_id: 1,
+                blood_ritual_id: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert!(
+            p.account_data.characters.blood_ritual_for_char(1).is_some(),
+            "a live observation outranks an older list refresh"
+        );
+    }
+
+    /// The character list is what makes the Blood Ritual known for characters
+    /// that are not the live one -- the live status only ever describes the
+    /// character being played (issue #64). The list can lag behind that status, so
+    /// the live character must be left to its own `BloodRitual` stat.
+    #[test]
+    fn api_account_data_seeds_blood_ritual_for_non_live_characters() {
+        use realmhound_core::api::blood_ritual::BloodRitualDef;
+        use realmhound_core::api::RealmCharacter;
+
+        /// The tier the current feed defines (Halloween 2026 tier 1).
+        const CURRENT: &str = "5027802235043840";
+        /// An id from an earlier event that the current feed does not define.
+        const STALE: &str = "5704571108229120";
+
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data
+            .characters
+            .set_blood_ritual_defs(vec![BloodRitualDef {
+                id: CURRENT.to_string(),
+                tier: 1,
+                hp_mult: 0.8,
+                damage_mult: 1.24,
+                loot_pct: 25.0,
+            }]);
+        // Detected live for the character being played.
+        p.live_char_id = Some(1);
+        assert!(p
+            .account_data
+            .characters
+            .set_blood_ritual_for_char(Some(1), CURRENT));
+
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            characters: vec![
+                RealmCharacter {
+                    char_id: 1,
+                    blood_ritual_id: Some(STALE.into()),
+                    ..Default::default()
+                },
+                RealmCharacter {
+                    char_id: 2,
+                    blood_ritual_id: Some(CURRENT.into()),
+                    ..Default::default()
+                },
+                RealmCharacter {
+                    char_id: 3,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert_eq!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(1)
+                .map(|d| d.tier),
+            Some(1),
+            "the live character keeps what its own stat reported"
+        );
+        assert_eq!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2)
+                .map(|d| d.tier),
+            Some(1),
+            "a character that is not live is known from the character list"
+        );
+        assert!(
+            p.account_data.characters.blood_ritual_for_char(3).is_none(),
+            "a character without the tag has no ritual"
+        );
+    }
+
+    /// The Crucible marker comes from the live CRUCIBLE stat and from nowhere else:
+    /// the character list's own flag is stale (it claims crucible on non-seasonal
+    /// characters -- issue #66), and a Refresh must never revoke a marker the live
+    /// stat set. Crucible runs on non-seasonal characters too, so clearing on
+    /// `!seasonal` wiped a real marker every time the account data refreshed, which
+    /// is what made the Character card pill vanish on Refresh.
+    #[test]
+    fn api_account_data_keeps_a_live_crucible_marker_on_a_regular_character() {
+        use realmhound_core::api::RealmCharacter;
+        use realmhound_core::vault::CachedCharacter;
+
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data.characters.crucible_migrated = true;
+
+        // Both live-detected: one on a regular character, one seasonal.
+        for char_id in [1, 2] {
+            let mut c = CachedCharacter {
+                char_id,
+                ..Default::default()
+            };
+            c.crucible_active = true;
+            p.account_data.characters.characters.push(c);
+        }
+
+        // The list reports nothing about the crucible for either of them; its own
+        // flag (which it does carry) is not trusted in either direction.
+        let data = realmhound_core::api::AccountData {
+            account_id: Some("MAIN123".into()),
+            characters: vec![
+                RealmCharacter {
+                    char_id: 1,
+                    seasonal: false,
+                    crucible_active: false,
+                    ..Default::default()
+                },
+                RealmCharacter {
+                    char_id: 2,
+                    seasonal: true,
+                    crucible_active: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        p.apply_control(ControlMsg::ApplyApiAccountData(data, scope(key, &id, 1)));
+
+        assert!(
+            p.account_data
+                .characters
+                .find_character(1)
+                .unwrap()
+                .crucible_active,
+            "a Refresh keeps the marker the live stat reported, seasonal or not"
+        );
+        assert!(
+            p.account_data
+                .characters
+                .find_character(2)
+                .unwrap()
+                .crucible_active,
+            "a seasonal character keeps the flag the live stat gave it"
+        );
+    }
+
+    /// The live `BloodRitual` stat is the only live source for the ritual, and the
+    /// two ways it arrives mean different things. A `NewTick` delta is the server
+    /// saying the stat changed, so an empty delta is a deactivation and the pill
+    /// must go immediately. A spawn snapshot is re-sent empty on *every* zone
+    /// change even while a ritual is active, and the game follows it with the real
+    /// id within milliseconds when one is: only silence past the settle window means
+    /// "none". Reading the empty spawn as a deactivation made the pill, the
+    /// attribute brackets and the Bonuses line flash on every portal (#64); ignoring
+    /// the empty delta left a ritual switched off in-game stuck until Refresh.
+    #[test]
+    fn blood_ritual_stat_deactivation_clears_and_zone_changes_do_not() {
+        use realmhound_core::api::blood_ritual::BloodRitualDef;
+        use realmhound_core::vault::CachedCharacter;
+
+        const CURRENT: &str = "5027802235043840";
+
+        let key = AccountKey::generate();
+        let id = AccountId::new("MAIN123").unwrap();
+        let mut p = PacketProcessor::new_for_test(AccountData::new());
+        p.set_selected_scope(key, id.clone());
+        p.account_data
+            .characters
+            .set_blood_ritual_defs(vec![BloodRitualDef {
+                id: CURRENT.to_string(),
+                tier: 1,
+                hp_mult: 0.8,
+                damage_mult: 1.24,
+                loot_pct: 25.0,
+            }]);
+        p.live_char_id = Some(2487);
+        p.account_data.characters.characters.push(CachedCharacter {
+            char_id: 2487,
+            ..Default::default()
+        });
+
+        // Ritual active, then a zone change: the spawn snapshot is empty, the id
+        // follows 80 ms later. The marker must survive both.
+        p.apply_blood_ritual_stat(CURRENT, false, 1_000);
+        assert!(p
+            .account_data
+            .characters
+            .blood_ritual_for_char(2487)
+            .is_some());
+        p.apply_blood_ritual_stat("", true, 2_000);
+        p.settle_blood_ritual(2_100);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_some(),
+            "an empty spawn inside the settle window is not a deactivation"
+        );
+        p.apply_blood_ritual_stat(CURRENT, false, 2_080);
+        p.settle_blood_ritual(9_999);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_some(),
+            "the id that follows the empty spawn cancels the pending clear"
+        );
+
+        // Switched off in game: the stat delta comes back empty.
+        p.apply_blood_ritual_stat("", false, 3_000);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_none(),
+            "an empty delta clears the ritual at once"
+        );
+        assert!(
+            !p.account_data
+                .characters
+                .find_character(2487)
+                .unwrap()
+                .blood_ritual_active,
+            "the character flag follows the cleared entry"
+        );
+
+        // And the unambiguous case: an empty spawn that is never confirmed.
+        p.apply_blood_ritual_stat(CURRENT, false, 4_000);
+        p.apply_blood_ritual_stat("", true, 5_000);
+        p.settle_blood_ritual(5_000);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_some(),
+            "still inside the window"
+        );
+        p.settle_blood_ritual(5_000 + 1_500);
+        assert!(
+            p.account_data
+                .characters
+                .blood_ritual_for_char(2487)
+                .is_none(),
+            "an unconfirmed empty spawn clears once it has settled"
+        );
+    }
+
     /// The pet-skin list arrives from its own endpoint, so a refresh whose
     /// char/list carried neither `OwnedSkins` nor `OwnedEmotes` (a mule response
     /// or a partial one) must still learn the pet skins.
@@ -4785,6 +5572,143 @@ mod new_selected_tests {
         };
         let ProcessorInitError::Database { label, .. } = error;
         assert_eq!(label, "combat");
+    }
+}
+
+#[cfg(test)]
+mod shot_bonus_tests {
+    use std::sync::{Arc, RwLock};
+
+    use realmhound_core::api::blood_ritual::BloodRitualDef;
+    use realmhound_core::api::crucible::CrucibleDef;
+    use realmhound_core::api::ClassExaltation;
+    use realmhound_core::stats::ShotDamageBonus;
+    use realmhound_core::vault::{AccountData, AccountDataRepository, CachedCharacter};
+    use realmhound_core::Settings;
+
+    use super::PacketProcessor;
+
+    /// A processor over a throwaway profile, plus the character cache it can be
+    /// fed. Same construction the other processor tests use.
+    fn processor() -> (tempfile::TempDir, PacketProcessor) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = AccountDataRepository::for_profile(temp.path().join("account_data.json"));
+        let processor = PacketProcessor::new_selected(
+            Arc::new(RwLock::new(Settings::default())),
+            AccountData::new(),
+            repo,
+            temp.path().join("loot_history.db"),
+            temp.path().join("combat_history.db"),
+            None,
+            None,
+        )
+        .expect("writers open for a valid profile");
+        (temp, processor)
+    }
+
+    /// A fully-exalted class: every stat at raw 50+ -> exalt level 5 -> Mastery
+    /// level 4 -> +10% weapon damage.
+    fn maxed_exalt(class_type: i32) -> ClassExaltation {
+        ClassExaltation {
+            class_type,
+            attack: 108,
+            defense: 164,
+            speed: 76,
+            dexterity: 103,
+            vitality: 99,
+            wisdom: 131,
+            hp: 80,
+            mp: 78,
+        }
+    }
+
+    fn ritual_tier1() -> BloodRitualDef {
+        BloodRitualDef {
+            id: "5027802235043840".into(),
+            tier: 1,
+            hp_mult: 0.8,
+            damage_mult: 1.24,
+            loot_pct: 25.0,
+        }
+    }
+
+    #[test]
+    fn pushes_the_characters_mastery_and_ritual_into_the_engine() {
+        // This is the whole point of the push: the engine reconstructs the
+        // player's own weapon damage and cannot see any of these three inputs in
+        // the packet stream. When the character is not known the engine must stay
+        // neutral rather than apply a stale bonus from a previously loaded one.
+        let (_temp, mut processor) = processor();
+        assert_eq!(
+            processor.combat.shot_damage_bonus(),
+            ShotDamageBonus::none(),
+            "no live character yet: neutral"
+        );
+
+        processor.live_char_id = Some(2538);
+        processor.sync_shot_damage_bonus();
+        assert_eq!(
+            processor.combat.shot_damage_bonus(),
+            ShotDamageBonus::none(),
+            "unknown character: still neutral"
+        );
+
+        let character = CachedCharacter {
+            char_id: 2538,
+            class_id: 819,
+            crucible_active: true,
+            ..Default::default()
+        };
+        let cache = &mut processor.account_data.characters;
+        cache.characters.push(character);
+        cache.exaltation_stats.insert(819, maxed_exalt(819));
+        cache.active_crucible = Some(CrucibleDef {
+            // The season's Crucible carries no damage bonus of its own.
+            damage_mult: 1.0,
+            ..Default::default()
+        });
+        cache.set_blood_ritual_defs(vec![ritual_tier1()]);
+        cache.blood_ritual_by_char.insert(2538, ritual_tier1().id);
+
+        processor.sync_shot_damage_bonus();
+        let bonus = processor.combat.shot_damage_bonus();
+        assert_eq!(bonus.mastery, 1.1, "class mastery from exaltations");
+        assert!((bonus.challenge - 1.24).abs() < 1e-6, "{bonus:?}");
+        assert!((bonus.total() - 1.364).abs() < 1e-6, "{bonus:?}");
+    }
+
+    #[test]
+    fn crucible_and_ritual_compound_and_the_marker_gates_the_crucible() {
+        let (_temp, mut processor) = processor();
+        processor.live_char_id = Some(7);
+        let cache = &mut processor.account_data.characters;
+        cache.characters.push(CachedCharacter {
+            char_id: 7,
+            class_id: 768,
+            crucible_active: false,
+            ..Default::default()
+        });
+        cache.active_crucible = Some(CrucibleDef {
+            damage_mult: 1.15,
+            ..Default::default()
+        });
+
+        // Not a Crucible character: the seasonal bonus must not apply.
+        processor.sync_shot_damage_bonus();
+        assert!((processor.combat.shot_damage_bonus().challenge - 1.0).abs() < 1e-6);
+
+        processor
+            .account_data
+            .characters
+            .find_character_mut(7)
+            .unwrap()
+            .crucible_active = true;
+        processor.sync_shot_damage_bonus();
+        assert!(
+            (processor.combat.shot_damage_bonus().challenge - 1.15).abs() < 1e-6,
+            "{:?}",
+            processor.combat.shot_damage_bonus()
+        );
     }
 }
 
