@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://pillarzz.github.io/RealmHound/sitemap.xml
