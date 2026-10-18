@@ -121,11 +121,11 @@ const TOOLTIP_MARGIN: f32 = 6.0;
 /// actually have. Several obvious choices (U+2715 close, U+25A1 and U+2610 for
 /// restore, U+21BA for reset) are absent from Noto Sans and Noto Emoji and draw
 /// as empty tofu boxes; `chrome_glyphs_render` guards against that returning.
+///
+/// The lock toggle is the exception: see [`lock_button`].
 const CLOSE_GLYPH: &str = "\u{2716}";
 const MINIMIZE_GLYPH: &str = "\u{2212}";
 const RESTORE_GLYPH: &str = "+";
-const LOCKED_GLYPH: &str = "\u{1F512}";
-const UNLOCKED_GLYPH: &str = "\u{1F513}";
 /// The loot overlay's reset button, guarded by the same test.
 pub(super) const RESET_GLYPH: &str = "\u{1F504}";
 
@@ -702,18 +702,12 @@ fn chrome(
             if chrome_button(ui, glyph, tip).clicked() {
                 cfg.minimized = !cfg.minimized;
             }
-            let (glyph, tip) = if locked {
-                (
-                    LOCKED_GLYPH,
-                    "Unlock: stop passing clicks through so the overlay can be moved",
-                )
+            let tip = if locked {
+                "Unlock: stop passing clicks through so the overlay can be moved"
             } else {
-                (
-                    UNLOCKED_GLYPH,
-                    "Lock: freeze the overlay and pass every click through to the game",
-                )
+                "Lock: freeze the overlay and pass every click through to the game"
             };
-            if chrome_button(ui, glyph, tip).clicked() {
+            if lock_button(ui, locked, tip).clicked() {
                 cfg.locked = !cfg.locked;
             }
             content.title_extras(ui);
@@ -736,6 +730,53 @@ fn chrome_button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Respons
     );
     overlay_tooltip(ui, &response, tooltip);
     response
+}
+
+/// The lock toggle, drawn rather than typed.
+///
+/// Noto Emoji's padlocks (U+1F512 / U+1F513) are solid pictographs meant to be
+/// read at emoji sizes; at the 11px the title bar uses they collapse into an
+/// unreadable blob, and the open and closed ones are indistinguishable. A
+/// handful of vector shapes stay crisp at the single size this is ever drawn at
+/// and make the shackle's open side obvious.
+fn lock_button(ui: &mut egui::Ui, locked: bool, tooltip: &str) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(16.0, TITLE_BAR_H), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let color = ui.style().interact(&response).fg_stroke.color;
+        paint_padlock(ui.painter(), rect.center(), color, locked);
+    }
+    overlay_tooltip(ui, &response, tooltip);
+    response
+}
+
+/// Paint a padlock centred on `center`: a rounded body with a shackle arc above
+/// it, whose right leg is missing when `locked` is false.
+fn paint_padlock(painter: &egui::Painter, center: egui::Pos2, color: Color32, locked: bool) {
+    const RADIUS: f32 = 2.75;
+    const LEG: f32 = 1.5;
+
+    let body = egui::Rect::from_center_size(center + egui::vec2(0.0, 2.0), egui::vec2(9.0, 7.0));
+    painter.rect_filled(body, CornerRadius::same(1), color);
+
+    // An open shackle hinges on its attached (left) leg, so swing the arc clear
+    // of the keyhole rather than just dropping the free leg.
+    let hinge_x = body.center().x + if locked { 0.0 } else { 1.25 };
+    let arc_y = body.top() - LEG;
+
+    let mut shackle = vec![egui::pos2(hinge_x - RADIUS, body.top())];
+    const STEPS: usize = 12;
+    for step in 0..=STEPS {
+        let angle = std::f32::consts::PI * (1.0 - step as f32 / STEPS as f32);
+        shackle.push(egui::pos2(
+            hinge_x + RADIUS * angle.cos(),
+            arc_y - RADIUS * angle.sin(),
+        ));
+    }
+    if locked {
+        shackle.push(egui::pos2(hinge_x + RADIUS, body.top()));
+    }
+    painter.add(egui::Shape::line(shackle, egui::Stroke::new(1.3_f32, color)));
 }
 
 /// Show `text` for a hovered overlay widget, anchored to the window's left edge
@@ -895,8 +936,8 @@ fn thousands(value: i64) -> String {
 mod tests {
     use super::{
         chrome_strip, perceptual_alpha, scrollbar_hit, short_title, thousands, HitRegions,
-        WindowRuntime, CHROME_HIT_H, CLOSE_GLYPH, DPS_TITLE, LOCKED_GLYPH, MINIMIZE_GLYPH,
-        RESET_GLYPH, RESTORE_GLYPH, UNLOCKED_GLYPH,
+        WindowRuntime, CHROME_HIT_H, CLOSE_GLYPH, DPS_TITLE, MINIMIZE_GLYPH, RESET_GLYPH,
+        RESTORE_GLYPH,
     };
     use eframe::egui;
     use realmhound_core::settings::OverlaySettings;
@@ -991,14 +1032,8 @@ mod tests {
 
         let font = egui::FontId::proportional(11.0);
         ctx.fonts_mut(|fonts| {
-            for glyph in [
-                CLOSE_GLYPH,
-                MINIMIZE_GLYPH,
-                RESTORE_GLYPH,
-                LOCKED_GLYPH,
-                UNLOCKED_GLYPH,
-                RESET_GLYPH,
-            ] {
+            // The lock toggle is painted, not typed, so it is not listed here.
+            for glyph in [CLOSE_GLYPH, MINIMIZE_GLYPH, RESTORE_GLYPH, RESET_GLYPH] {
                 assert!(
                     fonts.has_glyphs(&font, glyph),
                     "{glyph:?} has no glyph and would render as a tofu box"

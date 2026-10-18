@@ -6337,14 +6337,26 @@ fn parse_equipment_enchants(data: Option<&str>) -> [Vec<u16>; 4] {
     })
 }
 
-/// Map a raw realm map-name token (e.g. "{s.rotmg}") to a readable label.
+/// Map a raw map-name token (e.g. "{s.rotmg}") to a readable label.
+///
+/// Real dungeons are sent as localization keys too -- Oryx's Castle is
+/// `{s.oryx_s_castle}`, the Wine Cellar `{s.wine_cellar}` -- so a blanket
+/// "anything braced is the realm" collapses them into the open world and makes
+/// [`is_groupable_dungeon`] deny them their per-boss overlay tabs. Only keys
+/// with no known display name fall back to the realm.
 pub fn normalize_dungeon(name: &str) -> String {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.starts_with('{') {
-        "Realm".to_string()
-    } else {
-        trimmed.to_string()
+    if trimmed.is_empty() {
+        return "Realm".to_string();
     }
+    if trimmed.starts_with('{') {
+        let resolved = crate::assets::get_dungeon_portal_map().normalize_dungeon_name(trimmed);
+        if resolved != trimmed {
+            return resolved;
+        }
+        return "Realm".to_string();
+    }
+    trimmed.to_string()
 }
 
 /// Narrow an open-world fight list down to the encounter the player is on.
@@ -12975,6 +12987,15 @@ mod tests {
         assert_eq!(normalize_dungeon("{s.rotmg}"), "Realm");
         assert_eq!(normalize_dungeon(""), "Realm");
         assert_eq!(normalize_dungeon("Mad Lab"), "Mad Lab");
+        // Braced dungeon keys are dungeons, not the realm: collapsing them is
+        // what made Oryx's Castle show a single overlay tab for the two Stone
+        // Guardians.
+        assert_eq!(normalize_dungeon("{s.oryx_s_castle}"), "Oryx's Castle");
+        assert_eq!(normalize_dungeon("{s.wine_cellar}"), "Wine Cellar");
+        assert_eq!(normalize_dungeon("{s.nexus}"), "Nexus");
+        assert_eq!(normalize_dungeon("{s.vault}"), "Vault");
+        // An unrecognized key still falls back to the open world.
+        assert_eq!(normalize_dungeon("{s.pet_yard}"), "Realm");
     }
 
     #[test]
@@ -12983,6 +13004,12 @@ mod tests {
         assert!(is_groupable_dungeon("Mad Lab"));
         assert!(is_groupable_dungeon("Oryx's Sanctuary"));
         assert!(is_groupable_dungeon("The Nest"));
+        // Dungeons the client names with a localization key group too, once
+        // normalized.
+        assert!(is_groupable_dungeon(&normalize_dungeon(
+            "{s.oryx_s_castle}"
+        )));
+        assert!(is_groupable_dungeon(&normalize_dungeon("{s.wine_cellar}")));
         // Hubs, social spaces and the open world stay standalone.
         assert!(!is_groupable_dungeon("Realm"));
         assert!(!is_groupable_dungeon("Nexus"));
