@@ -952,7 +952,7 @@ impl PacketProcessor {
                 }
                 // The character list reports each character's Blood Ritual, which is
                 // what makes the ritual known for characters that are not the live
-                // one (issue #64). The list can lag behind the live status, so a
+                // one. The list can lag behind the live status, so a
                 // live observation (set or cleared) takes precedence over it.
                 let live_char_id = self.live_char_id;
                 let mut challenge_changed = false;
@@ -961,7 +961,7 @@ impl PacketProcessor {
                     // The Crucible marker is never taken from this list, in either
                     // direction: it is only ever *set* by the character's own live
                     // CRUCIBLE stat, and cleared by that same stat or a new season's
-                    // definitions (issue #63/#66). The list's `CrucibleActive` flag
+                    // definitions. The list's `CrucibleActive` flag
                     // is stale, so preserving the live-detected value in
                     // `update_from_api` is what matters here.
                     //
@@ -1397,7 +1397,7 @@ impl PacketProcessor {
     /// (Crucible x Blood Ritual tier). None of these ride the wire during a fight,
     /// so the engine can only learn them from here; resolving them through the
     /// same helper the theoretical DPS page uses is what keeps the two readouts
-    /// on the same numbers (issue #64).
+    /// on the same numbers.
     fn sync_shot_damage_bonus(&mut self) {
         let bonus = self
             .live_char_id
@@ -2729,32 +2729,55 @@ impl PacketProcessor {
                                     | ChatType::Guild
                                     | ChatType::Whisper
                             ) {
-                                let (mention_ping, custom_ping) = self
+                                // Normalize the body once and reuse it for every
+                                // configured alert instead of per variant.
+                                let normalized_body =
+                                    realmhound_core::chat_ping::NormalizedChatBody::new(
+                                        &chat_msg.text,
+                                    );
+                                let (mention_ping, custom_pings) = self
                                     .settings
                                     .read()
                                     .map(|s| {
-                                        let pings = realmhound_core::chat_ping::pings_for(
+                                        let pings = normalized_body.pings_for(
                                             &chat_msg.text,
                                             me.as_deref(),
-                                            s.sound.custom_chat_text.as_str(),
+                                            "",
                                         );
+                                        let custom = if SoundType::CustomChat.is_enabled(&s.sound) {
+                                            s.sound
+                                                .custom_chat_alerts
+                                                .iter()
+                                                .filter(|alert| {
+                                                    normalized_body
+                                                        .matches_any_trigger(&alert.words)
+                                                })
+                                                .map(|alert| {
+                                                    let key = alert.sound_key();
+                                                    let volume = s.sound.sound_volume(&key);
+                                                    (key, volume)
+                                                })
+                                                .collect::<Vec<_>>()
+                                        } else {
+                                            Vec::new()
+                                        };
                                         (
                                             pings.ign_mention
                                                 && SoundType::IgnMention.is_enabled(&s.sound),
-                                            pings.custom_chat
-                                                && SoundType::CustomChat.is_enabled(&s.sound),
+                                            custom,
                                         )
                                     })
-                                    .unwrap_or((false, false));
+                                    .unwrap_or((false, Vec::new()));
                                 if mention_ping {
                                     self.emit(UiPayload::Audio(AudioCommand::Play(
                                         SoundType::IgnMention,
                                     )));
                                 }
-                                if custom_ping {
-                                    self.emit(UiPayload::Audio(AudioCommand::Play(
-                                        SoundType::CustomChat,
-                                    )));
+                                for (custom_key, volume) in custom_pings {
+                                    self.emit(UiPayload::Audio(AudioCommand::PlayCustomChat {
+                                        custom_key,
+                                        volume,
+                                    }));
                                 }
                             }
                         }
@@ -3352,16 +3375,28 @@ impl PacketProcessor {
                     }
                 };
 
-                // Read enchant ids from the canonical character cache (must reflect
-                // inventory applied earlier in this same batch).
-                let to_enchants = char_id
-                    .and_then(|cid| self.account_data.characters.item_at_slot(cid, to.slot_id))
-                    .map(|item| item.enchant_ids)
-                    .unwrap_or_default();
-                let from_enchants = char_id
-                    .and_then(|cid| self.account_data.characters.item_at_slot(cid, from.slot_id))
-                    .map(|item| item.enchant_ids)
-                    .unwrap_or_default();
+                // Read enchant data from the canonical character cache (must reflect
+                // inventory applied earlier in this same batch). The packet's item
+                // type stays authoritative for the vault item's id, but the whole
+                // slot breakdown (filled + empty + locked) comes from the cached
+                // character item so empty-but-slotted items keep their rarity.
+                let to_char = char_id
+                    .and_then(|cid| self.account_data.characters.item_at_slot(cid, to.slot_id));
+                let from_char = char_id
+                    .and_then(|cid| self.account_data.characters.item_at_slot(cid, from.slot_id));
+                let vault_item = |item_type: i32,
+                                  char_item: Option<&realmhound_core::vault::CharacterItem>|
+                 -> LiveVaultItem {
+                    match char_item {
+                        Some(c) => LiveVaultItem {
+                            item_id: item_type,
+                            enchant_ids: c.enchant_ids.clone(),
+                            empty_enchant_slots: c.empty_enchant_slots,
+                            locked_enchant_slots: c.locked_enchant_slots,
+                        },
+                        None => LiveVaultItem::new(item_type),
+                    }
+                };
 
                 let storage = self.account_data.get_vault_mut(vault_type);
 
@@ -3375,7 +3410,7 @@ impl PacketProcessor {
                 } else if [chest_id, material_id, gift_id, potion_id]
                     .contains(&Some(from.object_id))
                 {
-                    let new_item = LiveVaultItem::with_enchants(to.item_type, to_enchants);
+                    let new_item = vault_item(to.item_type, to_char.as_ref());
                     if set_item(storage, from.object_id, from.slot_id, new_item) {
                         vault_updated = true;
                     }
@@ -3387,7 +3422,7 @@ impl PacketProcessor {
                     }
                 } else if [chest_id, material_id, gift_id, potion_id].contains(&Some(to.object_id))
                 {
-                    let new_item = LiveVaultItem::with_enchants(from.item_type, from_enchants);
+                    let new_item = vault_item(from.item_type, from_char.as_ref());
                     if set_item(storage, to.object_id, to.slot_id, new_item) {
                         vault_updated = true;
                     }
@@ -5126,8 +5161,8 @@ mod isolation_gate_tests {
 
     /// A deactivation is only ever reported by the character list, and the live
     /// character was skipped entirely by it, so a ritual switched off in-game stuck
-    /// on that character until logout -- the reset of "[RITUAL] live" that issue #64
-    /// introduced. The list may clear the live character (it may not set it: the live
+    /// on that character until logout -- the stuck "[RITUAL] live" state the
+    /// reset introduced. The list may clear the live character (it may not set it: the live
     /// `BloodRitual` stat is fresher for that).
     #[test]
     fn api_account_data_clears_a_deactivated_live_blood_ritual() {
@@ -5220,7 +5255,7 @@ mod isolation_gate_tests {
 
     /// The character list is what makes the Blood Ritual known for characters
     /// that are not the live one -- the live status only ever describes the
-    /// character being played (issue #64). The list can lag behind that status, so
+    /// character being played. The list can lag behind that status, so
     /// the live character must be left to its own `BloodRitual` stat.
     #[test]
     fn api_account_data_seeds_blood_ritual_for_non_live_characters() {
@@ -5298,7 +5333,7 @@ mod isolation_gate_tests {
 
     /// The Crucible marker comes from the live CRUCIBLE stat and from nowhere else:
     /// the character list's own flag is stale (it claims crucible on non-seasonal
-    /// characters -- issue #66), and a Refresh must never revoke a marker the live
+    /// characters), and a Refresh must never revoke a marker the live
     /// stat set. Crucible runs on non-seasonal characters too, so clearing on
     /// `!seasonal` wiped a real marker every time the account data refreshed, which
     /// is what made the Character card pill vanish on Refresh.
@@ -5370,7 +5405,7 @@ mod isolation_gate_tests {
     /// change even while a ritual is active, and the game follows it with the real
     /// id within milliseconds when one is: only silence past the settle window means
     /// "none". Reading the empty spawn as a deactivation made the pill, the
-    /// attribute brackets and the Bonuses line flash on every portal (#64); ignoring
+    /// attribute brackets and the Bonuses line flash on every portal; ignoring
     /// the empty delta left a ritual switched off in-game stuck until Refresh.
     #[test]
     fn blood_ritual_stat_deactivation_clears_and_zone_changes_do_not() {

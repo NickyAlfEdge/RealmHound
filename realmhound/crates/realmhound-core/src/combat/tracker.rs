@@ -29,7 +29,8 @@ use crate::stats::derived::pet_ability_deals_damage;
 use super::damage::{self, AttackerStats, Rng, DEFAULT_EXALT_BONUS};
 use super::types::{
     AbilityActivation, BoostWindow, CompletedFight, DamageProvenance, DamageTakenProvenance,
-    FightParticipant, ParticipantEndStatus, PetInfo, SummonContribution, WeaponContribution,
+    FightParticipant, ItemProcContribution, LethalStrikeContribution, ParticipantEndStatus,
+    PatternContribution, PetInfo, SummonContribution, WeaponContribution,
 };
 
 /// MaxHP fallback for boss classification, used only when an enemy is not tag-
@@ -178,7 +179,8 @@ const LOCAL_SUMMON_MAX_AGE_MS: i64 = 60_000;
 /// not depend on the asset catalog being loaded, and names are matched as well so a
 /// reskin or a new barrel-like object works without a code change. Anything else
 /// leaving the world at the same tick as a hit -- a trap, a wall piece, a mob -- is
-/// not a source, however plausible the coincidence. Background: issue #74.
+/// not a source, however plausible the coincidence. Background: some dungeon
+/// mechanics damage the boss when they despawn.
 fn is_boss_damaging_mechanic(object_type: i32) -> bool {
     matches!(object_type, 0x0786 | 0x0796)
         || get_asset_manager()
@@ -522,6 +524,9 @@ impl TrackedObject {
             ScalingStat::Vitality => self.vitality_seen.then_some(self.vitality),
             ScalingStat::Speed => self.speed_seen.then_some(self.speed),
             ScalingStat::MaxMp => Some(self.max_mp),
+            // Max HP is only usable once the server has reported it; a zero
+            // would price an HP-scaled ability as if the stat were empty.
+            ScalingStat::MaxHp => (self.max_hp > 0).then_some(self.max_hp),
         }
     }
 
@@ -634,6 +639,58 @@ struct PendingShot {
     /// trajectories. `None` for shots fired before this was recorded (and in
     /// tests), in which case both procs are credited unconditionally.
     shot_geo: Option<(f32, f32, f32)>,
+    /// Enchantment whose sub-attack supplied this shot's projectile, if any. Set
+    /// only when the resolver actually used the enchant's mapping, so the
+    /// per-weapon breakdown can show what the enchant contributed.
+    enchant_source: Option<u16>,
+    /// Cloak that supplied this shot's Lethal Strike parameters (0 when the
+    /// shot is not empowered). Kept so a mid-fight cloak swap shows one row per
+    /// cloak instead of merging their different bonuses.
+    ls_cloak: i32,
+    /// `PlayerShoot.projectileId` exactly as the client reported it (`-1` is the
+    /// weapon's default pattern). Kept raw so the breakdown can separate patterns
+    /// even when the weapon's own data cannot name them.
+    raw_projectile_id: i32,
+    /// The ability item that fired this shot, when the packet's `weaponId` named
+    /// the local player's ability slot rather than a weapon. Such a shot is the
+    /// ability's own damage -- it fires with no weapon involved (a quiver's bolt)
+    /// -- so it is credited to the ability activation and kept out of the weapon
+    /// breakdown. Weapon-synergy procs (a cloak's Lethal Strike, Holy Barrage)
+    /// never take this path: the server fires those and names them in a
+    /// `ServerPlayerShoot` instead.
+    ability_item: Option<i32>,
+}
+
+/// Identity of one equipped weapon copy: item id plus up to four enchant ids,
+/// packed into a fixed-size key so the per-hit pattern/LS/proc buckets do not
+/// allocate. Parent weapon rows are keyed the same way, so subsets attach to
+/// the exact copy that fired them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct WeaponIdentity {
+    item_id: i32,
+    enchants: [u16; 4],
+    len: u8,
+}
+
+impl WeaponIdentity {
+    fn new(item_id: i32, enchants: &[u16]) -> Self {
+        let mut packed = [0u16; 4];
+        let len = enchants.len().min(packed.len());
+        packed[..len].copy_from_slice(&enchants[..len]);
+        Self {
+            item_id,
+            enchants: packed,
+            len: len as u8,
+        }
+    }
+
+    fn as_slice(&self) -> &[u16] {
+        &self.enchants[..self.len as usize]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Accumulated contribution from one attacker during an active fight.
@@ -678,6 +735,18 @@ struct ParticipantAccum {
     /// the most damage with -- and its matching enchants -- rather than whatever
     /// they happened to have equipped when the boss died.
     damage_by_equipment: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)>,
+    /// Damage + hits fired from a specific firing pattern, keyed by
+    /// `(weapon identity, reported projectile id, enchant that supplied it)`.
+    /// Always a subset of `damage_by_equipment`, so the weapon row keeps the
+    /// total and the UI can break out the extra shots.
+    damage_by_pattern: HashMap<(WeaponIdentity, i32, Option<u16>), (i64, u64)>,
+    /// Lethal Strike bonus + empowered hit count, keyed by
+    /// `(weapon identity, cloak)`. A subset of the weapon's damage, broken out
+    /// per cloak so a swap mid-fight keeps each cloak's own bonus visible.
+    ls_by_weapon: HashMap<(WeaponIdentity, i32), (i64, u64)>,
+    /// Weapon-shot procs fired by other equipped items, keyed by
+    /// `(weapon identity, proc item id)`. A subset of the weapon's damage.
+    damage_by_item: HashMap<(WeaponIdentity, i32), (i64, u64)>,
     /// Summon/pet-sourced subset of `damage`/`hits`. The owner's row keeps the
     /// total (the game attributes pet damage to the player), but the split lets
     /// the summary show the pet's own line and keeps pet hits out of the owner's
@@ -995,6 +1064,12 @@ struct LocalVolleyHit {
     /// The fight the hit landed in, for the same reason as
     /// [`LocalDamageEvent::destination`].
     destination: FightDestination,
+    /// True when the local client fired this projectile itself from an ability
+    /// activation (`PlayerShoot.weaponId` named the ability slot), false for a
+    /// volley the server fired. A client-fired ability shot has already proved
+    /// which item owns it, so it is credited to that item's latest activation
+    /// without the attribution window the server volleys still need.
+    owns_ability: bool,
 }
 
 /// The stable identity of one fight's damage destination. A normal boss is its
@@ -1133,7 +1208,14 @@ struct FightState {
     boss_object_type: i32,
     /// The stable damage destination this fight owns (see [`FightDestination`]).
     destination: FightDestination,
+    /// The boss's max HP adopted for this fight. Before any real damage is
+    /// recorded it follows the authoritative rescale (dungeon player-count
+    /// scaling), so observers who loaded at different times agree on the pool;
+    /// once positive damage lands it is frozen.
     boss_max_hp: i32,
+    /// The HP pool the fight started with: the boss's HP when the fight was
+    /// registered, or the last pre-damage rescaled max. The overkill cap uses
+    /// this plus `healed_hp`.
     boss_start_hp: i32,
     started_at: i64,
     last_activity: i64,
@@ -1143,6 +1225,14 @@ struct FightState {
     /// to ~0 then reset to full HP for a new phase under the same object id, so
     /// the HP at removal is misleadingly high. The minimum captures the death.
     min_hp_seen: i64,
+    /// Total HP the boss regained after it had already taken damage. A healing
+    /// boss's real damage pool is its starting HP plus everything it healed
+    /// back; phase HP resets count the same way. The overkill cap uses this so a
+    /// heal is not mistaken for overkill.
+    healed_hp: i64,
+    /// A MaxHP change arrived without its matching HP reading. The next HP
+    /// update is the rescale's scaled current HP, not a heal.
+    rescale_pending: bool,
     /// Local player's char id when this fight began (0 if unknown then).
     local_char_id: i32,
     /// Count of local-player "close calls" (HP dropped below 20% of max,
@@ -1181,6 +1271,41 @@ struct FightState {
 const MAX_UPTIME_GAP_MS: i64 = 5_000;
 
 impl FightState {
+    /// The damage pool this fight actually removed, or 0 when the boss's nominal
+    /// max HP is not a damage pool at all.
+    ///
+    /// A boss that never lost HP (Moonlight Village mechanics, invulnerable
+    /// finish) absorbed damage the HP bar never reflected. A boss that healed or
+    /// reset its HP at a phase transition absorbed its starting pool plus every
+    /// point it regained, so `boss_start_hp` alone would understate it. This is
+    /// deliberately data-driven -- no per-boss list.
+    fn effective_damage_pool(&self) -> i64 {
+        let removed = self.boss_start_hp as i64 - self.min_hp_seen;
+        if removed <= 0 {
+            // A boss the game keeps off the HP bar -- the `<AlwaysPositiveHealth />`
+            // objects, of which the realm's Artificial Sprite God is one -- dies
+            // without ever reporting its HP leaving full, so `removed` stays 0 even
+            // though the whole pool was absorbed. Returning 0 there left the
+            // overkill trim with no pool to scale to, and a killed fight could
+            // report more damage than the boss had (22,569 against an 18,500 pool).
+            //
+            // Mechanics bosses whose HP genuinely never moves are excluded: an
+            // invulnerable finish, a Moonlight Village encounter and an aggregated
+            // aux row deal real damage that the bar never reflected, so their raw
+            // figures are kept. The unchanged plausibility bound in
+            // `trim_plausible_overkill` still guards phase-gated and healed damage.
+            let never_moved = self.min_hp_seen >= self.boss_start_hp as i64;
+            let mechanics = crate::assets::is_invuln_finish_boss(self.boss_object_type)
+                || crate::assets::is_mv_boss(self.boss_object_type)
+                || crate::assets::aux_target_for_type(self.boss_object_type).is_some();
+            if self.killed && never_moved && !mechanics {
+                return (self.boss_start_hp as i64).saturating_add(self.healed_hp.max(0));
+            }
+            return 0;
+        }
+        (self.boss_start_hp as i64).saturating_add(self.healed_hp.max(0))
+    }
+
     /// Accrue boss uptime up to `now_ms`, counting the elapsed slice only while
     /// the boss is vulnerable. Call on every boss damage event and on every boss
     /// condition change (with the state that applied *before* the change).
@@ -1276,9 +1401,13 @@ pub struct CombatTracker {
     /// arrive before a seed cannot be rolled.
     rng_seeded: bool,
     /// Whether local self-damage can be trusted for the current map. Cleared for
-    /// the rest of a map if the RNG is unseeded when a shot arrives or a weapon's
-    /// asset data is unavailable (either would desync the sequence).
+    /// the rest of a map if the RNG is unseeded when a shot arrives (that would
+    /// desync every later roll). An unresolvable projectile does NOT clear it:
+    /// that single shot stays unresolved instead.
     self_damage_available: bool,
+    /// Whether the one-per-map warning about an unresolvable projectile has been
+    /// logged, so a weapon firing one every tick cannot flood the log.
+    unresolved_projectile_logged: bool,
     /// Rolled local shots awaiting their `EnemyHit`, keyed by bullet id.
     pending_shots: HashMap<i16, PendingShot>,
     /// Client `time` of the most recent local shot trigger (from the outgoing
@@ -1503,6 +1632,7 @@ impl CombatTracker {
             rng: Rng::new(0),
             rng_seeded: false,
             self_damage_available: false,
+            unresolved_projectile_logged: false,
             pending_shots: HashMap::new(),
             last_shot_trigger: None,
             lethal_strike_windows: VecDeque::new(),
@@ -1639,6 +1769,7 @@ impl CombatTracker {
         self.rng = Rng::new(map_seed);
         self.rng_seeded = true;
         self.self_damage_available = true;
+        self.unresolved_projectile_logged = false;
         self.pending_shots.clear();
         self.last_shot_trigger = None;
         self.lethal_strike_windows.clear();
@@ -1690,6 +1821,7 @@ impl CombatTracker {
         // The RNG state does not survive a disconnect; a new map seed is required.
         self.rng_seeded = false;
         self.self_damage_available = false;
+        self.unresolved_projectile_logged = false;
         self.pending_shots.clear();
         self.last_shot_trigger = None;
         self.lethal_strike_windows.clear();
@@ -2011,15 +2143,17 @@ impl CombatTracker {
         } else {
             0
         };
-        let (new_hp, obj_type, obj_max_hp, previous_hp) = {
+        let (new_hp, obj_type, obj_max_hp, previous_hp, previous_max_hp) = {
             let entry = self.objects.entry(object_id).or_default();
             let previous_hp = entry.hp as i64;
+            let previous_max_hp = entry.max_hp;
             apply_stats(entry, status, time_ms);
             (
                 entry.hp as i64,
                 entry.object_type,
                 entry.max_hp,
                 previous_hp,
+                previous_max_hp,
             )
         };
         // Diff the local player's boost-relevant stats against the snapshot taken
@@ -2107,25 +2241,84 @@ impl CombatTracker {
             fight.last_activity = time_ms;
             fight.min_hp_seen = fight.min_hp_seen.min(new_hp);
 
-            // Post-survival second coming: the boss heals to full, and its max HP
-            // may have rescaled while the survival phase ran (players died /
-            // nexused, so dungeon HP-scaling readjusted). Read the authoritative
-            // current max from the status packet and keep the segment's pool
-            // pinned to that full value until the rage phase takes real damage,
-            // then freeze it. This makes the post card's denominator match the
-            // true rescaled pool even though the split fired before the heal
-            // completed (taunt) or below the peak (HP fallback).
-            if fight.segment_label == Some("Post-survival") && obj_max_hp > 0 {
-                // Freeze on the first *positive* damage only. The boss is
-                // Invulnerable while it heals, so any local shots that land
-                // during the revive resolve to 0 damage (they still register as
-                // hits) -- gating on hits would freeze a stale, pre-rescale pool
-                // before the authoritative rescaled MaxHP packet arrives.
-                let damage_started = fight.attackers.values().any(|a| a.damage > 0);
-                if !damage_started {
-                    fight.boss_max_hp = obj_max_hp;
-                    fight.boss_start_hp = obj_max_hp;
-                }
+            // Keep the fight's damage pool aligned with the boss's authoritative
+            // HP until this observer records real damage. Dungeon bosses rescale
+            // as players load in or leave, and the local observer may register
+            // the fight at an earlier scale or arrive after it has already been
+            // damaged. Freezing the first-seen numbers would make two observers
+            // of the same kill show different pools (and would let the card
+            // reconcile to HP the game removed by downscaling). While no
+            // positive damage is recorded, the pool follows the current HP and
+            // the authoritative max; a MaxHP-only packet that catches the boss
+            // at its old full pool adopts the new full max immediately.
+            //
+            // Pre-survival is skipped: its own heal-back split owns the rescaled
+            // revive pool. Post-survival pins the full rescaled max while the
+            // boss revives. Near-zero HP is death/reconciliation territory, not
+            // a new pool.
+            //
+            // Freeze on the first *positive* damage. Invulnerable-phase shots
+            // resolve to 0 damage (they may still register as hits), so gating
+            // on hits would freeze a stale, pre-rescale pool.
+            let no_damage_recorded = !fight.attackers.values().any(|a| a.damage > 0);
+            let near_zero = new_hp <= obj_max_hp as i64 / 100;
+            let is_pre_survival = fight.segment_label == Some("Pre-survival");
+            if obj_max_hp > 0 && no_damage_recorded && !near_zero && !is_pre_survival {
+                let max_changed = obj_max_hp as i64 != fight.boss_max_hp as i64;
+                let has_max_hp_stat = status
+                    .stats
+                    .iter()
+                    .any(|s| s.stat_type_id == StatType::MaxHP as u8);
+                // A MaxHP-only packet can arrive before the matching HP packet.
+                // If the boss was at its old full pool and this packet did not
+                // report HP loss, the new full max is the new pool.
+                let was_full_old_pool = has_max_hp_stat
+                    && max_changed
+                    && previous_hp > 0
+                    && previous_hp >= fight.boss_max_hp as i64
+                    && new_hp >= previous_hp;
+                let start = if fight.segment_label == Some("Post-survival") || was_full_old_pool {
+                    obj_max_hp as i64
+                } else {
+                    new_hp
+                };
+                fight.boss_max_hp = obj_max_hp;
+                fight.boss_start_hp = start as i32;
+                fight.min_hp_seen = start;
+            }
+
+            // Track HP the boss regained after it had already been damaged. This
+            // is the general healer case: the fight's real pool is the starting
+            // HP plus every heal/reset, not the starting HP alone. Gate on prior
+            // damage so a first sighting at full (or a spawn packet) is not a
+            // heal, and on a max HP that is stable across *this* update so the
+            // scaling delta itself is not either. Comparing against the previous
+            // object state (not the frozen accounting pool) keeps genuine heals
+            // counted after a mid-fight rescale.
+            let max_rescaled = previous_max_hp as i64 != obj_max_hp as i64;
+            let scaling_update = max_rescaled || fight.rescale_pending;
+            // A MaxHP-only packet can precede its matching HP packet. Remember
+            // that pending scale (and consume it on the HP packet) so the scaled
+            // current HP is not mistaken for healing.
+            fight.rescale_pending = if max_rescaled {
+                !has_hp_stat
+            } else if has_hp_stat {
+                false
+            } else {
+                fight.rescale_pending
+            };
+            if previous_hp > 0
+                && new_hp > previous_hp
+                && fight.min_hp_seen < fight.boss_start_hp as i64
+                && !scaling_update
+                // `<AlwaysPositiveHealth />` bosses refill their HP number without
+                // being healed (the Artificial Sprite God snaps back to full from
+                // 12,775). Counting that as healing widens the damage pool past
+                // anything that was dealt, so the overkill trim would then let the
+                // card report more than the boss's HP.
+                && !get_asset_manager().always_positive_health(fight.boss_object_type)
+            {
+                fight.healed_hp = fight.healed_hp.saturating_add(new_hp - previous_hp);
             }
 
             let max_hp = fight.boss_max_hp as i64;
@@ -2447,6 +2640,8 @@ impl CombatTracker {
                 last_activity: time_ms,
                 killed: false,
                 min_hp_seen: max_hp as i64,
+                healed_hp: 0,
+                rescale_pending: false,
                 local_char_id: self.local_char_id,
                 local_close_calls: 0,
                 attackers: HashMap::new(),
@@ -3088,7 +3283,8 @@ impl CombatTracker {
     /// an `Explosive Barrel` removal, in the same tick, with no shot, activation or
     /// creature of theirs behind the packet. Only objects that are such a mechanic are
     /// recorded at all (see [`is_boss_damaging_mechanic`]), so a trap or a wall piece
-    /// despawning at the same tick cannot claim the hit. Background: issue #74.
+    /// despawning at the same tick cannot claim the hit. Background: a
+    /// barrel-like mechanic deals its hit when the object leaves the world.
     fn object_removal_near(&self, target_id: i32, time_ms: i64) -> Option<i32> {
         let target = self.objects.get(&target_id)?;
         let (tx, ty) = (target.last_x, target.last_y);
@@ -3300,11 +3496,34 @@ impl CombatTracker {
         ended_at: i64,
         destination: FightDestination,
     ) -> Vec<AbilityActivation> {
-        let uses: Vec<&LocalAbilityUse> = self
+        let mut uses: Vec<&LocalAbilityUse> = self
             .local_ability_uses
             .iter()
             .filter(|u| u.time_ms >= started_at && u.time_ms <= ended_at)
             .collect();
+        // An opening ability projectile can land after the fight has started even
+        // though the activation that fired it predates the lazy fight start
+        // (the fight begins on the first hit). Keep that activation as the owner
+        // -- and as a row -- for client-fired ability shots landing in this fight.
+        for hit in self
+            .local_volley_hits
+            .iter()
+            .filter(|h| h.owns_ability)
+            .filter(|h| h.time_ms >= started_at && h.time_ms <= ended_at)
+            .filter(|h| h.destination == destination)
+        {
+            let owner = self
+                .local_ability_uses
+                .iter()
+                .rev()
+                .find(|u| u.item_id == hit.item_id && u.time_ms <= hit.time_ms);
+            if let Some(owner) = owner {
+                if !uses.iter().any(|u| std::ptr::eq(*u, owner)) {
+                    uses.push(owner);
+                }
+            }
+        }
+        uses.sort_by_key(|u| u.time_ms);
         // Credit every packet to the activation that can own it, so no packet is
         // counted twice and none lands on an ability that could not have produced
         // it. Packets are scoped to their destination first: overlapping fights
@@ -3316,11 +3535,11 @@ impl CombatTracker {
             .filter(|e| e.time_ms >= started_at && e.time_ms <= ended_at)
             .filter(|e| e.destination == destination)
         {
-            let owner = uses
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, use_)| activation_claims_packet(use_, event.time_ms));
+            let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
+                // A pre-fight activation kept for an opening projectile may only
+                // own that projectile, never a bulletless packet in this fight.
+                use_.time_ms >= started_at && activation_claims_packet(use_, event.time_ms)
+            });
             if let Some((i, _)) = owner {
                 credited[i].0 += event.damage;
                 credited[i].1 += 1;
@@ -3335,7 +3554,28 @@ impl CombatTracker {
             let owner = uses.iter().enumerate().rev().find(|(_, use_)| {
                 use_.item_id == hit.item_id
                     && hit.time_ms >= use_.time_ms
-                    && hit.time_ms - use_.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS
+                    // A shot the client fired from an activation has already
+                    // proved which item owns it, so it is the latest activation of
+                    // that item however long the projectile took to land. The
+                    // window only bounds server volleys, where a late packet could
+                    // otherwise be blamed on an activation that could not have
+                    // produced it.
+                    && (hit.owns_ability
+                        || (use_.time_ms >= started_at
+                            && hit.time_ms - use_.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS))
+            });
+            // A hit that no activation can own yet would otherwise stay in the
+            // fight total while appearing in no row at all (a quiver's first bolt
+            // can land before the fight's own first activation is in window). Fall
+            // back to the item's earliest activation so the damage is always shown
+            // against the ability that fired it.
+            let owner = owner.or_else(|| {
+                uses.iter()
+                    .position(|use_| {
+                        use_.item_id == hit.item_id
+                            && (hit.owns_ability || use_.time_ms >= started_at)
+                    })
+                    .map(|i| (i, &uses[i]))
             });
             if let Some((i, _)) = owner {
                 credited[i].0 += hit.damage;
@@ -3519,7 +3759,26 @@ impl CombatTracker {
             return;
         }
         // The local player's stats must be known to compute the attack multiplier.
-        let Some(local) = self.objects.get(&self.local_object_id) else {
+        // Snapshotted rather than borrowed: the unresolved-projectile path below
+        // mutates `self`, which a live borrow of `self.objects` forbids.
+        let local_snapshot = self.objects.get(&self.local_object_id).map(|local| {
+            (
+                local.attack_seen,
+                // Mastery and the seasonal Crucible/Blood Ritual multipliers are
+                // character data rather than object stats, so they are folded in
+                // from the tracker (see `set_shot_damage_bonus`) -- the game scales
+                // the weapon's whole damage range by them, and the server-side
+                // spell values the ability rows use already include them.
+                AttackerStats {
+                    mastery_mult: self.shot_damage_bonus.mastery,
+                    challenge_mult: self.shot_damage_bonus.challenge,
+                    ..local.attacker_stats()
+                },
+                local.equipment,
+                local.equipment_enchants.clone(),
+            )
+        });
+        let Some((attack_seen, atk, local_equipment, local_enchants)) = local_snapshot else {
             tracing::warn!(
                 "[COMBAT] self-compute disabled for this map: local object {} not in \
                  the object table at weapon={weapon_id} projectile_id={projectile_id}",
@@ -3528,7 +3787,7 @@ impl CombatTracker {
             self.self_damage_available = false;
             return;
         };
-        if !local.attack_seen {
+        if !attack_seen {
             tracing::warn!(
                 "[COMBAT] self-compute disabled for this map: local ATT stat not \
                  observed yet at weapon={weapon_id} projectile_id={projectile_id}"
@@ -3536,46 +3795,111 @@ impl CombatTracker {
             self.self_damage_available = false;
             return;
         }
-        // Mastery and the seasonal Crucible/Blood Ritual multipliers are
-        // character data rather than object stats, so they are folded in from the
-        // tracker (see `set_shot_damage_bonus`) -- the game scales the weapon's
-        // whole damage range by them, and the server-side spell values the
-        // ability rows use already include them.
-        let atk = AttackerStats {
-            mastery_mult: self.shot_damage_bonus.mastery,
-            challenge_mult: self.shot_damage_bonus.challenge,
-            ..local.attacker_stats()
+        // The packet's `weaponId` names the item that fired the projectile, and
+        // the game reports the ability slot for an ability's own shot (a quiver's
+        // bolt, fired with no weapon involved). That is a different thing from a
+        // weapon-synergy proc -- a cloak's Lethal Strike, Holy Barrage -- which
+        // the server fires and names in a `ServerPlayerShoot`; those never come
+        // through here. Detecting it up front keeps the ability's damage out of
+        // the weapon breakdown, which would otherwise read as a weapon row named
+        // after the ability.
+        let ability_item = if weapon_id >= 0 && weapon_id == local_equipment[ABILITY_SLOT] {
+            Some(weapon_id)
+        } else {
+            None
         };
-        let lethal_strike = self.lethal_strike_snapshot();
+        // A weapon shot can benefit from the weapon's Lethal Strike cloak; an
+        // ability's own shot cannot, and its bonus would otherwise be invented.
+        let lethal_strike = if ability_item.is_some() {
+            None
+        } else {
+            self.lethal_strike_snapshot()
+        };
+        let ls_cloak = if lethal_strike.is_some() {
+            local_equipment[ABILITY_SLOT]
+        } else {
+            0
+        };
 
         let proj_index = if projectile_id < 0 {
             0
         } else {
             projectile_id as usize
         };
-        let resolved = get_asset_manager().weapon_projectile(weapon_id, proj_index);
+        // An enchantment can replace or add the firing pattern a slot uses
+        // (`SetSubAttack` / `AddSubAttack`), so resolve through the enchants of
+        // the slot that fired: the weapon's, or the ability's own. A stat update
+        // lag or a mid-fight swap would pair one item's shot with another's
+        // enchants, so only trust them while that slot still holds the item that
+        // fired.
+        let firing_slot = if ability_item.is_some() {
+            ABILITY_SLOT
+        } else {
+            WEAPON_SLOT
+        };
+        let weapon_enchants: &[u16] = if weapon_id == local_equipment[firing_slot] {
+            &local_enchants[firing_slot]
+        } else {
+            &[]
+        };
+        let mut resolved = get_asset_manager().weapon_projectile_with_enchants(
+            weapon_id,
+            proj_index,
+            weapon_enchants,
+        );
+        // An ability's own shot is not priced off its raw projectile range: the
+        // item's `<Activate>` adds a flat stat-mod bonus per point of its scaling
+        // stat above a floor, and the game's tooltip prints exactly that in
+        // brackets (Quiver of Thunder "(+840)" on ATT, Quiver of Shadows "(+310)"
+        // on DEF). Rolling the bare `<Projectile>` range values every ability shot
+        // at roughly half its real damage, which is what made a quiver-only solo
+        // read 49% of a boss's HP. Resolved through the same accessors the
+        // Character Stats readout uses, so the two cannot drift apart again.
+        if let Some(item) = ability_item {
+            if let Some((bmin, bmax, bap)) = self.ability_shot_range(item) {
+                resolved = Some((
+                    bmin,
+                    bmax,
+                    bap,
+                    resolved.as_ref().map(|r| r.3).unwrap_or(0),
+                    None,
+                ));
+            }
+        }
 
-        let Some((min, max, ap, slot)) = resolved else {
-            // Unknown projectile data: cannot determine whether this shot advances
-            // the RNG, so all later rolls would be unreliable.
-            tracing::warn!(
-                "[COMBAT] self-compute disabled for this map: no projectile data for \
-                 weapon={weapon_id} projectile_id={projectile_id} (index {proj_index}, \
-                 weapon defines {} projectile type(s))",
-                get_asset_manager().projectile_type_count(weapon_id)
-            );
-            self.self_damage_available = false;
+        let Some((min, max, ap, slot, enchant_source)) = resolved else {
+            // One unresolvable projectile must not zero every later fight on this
+            // map: the shot stays unresolved (its hits are estimated from the
+            // resolved ones) and self-compute stays alive. Without projectile data
+            // the RNG step is a best-effort hedge -- consume one when the weapon's
+            // own projectile is variable-damage, which is the common case for
+            // sub-attacks, rather than leaving every later roll shifted.
+            if !self.unresolved_projectile_logged {
+                self.unresolved_projectile_logged = true;
+                tracing::warn!(
+                    "[COMBAT] unresolvable projectile: weapon={weapon_id} \
+                     projectile_id={projectile_id} (index {proj_index}, weapon \
+                     defines {} projectile type(s)); keeping self-compute for this \
+                     map and estimating these hits",
+                    get_asset_manager().projectile_type_count(weapon_id)
+                );
+            }
+            if get_asset_manager()
+                .weapon_projectile(weapon_id, 0)
+                .is_some_and(|(mn, mx, _, _)| mn != mx)
+            {
+                self.rng.next();
+            }
             return;
         };
 
-        // Weapon-damage enchant multipliers apply only when the shot's weapon is
-        // the one currently equipped in the weapon slot; a stat update lag or a
-        // mid-fight swap would otherwise pair one weapon's shot with another's
-        // enchants. Unenchanted (or mismatched) weapons roll at (1.0, 1.0), i.e.
+        // Weapon-damage enchant multipliers apply only when the shot's item is
+        // the one currently equipped in the slot that fired; a stat update lag or
+        // a mid-fight swap would otherwise pair one item's shot with another's
+        // enchants. Unenchanted (or mismatched) items roll at (1.0, 1.0), i.e.
         // exactly as before.
-        let (min_mult, max_mult) = if weapon_id == local.equipment[WEAPON_SLOT] {
-            get_asset_manager()
-                .weapon_damage_enchant_mult(&local.equipment_enchants[WEAPON_SLOT], proj_index)
+        let (min_mult, max_mult) = if weapon_id == local_equipment[firing_slot] {
+            get_asset_manager().weapon_damage_enchant_mult(&local_enchants[firing_slot], proj_index)
         } else {
             (1.0, 1.0)
         };
@@ -3584,8 +3908,12 @@ impl CombatTracker {
             damage::roll_base_damage(&mut self.rng, min, max, min_mult, max_mult, slot, &atk);
         // The gear this shot is credited to, snapshotted now: the hit may arrive
         // after a swap (see `PendingShot::shot_gear`).
-        let mut shot_gear = (local.equipment, local.equipment_enchants.clone());
-        if shot_gear.0[WEAPON_SLOT] != weapon_id {
+        let mut shot_gear = (local_equipment, local_enchants);
+        if ability_item.is_some() {
+            // The firing item is the ability, not a weapon, so the weapon slot
+            // keeps the gear actually worn: overwriting it here is what turned an
+            // ability's shots into a weapon row named after the ability.
+        } else if shot_gear.0[WEAPON_SLOT] != weapon_id {
             // The equipment snapshot lags the swap (same condition the damage-roll
             // guard above covers): trust the packet's weapon and drop the stale
             // weapon enchants rather than pair one weapon with another's.
@@ -3603,8 +3931,55 @@ impl CombatTracker {
                 procs_credited: false,
                 extra_projectile,
                 shot_geo: Some((shot_x, shot_y, angle)),
+                enchant_source,
+                raw_projectile_id: projectile_id,
+                ls_cloak,
+                ability_item,
             },
         );
+    }
+
+    /// The damage range an ability's own shot is rolled from.
+    ///
+    /// An item's `<Activate>` shoot effect carries `scalingStat`,
+    /// `statModScalingMin` and `statModDamage`: per shot its damage is the item's
+    /// `<Projectile>` range plus `statModDamage * max(0, stat - statModScalingMin)`
+    /// for whichever of the eight stats it names. `None` when the item declares no
+    /// shoot effect, in which case the raw projectile range stands.
+    ///
+    /// Readers go through the effect's own `min_for` / `max_for`, which the
+    /// Character Stats readout also uses, so the two paths share one formula
+    /// instead of two copies of it.
+    fn ability_shot_range(&self, item: i32) -> Option<(i32, i32, bool)> {
+        use crate::assets::AbilityEffect;
+        let effects = get_asset_manager().ability_effects(item)?;
+        let local = self.objects.get(&self.local_object_id)?;
+        for effect in &effects.effects {
+            match effect {
+                // `min_hex` above zero is an orb's on-hex-consume burst, which the
+                // server fires; only the on-activate burst is the client's own shot.
+                AbilityEffect::ProjectileBurst { burst, min_hex, .. } if *min_hex == 0 => {
+                    let stat = burst
+                        .scaling_stat
+                        .and_then(|s| local.effective_scaling_stat(s))
+                        .unwrap_or(0);
+                    return Some((
+                        burst.min_for(stat),
+                        burst.max_for(stat),
+                        burst.armor_piercing,
+                    ));
+                }
+                AbilityEffect::Shuriken(sh) => {
+                    let stat = sh
+                        .scaling_stat
+                        .and_then(|s| local.effective_scaling_stat(s))
+                        .unwrap_or(0);
+                    return Some((sh.min_for(stat), sh.max_for(stat), sh.armor_piercing));
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Snapshot the local player's Lethal Strike state at shoot time: the
@@ -3801,10 +4176,35 @@ impl CombatTracker {
         // Set when this hit came from a volley the server fired for a local
         // ability activation; its damage is that ability's, not the weapon's.
         let mut volley_item: Option<i32> = None;
+        // Set when the shot's projectile came from an enchantment's sub-attack.
+        let mut enchant_source: Option<u16> = None;
+        // Set when this hit came from a shot the client fired from an ability
+        // activation (its `PlayerShoot` named the ability slot), so the damage is
+        // that ability's own and not the weapon's.
+        let mut ability_shot_item: Option<i32> = None;
+        // The pattern the client reported for this shot (`-1` = default).
+        let mut raw_projectile_id: i32 = -1;
+        // Lethal Strike bonus contained in this hit's damage, and whether the hit
+        // itself was empowered (the simulated side procs add damage, not hits).
+        let mut ls_extra: i64 = 0;
+        let mut ls_empowered = false;
+        // Cloak that supplied this hit's Lethal Strike (0 = not empowered).
+        let mut ls_cloak: i32 = 0;
+        // Equipped item whose weapon-shot proc fired this hit (Holy Barrage).
+        let mut proc_item: Option<i32> = None;
+        let local_weapon = self
+            .objects
+            .get(&self.local_object_id)
+            .map(|o| o.equipment[WEAPON_SLOT])
+            .unwrap_or(-1);
         let resolved = if shooter_id == self.local_object_id {
             // Weapon shot: damage was rolled from the map RNG at shoot time.
             let weapon_resolved = if self.self_damage_available {
                 self.pending_shots.get(&bullet_id).cloned().map(|shot| {
+                    enchant_source = shot.enchant_source;
+                    raw_projectile_id = shot.raw_projectile_id;
+                    ls_cloak = shot.ls_cloak;
+                    ability_shot_item = shot.ability_item;
                     let base = damage::damage_with_defense(
                         shot.base_damage,
                         shot.armor_piercing,
@@ -3825,6 +4225,8 @@ impl CombatTracker {
                                 // Main-shot bonus: once per resolved hit (so a
                                 // piercing bullet's several hits each get it).
                                 dmg += bonus as i32;
+                                ls_extra += bonus as i64;
+                                ls_empowered = true;
                                 // Side procs: fire once per trigger, so credit
                                 // them on the first hit only to avoid piercing
                                 // duplication, and only on the primary projectile
@@ -3856,6 +4258,7 @@ impl CombatTracker {
                                         None => 2,
                                     };
                                     dmg += (proc_hits as i64 * bonus) as i32;
+                                    ls_extra += proc_hits as i64 * bonus as i64;
                                     if let Some(s) = self.pending_shots.get_mut(&bullet_id) {
                                         s.procs_credited = true;
                                     }
@@ -3883,7 +4286,16 @@ impl CombatTracker {
                     // it is credited to the ability row instead of the loadout
                     // bucket (which stays self-computed weapon damage only).
                     if let Some((_, _, item_id)) = volley {
-                        if self.local_ability_uses.iter().any(|u| {
+                        // A weapon-shot proc (Holy Barrage) belongs to the item
+                        // that owns the proc, not to an activation: it fires
+                        // whenever the condition holds, often with no activation
+                        // of that item at all. It is shown under the weapon it
+                        // fired alongside.
+                        let is_weapon_proc = item_id != local_weapon
+                            && get_asset_manager().item_has_on_shoot_proc(item_id);
+                        if is_weapon_proc {
+                            proc_item = Some(item_id);
+                        } else if self.local_ability_uses.iter().any(|u| {
                             u.item_id == item_id
                                 && u.time_ms <= time_ms
                                 && time_ms - u.time_ms <= ABILITY_ATTRIBUTION_WINDOW_MS
@@ -4017,6 +4429,49 @@ impl CombatTracker {
                 if target_guarded {
                     accum.guarded_damage += dmg as i64;
                 }
+                // Attribute the shot to its reported firing pattern. The weapon row
+                // still carries the full total; this is the subset the UI shows
+                // beneath it, split per pattern the client reported. An ability's
+                // own shot has no weapon row to sit under, so it is left out here
+                // and credited to the ability activation below.
+                if ability_shot_item.is_none() {
+                    if let Some((gear, gear_enchants)) = shot_gear.as_ref() {
+                        let weapon =
+                            WeaponIdentity::new(gear[WEAPON_SLOT], &gear_enchants[WEAPON_SLOT]);
+                        let entry = accum
+                            .damage_by_pattern
+                            .entry((weapon, raw_projectile_id, enchant_source))
+                            .or_default();
+                        entry.0 += dmg as i64;
+                        entry.1 += 1;
+                        // Lethal Strike is a bonus inside those same hits, broken
+                        // out so the cloak's share is visible on its own row.
+                        if ls_extra > 0 {
+                            let ls = accum.ls_by_weapon.entry((weapon, ls_cloak)).or_default();
+                            ls.0 += ls_extra;
+                            if ls_empowered {
+                                ls.1 += 1;
+                            }
+                        }
+                    }
+                }
+                // A weapon-shot proc from another equipped item fires alongside the
+                // weapon, so it belongs to that weapon's line with the item's icon.
+                if let Some(item_id) = proc_item {
+                    if local_weapon >= 0 {
+                        let weapon = shot_gear
+                            .as_ref()
+                            .map(|(gear, gear_enchants)| {
+                                WeaponIdentity::new(gear[WEAPON_SLOT], &gear_enchants[WEAPON_SLOT])
+                            })
+                            .unwrap_or_else(|| {
+                                WeaponIdentity::new(local_weapon, &enchants[WEAPON_SLOT])
+                            });
+                        let e = accum.damage_by_item.entry((weapon, item_id)).or_default();
+                        e.0 += dmg as i64;
+                        e.1 += 1;
+                    }
+                }
                 dmg as i64
             }
             None => {
@@ -4047,7 +4502,10 @@ impl CombatTracker {
                     entry.source_enchants = enchants;
                 }
             }
-        } else if let Some(item_id) = volley_item {
+        } else if let Some((item_id, owns_ability)) = ability_shot_item
+            .map(|item| (item, true))
+            .or_else(|| volley_item.map(|item| (item, false)))
+        {
             // An ability volley's hit: the packet named the ability that fired it,
             // so the damage belongs to that ability's own activation. It stays out
             // of the loadout bucket, which is the weapon breakdown and holds
@@ -4058,6 +4516,7 @@ impl CombatTracker {
                 item_id,
                 damage: dmg,
                 destination,
+                owns_ability,
             });
             self.trim_local_event_logs();
         } else {
@@ -4209,6 +4668,8 @@ impl CombatTracker {
                 last_activity: time_ms,
                 killed: false,
                 min_hp_seen: start_hp as i64,
+                healed_hp: 0,
+                rescale_pending: false,
                 local_char_id: self.local_char_id,
                 local_close_calls: carried_close_calls,
                 attackers: HashMap::new(),
@@ -4273,6 +4734,8 @@ impl CombatTracker {
                 last_activity: time_ms,
                 killed: false,
                 min_hp_seen: 0,
+                healed_hp: 0,
+                rescale_pending: false,
                 local_char_id,
                 local_close_calls: 0,
                 attackers: HashMap::new(),
@@ -4571,21 +5034,23 @@ impl CombatTracker {
         // trimming so an over-full total is scaled with everyone else.
         let masked_is_local = self.reconcile_masked_local(&fight, &mut participants);
 
-        // Trim overkill: when the boss is killed, the sum of attributed damage
-        // must not exceed the HP it actually lost (its start HP). The final
-        // volley routinely lands several projectiles in the death tick that each
-        // roll full damage, overshooting the HP pool. Scale participant damage
-        // down proportionally so shares are preserved and the total matches the
-        // boss HP (exact for a solo kill). Only shrinks totals, never inflates,
-        // so it is a no-op for crowded fights where we saw less than the full HP.
+        // Trim only *plausible* death-tick overkill. The final volley routinely
+        // lands several projectiles in the death tick that each roll full damage,
+        // overshooting the HP pool; scaling those down keeps a normal kill at
+        // 100% without under-reporting anyone.
         //
-        // Moonlight Village mechanics bosses are exempt: they never lose HP (the
-        // run is scored by its clear, not by a death), so their nominal max HP is
-        // not the damage they absorbed. Capping there would truncate the party's
-        // real output, so raw damage is kept as-is and shares are later taken
-        // against the tracked total.
-        if fight.killed && !crate::assets::is_mv_boss(fight.boss_object_type) {
-            cap_overkill(&mut participants, fight.boss_start_hp as i64);
+        // Boss HP is not a safe cap in general. Bosses that heal, reset HP at a
+        // phase transition, or gate damage behind phase thresholds absorb far
+        // more than their starting pool, and the server still reports those hits.
+        // `effective_damage_pool` accounts for the first two by adding the HP the
+        // boss regained; the plausibility bound catches the third (and any other
+        // "the HP bar didn't tell the whole story" mechanic). Beyond the bound,
+        // the excess is not overkill, so the party's raw damage is kept and each
+        // player's share stays honest. This is one general policy, not a list of
+        // per-boss exceptions; it also covers Moonlight Village mechanics bosses,
+        // whose nominal max HP is never removed.
+        if fight.killed {
+            trim_plausible_overkill(&fight, &mut participants);
         }
 
         // Solo HP-gap reconciliation: in an effectively-solo, fully-observed kill,
@@ -5043,7 +5508,12 @@ impl CombatTracker {
             // damage is reconstructed from their own shot packets. Remote rows are
             // whole damage packets with no weapon attribution.
             weapons: if is_local {
-                aggregate_weapons(&accum.damage_by_equipment)
+                aggregate_weapons(
+                    &accum.damage_by_equipment,
+                    &accum.damage_by_pattern,
+                    &accum.ls_by_weapon,
+                    &accum.damage_by_item,
+                )
             } else {
                 Vec::new()
             },
@@ -5753,6 +6223,8 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
     dst.started_at = dst.started_at.min(src.started_at);
     dst.last_activity = dst.last_activity.max(src.last_activity);
     dst.min_hp_seen = dst.min_hp_seen.min(src.min_hp_seen);
+    dst.healed_hp = dst.healed_hp.saturating_add(src.healed_hp);
+    dst.rescale_pending |= src.rescale_pending;
     dst.killed = dst.killed || src.killed;
     dst.joined_late = dst.joined_late || src.joined_late;
     dst.local_close_calls += src.local_close_calls;
@@ -5805,23 +6277,76 @@ fn merge_fight_into(dst: &mut FightState, src: FightState) {
             bucket.0 += dmg;
             bucket.1 += hits;
         }
+        for (key, (dmg, hits)) in accum.damage_by_pattern {
+            let bucket = e.damage_by_pattern.entry(key).or_default();
+            bucket.0 += dmg;
+            bucket.1 += hits;
+        }
+        for (key, (dmg, hits)) in accum.ls_by_weapon {
+            let bucket = e.ls_by_weapon.entry(key).or_default();
+            bucket.0 += dmg;
+            bucket.1 += hits;
+        }
+        for (key, (dmg, hits)) in accum.damage_by_item {
+            let bucket = e.damage_by_item.entry(key).or_default();
+            bucket.0 += dmg;
+            bucket.1 += hits;
+        }
+    }
+}
+
+/// Resolve a raw weapon identity's enchant list the way the parent rows do: a
+/// bucket recorded before the weapon's enchants arrived folds into the same
+/// weapon's enchanted row.
+fn effective_weapon_enchants(
+    identity: &WeaponIdentity,
+    enchants_by_weapon: &HashMap<i32, Vec<u16>>,
+) -> Vec<u16> {
+    if identity.is_empty() {
+        enchants_by_weapon
+            .get(&identity.item_id)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        identity.as_slice().to_vec()
     }
 }
 
 /// Collapse a participant's per-loadout damage buckets into one row per weapon
 /// (item id plus the enchants it was fired with), summing across loadouts so a
 /// mid-fight armor or ring swap does not split the same weapon's contribution.
+/// The per-pattern buckets are attached as a subset of their weapon's row.
 /// Highest damage first.
 fn aggregate_weapons(
     buckets: &HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)>,
+    pattern_buckets: &HashMap<(WeaponIdentity, i32, Option<u16>), (i64, u64)>,
+    ls_buckets: &HashMap<(WeaponIdentity, i32), (i64, u64)>,
+    item_buckets: &HashMap<(WeaponIdentity, i32), (i64, u64)>,
 ) -> Vec<WeaponContribution> {
     let mut out: Vec<WeaponContribution> = Vec::new();
+    // A loadout bucket recorded before the weapon's enchants arrived has an empty
+    // enchant list. Fold those into the same weapon's enchanted row rather than
+    // showing a one-hit ghost line beside it.
+    let mut enchants_by_weapon: HashMap<i32, Vec<u16>> = HashMap::new();
+    for ((gear, enchants), _) in buckets {
+        let weapon_id = gear[WEAPON_SLOT];
+        if !enchants[WEAPON_SLOT].is_empty() {
+            enchants_by_weapon.insert(weapon_id, enchants[WEAPON_SLOT].clone());
+        }
+    }
     for ((gear, enchants), &(damage, hits)) in buckets {
         let weapon_id = gear[WEAPON_SLOT];
         if weapon_id < 0 {
             continue;
         }
-        let weapon_enchants = enchants[WEAPON_SLOT].clone();
+        let weapon_enchants = if enchants[WEAPON_SLOT].is_empty() {
+            enchants_by_weapon
+                .get(&weapon_id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            enchants[WEAPON_SLOT].clone()
+        };
         match out
             .iter_mut()
             .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
@@ -5835,8 +6360,104 @@ fn aggregate_weapons(
                 enchants: weapon_enchants,
                 damage,
                 hits,
+                patterns: Vec::new(),
+                ls: Vec::new(),
+                item_procs: Vec::new(),
             }),
         }
+    }
+    for ((identity, cloak_id), &(ls_damage, ls_hits)) in ls_buckets {
+        let weapon_id = identity.item_id;
+        let weapon_enchants = effective_weapon_enchants(identity, &enchants_by_weapon);
+        if let Some(w) = out
+            .iter_mut()
+            .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
+        {
+            w.ls.push(LethalStrikeContribution {
+                item_id: *cloak_id,
+                damage: ls_damage,
+                hits: ls_hits,
+            });
+        }
+    }
+    for ((identity, item_id), &(damage, hits)) in item_buckets {
+        let weapon_id = identity.item_id;
+        let weapon_enchants = effective_weapon_enchants(identity, &enchants_by_weapon);
+        if let Some(w) = out
+            .iter_mut()
+            .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
+        {
+            w.item_procs.push(ItemProcContribution {
+                item_id: *item_id,
+                damage,
+                hits,
+            });
+        }
+    }
+    for ((identity, projectile_id, enchant_id), &(damage, hits)) in pattern_buckets {
+        let weapon_id = identity.item_id;
+        let weapon_enchants = effective_weapon_enchants(identity, &enchants_by_weapon);
+        if let Some(w) = out
+            .iter_mut()
+            .find(|w| w.weapon_id == weapon_id && w.enchants == weapon_enchants)
+        {
+            w.patterns.push(PatternContribution {
+                projectile_id: *projectile_id,
+                enchant_id: *enchant_id,
+                damage,
+                hits,
+            });
+        }
+    }
+    for w in out.iter_mut() {
+        // The pattern with the most hits is the weapon's default.
+        let default_pid = if w.patterns.iter().any(|p| p.projectile_id == -1) {
+            -1
+        } else {
+            w.patterns
+                .iter()
+                .max_by_key(|p| p.hits)
+                .map(|p| p.projectile_id)
+                .unwrap_or(0)
+        };
+        let sole_sub_attack_enchant = {
+            let mut candidates = w
+                .enchants
+                .iter()
+                .copied()
+                .filter(|&e| get_asset_manager().enchant_sub_attack_count(e) > 0);
+            match (candidates.next(), candidates.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        };
+        // A weapon that defines more than one projectile reports their indices as
+        // `projectileId`: those are its own main shots, not extra patterns, and
+        // must stay in the weapon row. Only when the weapon can fire just one
+        // projectile is a second reported index necessarily something the enchant
+        // added.
+        let single_projectile = get_asset_manager().projectile_type_count(w.weapon_id) <= 1;
+        if single_projectile && sole_sub_attack_enchant.is_some() {
+            for p in w.patterns.iter_mut() {
+                if p.enchant_id.is_none() && p.projectile_id != default_pid {
+                    p.enchant_id = sole_sub_attack_enchant;
+                }
+            }
+        }
+        // Keep only patterns that are provably extra: enchant-sourced ones. Any
+        // other reported index is the weapon's own projectile.
+        w.patterns.retain(|p| p.enchant_id.is_some());
+        w.patterns.sort_by(|a, b| {
+            b.damage
+                .cmp(&a.damage)
+                .then(b.hits.cmp(&a.hits))
+                .then(a.projectile_id.cmp(&b.projectile_id))
+        });
+    }
+    for w in out.iter_mut() {
+        w.item_procs
+            .sort_by(|a, b| b.damage.cmp(&a.damage).then(a.item_id.cmp(&b.item_id)));
+        w.ls.sort_by(|a, b| b.damage.cmp(&a.damage).then(a.item_id.cmp(&b.item_id)));
     }
     out.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
     out
@@ -5853,10 +6474,53 @@ fn drop_unresolved(participants: &mut Vec<FightParticipant>) {
     participants.retain(|p| !(p.provenance == DamageProvenance::Unresolved && !p.is_local));
 }
 
-/// Scale participant damage so the total does not exceed `cap` (the boss HP the
-/// fight removed). Preserves each participant's share and integer exactness
-/// (largest-remainder distribution). A no-op when the total is already within
-/// the cap, so it only ever removes overkill, never inflates undercounted fights.
+/// How far above the effective damage pool a raw total may sit before it stops
+/// looking like a final-volley overshoot. The death tick can add a whole volley
+/// (or several), but not multiples of the boss's pool. Past this bound the
+/// excess is healed/gated/absorbed damage that the HP bar never reflected, and
+/// proportionally scaling the party to the pool would under-report everyone.
+const OVERKILL_MAX_PLAUSIBLE_FACTOR: i64 = 2;
+
+/// Trim the final volley's overshoot when -- and only when -- the raw total is
+/// plausibly just overkill for the pool this fight actually removed.
+///
+/// This is the general gate for "boss HP is not the damage the boss absorbed":
+/// healers (the pool includes healed HP), phase HP resets, phase-gate caps, and
+/// invulnerable-finish/mechanics bosses (their pool is 0 because they never
+/// lost HP) all bypass the proportional cap. No boss identity is consulted.
+fn trim_plausible_overkill(fight: &FightState, participants: &mut [FightParticipant]) {
+    let pool = fight.effective_damage_pool();
+    if pool <= 0 {
+        return;
+    }
+    let raw_total = participants
+        .iter()
+        .fold(0i64, |sum, p| sum.saturating_add(p.damage.max(0)));
+    let plausible_bound = pool.saturating_mul(OVERKILL_MAX_PLAUSIBLE_FACTOR);
+    if raw_total <= plausible_bound {
+        cap_overkill(participants, pool);
+    } else {
+        // Not a death-tick overshoot: the boss absorbed/healed/gated damage the
+        // HP bar never reflected. Keep raw shares and leave a breadcrumb so
+        // affected encounters can be identified without a per-boss list.
+        tracing::debug!(
+            "[COMBAT] overkill cap skipped: type={} raw={} pool={} healed={} \
+             min_hp={} start_hp={}",
+            fight.boss_object_type,
+            raw_total,
+            pool,
+            fight.healed_hp,
+            fight.min_hp_seen,
+            fight.boss_start_hp
+        );
+    }
+}
+
+/// Scale participant damage so the total does not exceed `cap` (the effective
+/// damage pool the fight removed). Preserves each participant's share and
+/// integer exactness (largest-remainder distribution). A no-op when the total is
+/// already within the cap. Callers must only pass a plausible death-tick
+/// overshoot; see [`trim_plausible_overkill`].
 fn cap_overkill(participants: &mut [FightParticipant], cap: i64) {
     if cap <= 0 {
         return;
@@ -5880,6 +6544,27 @@ fn cap_overkill(participants: &mut [FightParticipant], cap: i64) {
         if let Some(gd) = p.guarded_damage.as_mut() {
             let graw = (*gd).max(0) as i128 * cap as i128;
             *gd = (graw / total as i128) as i64;
+        }
+        // The pattern breakdown is likewise a subset of the weapon rows, so it
+        // scales with them or a sub-row could exceed its weapon after a trim.
+        for w in p.weapons.iter_mut() {
+            // Scale the weapon row itself too: its sub-rows are scaled below, so
+            // leaving it at its pre-trim figure would manufacture "native" damage
+            // that has no hits behind it (and rows that no longer sum).
+            let wraw = w.damage.max(0) as i128 * cap as i128;
+            w.damage = (wraw / total as i128) as i64;
+            for pc in w.patterns.iter_mut() {
+                let praw = pc.damage.max(0) as i128 * cap as i128;
+                pc.damage = (praw / total as i128) as i64;
+            }
+            for ls in w.ls.iter_mut() {
+                let lraw = ls.damage.max(0) as i128 * cap as i128;
+                ls.damage = (lraw / total as i128) as i64;
+            }
+            for ip in w.item_procs.iter_mut() {
+                let iraw = ip.damage.max(0) as i128 * cap as i128;
+                ip.damage = (iraw / total as i128) as i64;
+            }
         }
         assigned += floor;
         remainders.push((i, rem));
@@ -6310,6 +6995,8 @@ mod tests {
             last_activity: started_at,
             killed: false,
             min_hp_seen: 300_000,
+            healed_hp: 0,
+            rescale_pending: false,
             local_char_id: 42,
             local_close_calls,
             attackers: HashMap::new(),
@@ -6324,13 +7011,16 @@ mod tests {
     }
 
     #[test]
-    fn merge_fight_into_sums_close_calls() {
+    fn merge_fight_into_sums_close_calls_and_healing() {
         // A wandering boss re-detected under a new segment must not drop the
-        // close calls recorded on either segment.
+        // close calls or healing recorded on either segment.
         let mut dst = fight_state(1, 100);
-        let src = fight_state(2, 200);
+        dst.healed_hp = 40;
+        let mut src = fight_state(2, 200);
+        src.healed_hp = 60;
         merge_fight_into(&mut dst, src);
         assert_eq!(dst.local_close_calls, 3);
+        assert_eq!(dst.healed_hp, 100);
     }
 
     #[test]
@@ -7211,6 +7901,31 @@ mod tests {
         assert!(!t.rng_seeded);
         assert!(!t.self_damage_available);
         assert!(t.pending_shots.is_empty());
+    }
+
+    #[test]
+    fn unresolvable_projectile_does_not_disable_the_map() {
+        // One projectile the asset layer cannot resolve (in tests no assets are
+        // loaded, which is the same shape as an unmodelled enchant sub-attack)
+        // must leave that shot unvalued instead of zeroing every later fight on
+        // the map.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 100)]), 5);
+        t.on_local_shot(0x333, 1, 7, 10, 0.0, 0.0, 0.0, 10);
+        assert!(
+            t.self_damage_available,
+            "an unresolved projectile keeps self-compute alive"
+        );
+        assert!(
+            !t.pending_shots.contains_key(&7),
+            "the unresolved shot is not given a value"
+        );
+        // A second one is equally harmless (and does not log again).
+        t.on_local_shot(0x333, 2, 8, 20, 0.0, 0.0, 0.0, 20);
+        assert!(t.self_damage_available);
+        assert!(t.unresolved_projectile_logged);
     }
 
     #[test]
@@ -8748,14 +9463,167 @@ mod tests {
             (300, 3),
         );
         buckets.insert(([200, 1, 2, 3], [vec![], vec![], vec![], vec![]]), (100, 2));
-        let weapons = aggregate_weapons(&buckets);
+        let mut ls = HashMap::new();
+        ls.insert((WeaponIdentity::new(100, &[7]), 2855), (250i64, 4u64));
+        ls.insert((WeaponIdentity::new(100, &[7]), 2600), (90i64, 2u64));
+        let mut item_buckets = HashMap::new();
+        item_buckets.insert((WeaponIdentity::new(100, &[7]), 608), (900i64, 9u64));
+        let weapons = aggregate_weapons(&buckets, &HashMap::new(), &ls, &item_buckets);
         assert_eq!(weapons.len(), 2, "one row per weapon, not per loadout");
         assert_eq!(weapons[0].weapon_id, 100);
         assert_eq!(weapons[0].damage, 800);
         assert_eq!(weapons[0].hits, 8);
         assert_eq!(weapons[0].enchants, vec![7]);
+        assert!(
+            weapons[0].patterns.is_empty(),
+            "no per-pattern shots recorded"
+        );
+        assert_eq!(weapons[0].ls.len(), 2, "one Lethal Strike row per cloak");
+        assert_eq!(weapons[0].ls[0].item_id, 2855, "highest bonus first");
+        assert_eq!((weapons[0].ls[0].damage, weapons[0].ls[0].hits), (250, 4));
+        assert_eq!(weapons[0].ls[1].item_id, 2600);
+        assert_eq!(weapons[0].item_procs.len(), 1, "item proc subset attached");
+        assert_eq!(weapons[0].item_procs[0].item_id, 608);
+        assert_eq!(
+            (
+                weapons[0].item_procs[0].damage,
+                weapons[0].item_procs[0].hits
+            ),
+            (900, 9)
+        );
         assert_eq!(weapons[1].weapon_id, 200);
         assert_eq!(weapons[1].damage, 100);
+        assert!(weapons[1].ls.is_empty(), "no LS on the other weapon");
+        assert!(weapons[1].item_procs.is_empty());
+    }
+
+    #[test]
+    fn subset_buckets_keep_each_weapon_copys_enchant_identity() {
+        // Two copies of the same weapon id with different enchants were fired in
+        // one fight. Parent rows are distinct; the pattern/LS/proc subsets must
+        // attach to their own copy instead of whichever row is visited first.
+        let mut buckets: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)> = HashMap::new();
+        buckets.insert(
+            ([100, -1, -1, -1], [vec![1], vec![], vec![], vec![]]),
+            (1_000, 10),
+        );
+        buckets.insert(
+            ([100, -1, -1, -1], [vec![2], vec![], vec![], vec![]]),
+            (1_000, 10),
+        );
+        let mut patterns = HashMap::new();
+        patterns.insert(
+            (WeaponIdentity::new(100, &[1]), -1, Some(1)),
+            (1_000i64, 10u64),
+        );
+        patterns.insert(
+            (WeaponIdentity::new(100, &[2]), -1, Some(2)),
+            (1_000i64, 10u64),
+        );
+        let mut ls = HashMap::new();
+        ls.insert((WeaponIdentity::new(100, &[1]), 2855), (100i64, 2u64));
+        ls.insert((WeaponIdentity::new(100, &[2]), 2855), (200i64, 3u64));
+        let mut procs = HashMap::new();
+        procs.insert((WeaponIdentity::new(100, &[1]), 608), (50i64, 1u64));
+        procs.insert((WeaponIdentity::new(100, &[2]), 608), (70i64, 1u64));
+
+        let weapons = aggregate_weapons(&buckets, &patterns, &ls, &procs);
+        assert_eq!(weapons.len(), 2, "each enchanted copy keeps its own row");
+        for w in &weapons {
+            let (ls_damage, proc_damage) = match w.enchants.as_slice() {
+                [1] => (100, 50),
+                [2] => (200, 70),
+                other => panic!("unexpected enchants {other:?}"),
+            };
+            assert_eq!(
+                w.patterns.len(),
+                1,
+                "only this copy's pattern attaches (was combined on one copy)"
+            );
+            assert_eq!((w.patterns[0].damage, w.patterns[0].hits), (1_000, 10));
+            assert_eq!(w.ls.len(), 1);
+            assert_eq!((w.ls[0].item_id, w.ls[0].damage), (2855, ls_damage));
+            assert_eq!(w.item_procs.len(), 1);
+            assert_eq!(
+                (w.item_procs[0].item_id, w.item_procs[0].damage),
+                (608, proc_damage)
+            );
+        }
+    }
+
+    #[test]
+    fn enchant_sub_attack_hits_get_their_own_row_under_the_weapon() {
+        // A shot whose projectile came from an enchantment's sub-attack is still
+        // part of the weapon's total, but also gets its own line so the enchant's
+        // hits and value are visible.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 10);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::HP, 300_000)],
+            ),
+            10,
+        );
+        t.pending_shots.insert(
+            7,
+            PendingShot {
+                base_damage: 100,
+                shot_gear: ([3073, -1, -1, -1], Default::default()),
+                enchant_source: Some(0x4008),
+                raw_projectile_id: 1,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 7, 1000, 1000, 12);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
+        let done = t.on_tick(20);
+        let local = done[0]
+            .participants
+            .iter()
+            .find(|p| p.is_local)
+            .expect("local participant retained");
+        assert_eq!(local.weapons.len(), 1);
+        let weapon = &local.weapons[0];
+        assert_eq!(weapon.weapon_id, 3073);
+        assert_eq!(weapon.hits, 1, "the weapon row keeps the full total");
+        assert_eq!(
+            weapon.patterns.len(),
+            1,
+            "the extra pattern gets its own row"
+        );
+        assert_eq!(weapon.patterns[0].projectile_id, 1);
+        assert_eq!(weapon.patterns[0].enchant_id, Some(0x4008));
+        assert_eq!(weapon.patterns[0].hits, 1);
+        assert_eq!(
+            weapon.patterns[0].damage, weapon.damage,
+            "the sub-row is a subset of the weapon row"
+        );
+    }
+
+    #[test]
+    fn a_weapon_bucket_without_enchants_merges_into_its_enchanted_row() {
+        // A hit recorded before the weapon's enchant list arrived must not show as
+        // a second, one-hit line for the same weapon.
+        let mut buckets: HashMap<([i32; 4], [Vec<u16>; 4]), (i64, u64)> = HashMap::new();
+        buckets.insert(
+            ([100, 1, 2, 3], [vec![7], vec![], vec![], vec![]]),
+            (500, 5),
+        );
+        buckets.insert(([100, 1, 9, 3], [vec![], vec![], vec![], vec![]]), (50, 1));
+        let weapons =
+            aggregate_weapons(&buckets, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            weapons.len(),
+            1,
+            "the snapshot without enchants folds into the enchanted row"
+        );
+        assert_eq!(weapons[0].enchants, vec![7]);
+        assert_eq!((weapons[0].damage, weapons[0].hits), (550, 6));
     }
 
     #[test]
@@ -9003,6 +9871,7 @@ mod tests {
                 item_id: 999,
                 damage,
                 destination,
+                owns_ability: false,
             });
         }
 
@@ -9060,6 +9929,327 @@ mod tests {
         assert!(
             p.damage_by_equipment.is_empty(),
             "a spell volley is not the weapon's self-computed damage"
+        );
+    }
+
+    #[test]
+    fn ability_shot_is_credited_to_its_activation_not_the_weapon() {
+        // An ability that fires its own projectile (a quiver's bolt) sends a
+        // PlayerShoot naming the ability slot, not a weapon. That hit is the
+        // ability's damage: it belongs on the ability row and must not become a
+        // weapon row named after the ability, even when the fight held no weapon
+        // shot at all.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 300_000),
+                    stat(StatType::HP, 300_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            10,
+        );
+        t.on_object_status(1000, &status(1000, vec![name_stat("You")]), 10);
+        t.local_ability_uses
+            .push_back(ability_use(100, 0xC07, None));
+        t.pending_shots.insert(
+            9,
+            PendingShot {
+                base_damage: 1000,
+                shot_gear: ([-1, 0xC07, -1, -1], Default::default()),
+                ability_item: Some(0xC07),
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 9, 1000, 1000, 150);
+
+        let acts = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
+        assert_eq!(acts.len(), 1);
+        assert_eq!((acts[0].damage, acts[0].hits), (1000, 1));
+        let p = &t.fights.get(&500).unwrap().attackers[&1000];
+        assert_eq!(p.damage, 1000, "the hit still counts in the fight total");
+        assert!(
+            p.damage_by_equipment.is_empty(),
+            "an ability's own shot is not a weapon's damage"
+        );
+        assert!(
+            p.damage_by_pattern.is_empty(),
+            "nor does it open a firing-pattern row under a weapon"
+        );
+        assert!(
+            p.ls_by_weapon.is_empty(),
+            "ability shots get no Lethal Strike"
+        );
+    }
+
+    #[test]
+    fn an_ability_shot_stays_with_its_activation_past_the_volley_window() {
+        // The window that bounds server-fired volleys exists because a late packet
+        // could otherwise be blamed on an activation that could not have produced
+        // it. A client-fired ability shot already proves its owner, so a slow
+        // projectile landing after the window still credits the activation that
+        // fired it instead of falling out of the breakdown.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 300_000),
+                    stat(StatType::HP, 300_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            10,
+        );
+        t.on_object_status(1000, &status(1000, vec![name_stat("You")]), 10);
+        t.local_ability_uses
+            .push_back(ability_use(100, 0xC07, None));
+        t.pending_shots.insert(
+            9,
+            PendingShot {
+                base_damage: 1000,
+                shot_gear: ([-1, 0xC07, -1, -1], Default::default()),
+                ability_item: Some(0xC07),
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 9, 1000, 1000, 6_000);
+
+        let acts = t.ability_activations_for(0, 10_000, FightDestination::Boss(500));
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (1000, 1),
+            "a hit five seconds after the activation still belongs to it"
+        );
+    }
+
+    #[test]
+    fn the_firing_slot_decides_how_a_client_shot_is_bucketed() {
+        // End to end through `on_local_shot`: the packet's weapon id resolves the
+        // projectile (the ability's own, so its damage range is used), while the
+        // weapon slot keeps the gear actually worn instead of being overwritten
+        // with the ability's item id.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() || am.weapon_projectile(0xC07, 0).is_none() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    name_stat("You"),
+                    stat(StatType::Attack, 65),
+                    stat(StatType::Inventory0, 3072),
+                    stat(StatType::Inventory1, 0xC07),
+                ],
+            ),
+            10,
+        );
+        t.on_local_shot(0xC07, -1, 7, 100, 0.0, 0.0, 0.0, 150);
+
+        let shot = t
+            .pending_shots
+            .get(&7)
+            .expect("the ability's shot recorded");
+        assert_eq!(shot.ability_item, Some(0xC07));
+        assert_eq!(
+            shot.shot_gear.0[WEAPON_SLOT], 3072,
+            "the weapon slot keeps the equipped weapon, not the firing ability"
+        );
+        assert!(
+            shot.base_damage >= 925,
+            "the shot rolled the ability's projectile range (925-1125), \
+             got {}",
+            shot.base_damage
+        );
+        assert!(
+            shot.lethal_strike.is_none(),
+            "no Lethal Strike on ability shots"
+        );
+    }
+
+    #[test]
+    fn a_weapon_shot_is_unaffected_by_the_ability_slot() {
+        // The same path with the packet naming the weapon: nothing about the
+        // ability-slot branch may leak into a normal weapon shot.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() || am.weapon_projectile(0xC07, 0).is_none() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    name_stat("You"),
+                    stat(StatType::Attack, 65),
+                    stat(StatType::Inventory0, 0xC07),
+                    stat(StatType::Inventory1, 3072),
+                ],
+            ),
+            10,
+        );
+        t.on_local_shot(0xC07, -1, 7, 100, 0.0, 0.0, 0.0, 150);
+
+        let shot = t.pending_shots.get(&7).expect("shot recorded");
+        assert_eq!(
+            shot.ability_item, None,
+            "an item in the weapon slot is a weapon, whatever else is equipped"
+        );
+        assert_eq!(shot.shot_gear.0[WEAPON_SLOT], 0xC07);
+    }
+
+    #[test]
+    fn an_ability_shot_is_rolled_from_its_stat_modded_range() {
+        // Quiver of Thunder declares 925-1125 and `statModDamage="40"` above ATT
+        // 55, so the game's own tooltip prints 1765-1965 at ATT 76 -- "(+840)".
+        // Rolling the bare projectile range values every shot at about half its
+        // damage, which is what made a quiver-only solo read 49% of a boss's HP.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let Some(burst) = am.ability_effects(0xC07).and_then(|fx| {
+            fx.effects.into_iter().find_map(|e| match e {
+                crate::assets::AbilityEffect::ProjectileBurst { burst, min_hex, .. }
+                    if min_hex == 0 =>
+                {
+                    Some(burst)
+                }
+                _ => None,
+            })
+        }) else {
+            eprintln!("skipping: Quiver of Thunder declares no shoot effect");
+            return;
+        };
+        assert_eq!(
+            (burst.min_for(76), burst.max_for(76)),
+            (1765, 1965),
+            "the in-game tooltip's range at ATT 76"
+        );
+        assert_eq!(
+            (burst.min_for(81), burst.max_for(81)),
+            (1965, 2165),
+            "the Character Stats readout's average (+1040) at ATT 81"
+        );
+
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 42, 0);
+        t.on_player_loaded(1000, 42);
+        t.on_object_status(
+            1000,
+            &status(
+                1000,
+                vec![
+                    name_stat("You"),
+                    stat(StatType::Attack, 76),
+                    stat(StatType::Inventory1, 0xC07),
+                ],
+            ),
+            10,
+        );
+        t.on_local_shot(0xC07, -1, 7, 100, 0.0, 0.0, 0.0, 150);
+
+        let shot = t.pending_shots.get(&7).expect("shot recorded");
+        assert_eq!(shot.ability_item, Some(0xC07));
+        assert!(
+            (1765..1965).contains(&shot.base_damage),
+            "the roll lands inside the tooltip range, got {}",
+            shot.base_damage
+        );
+    }
+
+    #[test]
+    fn an_ability_hit_before_its_first_activation_is_still_credited() {
+        // A quiver's first bolt can land before the fight's own first activation
+        // is inside the window. Losing it would leave the damage in the fight
+        // total while no row showed it (observed: 8 hits landed, 7 credited).
+        let mut t = CombatTracker::new();
+        t.local_ability_uses
+            .push_back(ability_use(500, 0xC07, None));
+        t.local_volley_hits.push_back(LocalVolleyHit {
+            time_ms: 100,
+            item_id: 0xC07,
+            damage: 900,
+            destination: FightDestination::Boss(500),
+            owns_ability: true,
+        });
+        let acts = t.ability_activations_for(0, 1_000, FightDestination::Boss(500));
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (900, 1),
+            "the item's earliest activation takes the hit rather than dropping it"
+        );
+    }
+
+    #[test]
+    fn an_opening_ability_projectile_keeps_its_pre_fight_activation() {
+        // Fights start lazily on the first hit, so the activation that fired an
+        // opening ability projectile predates `started_at`. That activation must
+        // still own the hit (and appear in the breakdown) instead of the damage
+        // vanishing from every row.
+        let mut t = CombatTracker::new();
+        t.local_ability_uses
+            .push_back(ability_use(100, 0xC07, None));
+        t.local_ability_uses
+            .push_back(ability_use(400, 0xC07, None));
+        t.local_volley_hits.push_back(LocalVolleyHit {
+            time_ms: 150,
+            item_id: 0xC07,
+            damage: 1_000,
+            destination: FightDestination::Boss(500),
+            owns_ability: true,
+        });
+
+        let acts = t.ability_activations_for(150, 1_000, FightDestination::Boss(500));
+        assert_eq!(
+            acts.len(),
+            2,
+            "the pre-fight activation is kept alongside the in-fight one"
+        );
+        assert_eq!(acts[0].item_id, 0xC07);
+        assert_eq!(acts[0].start_offset_ms, 0);
+        assert_eq!(
+            (acts[0].damage, acts[0].hits),
+            (1_000, 1),
+            "the opening hit stays with the activation that fired it"
+        );
+        assert_eq!(
+            (acts[1].damage, acts[1].hits),
+            (0, 0),
+            "a later activation cannot steal the opening hit"
         );
     }
 
@@ -10305,6 +11495,306 @@ mod tests {
     }
 
     #[test]
+    fn healing_boss_damage_is_not_capped_to_starting_hp() {
+        // Track the real damage pool: start 100k, heal 30k back after damage,
+        // then kill. The party dealt 130k, which is exactly the pool -- without
+        // counting the heal it would look like 1.3x overkill and be trimmed.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Sprite World", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 100_000), stat(StatType::HP, 100_000)],
+            ),
+            0,
+        );
+        fn hit(t: &mut CombatTracker, bullet: i16, base: i32, hp: i32, at: i64) {
+            t.pending_shots.insert(
+                bullet,
+                PendingShot {
+                    base_damage: base,
+                    armor_piercing: true,
+                    ..Default::default()
+                },
+            );
+            t.on_local_hit(500, bullet, 1000, 1000, at);
+            t.on_object_status(500, &status(500, vec![stat(StatType::HP, hp)]), at + 1);
+        }
+        hit(&mut t, 10, 60_000, 40_000, 10);
+        // Heal back to 70k: 30k of the pool above the starting HP.
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 70_000)]), 20);
+        assert_eq!(
+            t.fights.get(&500).expect("fight live").healed_hp,
+            30_000,
+            "upward HP delta after damage is tracked as healing"
+        );
+        hit(&mut t, 11, 60_000, 10_000, 30);
+        hit(&mut t, 12, 10_000, 0, 40);
+        let done = t.on_tick(40);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].total_damage(),
+            130_000,
+            "raw damage kept: start HP plus the tracked heal"
+        );
+    }
+
+    #[test]
+    fn an_hp_refill_on_an_always_positive_health_boss_is_not_healing() {
+        // The realm's Artificial Sprite God (0x870A) carries
+        // `<AlwaysPositiveHealth />`: its bar snaps from 12,775 back to 18,500
+        // without being healed. Booking that as 5,725 of healing widened the
+        // damage pool past anything dealt, so the overkill trim let the card read
+        // 24,225 for an 18,500 boss.
+        use crate::assets::get_asset_manager;
+        if let Some(dir) = crate::assets::find_assets_dir() {
+            get_asset_manager().set_assets_dir(&dir);
+        }
+        let am = get_asset_manager();
+        if !am.try_load() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        assert!(am.always_positive_health(34570), "the boss is indexed");
+        assert!(
+            !am.always_positive_health(0x0B5B),
+            "an ordinary boss is not, so its heals still count"
+        );
+
+        let mut t = CombatTracker::new();
+        t.on_map_change("Realm", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            34570,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 18_500), stat(StatType::HP, 18_500)],
+            ),
+            0,
+        );
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 6_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 12_775)]), 11);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 18_500)]), 12);
+
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(fight.healed_hp, 0, "the refill is not a heal");
+        assert_eq!(
+            fight.effective_damage_pool(),
+            18_500,
+            "so the pool stays the boss's own HP"
+        );
+    }
+
+    #[test]
+    fn healing_after_a_mid_fight_rescale_is_counted() {
+        // A boss can rescale its HP pool after real damage has landed (dungeon
+        // player-count scaling). The rescale moves current HP too, so it must not
+        // be counted as healing -- but a genuine heal that follows must be, even
+        // while the frozen accounting pool still holds the pre-rescale max.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Some Dungeon", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 100_000), stat(StatType::HP, 100_000)],
+            ),
+            0,
+        );
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 60_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 40_000)]), 11);
+
+        // Rescale to a 200k pool at 40% current (80k). The MaxHP and HP readings
+        // can arrive separately; neither jump is a heal, and the frozen fight
+        // pool stays at 100k.
+        t.on_object_status(500, &status(500, vec![stat(StatType::MaxHP, 200_000)]), 20);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 80_000)]), 21);
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(fight.boss_max_hp, 100_000, "accounting pool stays frozen");
+        assert_eq!(fight.healed_hp, 0, "the split scaling delta is not healing");
+
+        // A real 60k heal after the rescale must count, even though the current
+        // max (200k) differs from the frozen accounting pool (100k).
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 140_000)]), 30);
+        assert_eq!(
+            t.fights.get(&500).expect("fight live").healed_hp,
+            60_000,
+            "post-rescale heal is counted"
+        );
+    }
+
+    #[test]
+    fn pre_damage_max_hp_rescale_adopts_the_new_pool() {
+        // Royal Cnidarian-style: the local player registers the fight while the
+        // boss is invulnerable at a smaller player-scaled pool, then more players
+        // load in and the boss rescales before any real damage lands. Both
+        // observers should end up with the same pool instead of freezing the
+        // first-seen max.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Cnidarian Reef", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 120_000),
+                    stat(StatType::HP, 120_000),
+                    stat(StatType::Condition, COND_INVULNERABLE),
+                ],
+            ),
+            0,
+        );
+        // An invulnerable-phase shot creates the fight but records no damage.
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 10_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        let fight = t.fights.get(&500).expect("fight created by the shot");
+        assert_eq!((fight.boss_max_hp, fight.boss_start_hp), (120_000, 120_000));
+        assert!(fight.attackers.values().all(|a| a.damage == 0));
+
+        // More players load in: the boss rescales to the full group pool. The
+        // MaxHP packet can arrive before the matching HP update.
+        t.on_object_status(
+            500,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 300_000), stat(StatType::Condition, 0)],
+            ),
+            20,
+        );
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 300_000)]), 21);
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(fight.boss_max_hp, 300_000, "adopts the rescaled max");
+        assert_eq!(fight.boss_start_hp, 300_000, "adopts the rescaled pool");
+        assert_eq!(
+            fight.min_hp_seen, 300_000,
+            "the rescale is not mistaken for damage already dealt"
+        );
+
+        // The real fight kills the rescaled pool.
+        t.pending_shots.insert(
+            11,
+            PendingShot {
+                base_damage: 300_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 11, 1000, 1000, 30);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 40);
+        let done = t.on_tick(40);
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].total_damage(),
+            300_000,
+            "caps against the rescaled pool"
+        );
+    }
+
+    #[test]
+    fn late_arrival_pool_follows_the_rescaled_current_hp() {
+        // The local player arrives when the boss is already at half HP, then the
+        // pool rescales with their arrival. The card should start from the
+        // scaled current HP, not the pre-arrival numbers.
+        let mut t = CombatTracker::new();
+        t.on_map_change("Some Dungeon", 1, 0);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 1_000_000),
+                    stat(StatType::HP, 500_000),
+                    stat(StatType::Condition, COND_INVULNERABLE),
+                ],
+            ),
+            0,
+        );
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 10_000,
+                armor_piercing: true,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+        let fight = t.fights.get(&500).expect("fight created");
+        assert_eq!(
+            (fight.boss_max_hp, fight.boss_start_hp),
+            (1_000_000, 500_000)
+        );
+
+        // The arrival scales the boss to 2M max at 50% (1M current).
+        t.on_object_status(
+            500,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 2_000_000),
+                    stat(StatType::HP, 1_000_000),
+                ],
+            ),
+            20,
+        );
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(fight.boss_max_hp, 2_000_000);
+        assert_eq!(fight.boss_start_hp, 1_000_000);
+        assert_eq!(fight.min_hp_seen, 1_000_000);
+
+        // A later downscale maps the current HP to the smaller pool too.
+        t.on_object_status(
+            500,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 1_000_000),
+                    stat(StatType::HP, 500_000),
+                ],
+            ),
+            30,
+        );
+        let fight = t.fights.get(&500).expect("fight live");
+        assert_eq!(
+            (fight.boss_max_hp, fight.boss_start_hp),
+            (1_000_000, 500_000)
+        );
+        assert_eq!(fight.min_hp_seen, 500_000);
+    }
+
+    #[test]
     fn mv_boss_damage_is_not_capped_to_nominal_hp() {
         // Moonlight Village mechanics bosses floor invulnerable -- their nominal
         // max HP is not the damage they absorbed -- so the party's raw damage must
@@ -10640,6 +12130,127 @@ mod tests {
         cap_overkill(&mut ps, 100_000);
         assert_eq!(ps[0].damage, 3000);
         assert_eq!(ps[1].damage, 2000);
+    }
+
+    #[test]
+    fn effective_pool_adds_healed_hp_after_damage() {
+        let mut fight = fight_state(0, 0);
+        fight.min_hp_seen = 0;
+        fight.healed_hp = 60_000;
+        assert_eq!(fight.effective_damage_pool(), 360_000);
+    }
+
+    #[test]
+    fn effective_pool_is_zero_when_boss_never_lost_hp() {
+        // Nominal max HP is not a damage pool if no HP was removed.
+        let fight = fight_state(0, 0);
+        assert_eq!(fight.effective_damage_pool(), 0);
+    }
+
+    #[test]
+    fn a_killed_boss_that_never_showed_hp_loss_still_has_its_pool() {
+        // `<AlwaysPositiveHealth />` bosses (the realm's Artificial Sprite God,
+        // 18,500 HP) die without the server ever reporting HP leaving full. Their
+        // whole pool was absorbed, so the overkill trim must scale to it -- before
+        // this the fight reported 22,569 damage against an 18,500 boss.
+        let mut fight = fight_state(0, 0);
+        fight.boss_max_hp = 18_500;
+        fight.boss_start_hp = 18_500;
+        fight.min_hp_seen = 18_500;
+        fight.killed = true;
+        assert_eq!(fight.effective_damage_pool(), 18_500);
+
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 15_000;
+        ps[1].damage = 7_569;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage + ps[1].damage, 18_500);
+    }
+
+    #[test]
+    fn artificial_sprite_god_pool_is_its_starting_hp() {
+        // The realm's Artificial Sprite God (0x870A) carries
+        // `<AlwaysPositiveHealth />` and self-destructs at low HP, so no HP loss is
+        // ever reported and its pool came out zero -- leaving the overkill trim
+        // with nothing to scale to (the card read 19,825 against 18,500).
+        let mut fight = fight_state(0, 0);
+        fight.boss_object_type = 34570;
+        fight.boss_max_hp = 18_500;
+        fight.boss_start_hp = 18_500;
+        fight.min_hp_seen = 18_500;
+        fight.killed = true;
+        assert_eq!(fight.effective_damage_pool(), 18_500);
+
+        let mut ps = vec![participant(1, true)];
+        ps[0].damage = 19_825;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 18_500, "never more than the boss had");
+    }
+
+    #[test]
+    fn a_mechanics_boss_that_never_showed_hp_loss_keeps_its_raw_damage() {
+        // An invulnerable-finish / Moonlight Village boss absorbs damage its bar
+        // never reflects, so its pool stays 0 and nothing is trimmed.
+        let mut fight = fight_state(0, 0);
+        fight.boss_object_type = 20450; // Sage Genji, a Moonlight Village mechanics boss
+        fight.min_hp_seen = 300_000;
+        fight.killed = true;
+        assert_eq!(fight.effective_damage_pool(), 0);
+    }
+
+    #[test]
+    fn healing_pool_is_not_treated_as_overkill() {
+        // Start 300k + 60k healed: the party's 360k is exactly the pool.
+        let mut fight = fight_state(0, 0);
+        fight.min_hp_seen = 0;
+        fight.healed_hp = 60_000;
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 300_000;
+        ps[1].damage = 60_000;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 300_000);
+        assert_eq!(ps[1].damage, 60_000);
+    }
+
+    #[test]
+    fn gated_damage_is_not_proportionally_capped() {
+        // HP 300k but 900k recorded: phase-gated/absorbed damage, not a
+        // final-volley overshoot. Every player keeps their real share.
+        let mut fight = fight_state(0, 0);
+        fight.min_hp_seen = 0;
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 600_000;
+        ps[1].damage = 300_000;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 600_000);
+        assert_eq!(ps[1].damage, 300_000);
+    }
+
+    #[test]
+    fn plausible_death_tick_overkill_is_still_trimmed() {
+        // 330k raw against a 300k pool is a plausible last-volley overshoot.
+        let mut fight = fight_state(0, 0);
+        fight.min_hp_seen = 0;
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 220_000;
+        ps[1].damage = 110_000;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 200_000);
+        assert_eq!(ps[1].damage, 100_000);
+        assert_eq!(ps.iter().map(|p| p.damage).sum::<i64>(), 300_000);
+    }
+
+    #[test]
+    fn boss_that_never_lost_hp_is_not_capped() {
+        // General form of the Moonlight Village case, with no boss identity
+        // check: a nominal pool is meaningless when no HP was removed.
+        let fight = fight_state(0, 0);
+        let mut ps = vec![participant(1, false), participant(2, false)];
+        ps[0].damage = 300_000;
+        ps[1].damage = 150_000;
+        trim_plausible_overkill(&fight, &mut ps);
+        assert_eq!(ps[0].damage, 300_000);
+        assert_eq!(ps[1].damage, 150_000);
     }
 
     #[test]
