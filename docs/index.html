@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RealmHound - RotMG packet capture, combat and loot analytics</title>
+<title>RealmHound - RotMG (Realm of the Mad God) packet capture and analytics</title>
 <meta name="description" content="RealmHound is a high performance packet sniffer for Realm of the Mad God on Windows and macOS, with combat history, DPS tracking, loot history, quests, missions, characters, and account tools.">
 <link rel="canonical" href="https://pillarzz.github.io/RealmHound/">
 <meta name="robots" content="index,follow">
@@ -27,7 +27,10 @@
   "applicationCategory": "GameApplication",
   "operatingSystem": "Windows 10, Windows 11, macOS 11 or newer",
   "downloadUrl": "https://github.com/pillarzz/RealmHound/releases/latest",
-  "sameAs": "https://github.com/pillarzz/RealmHound",
+  "sameAs": [
+    "https://github.com/pillarzz/RealmHound",
+    "https://discord.gg/4zdy5Z4Sfd"
+  ],
   "isAccessibleForFree": true,
   "featureList": [
     "Combat and DPS tracking for boss fights",
@@ -39,7 +42,74 @@
     "Party and chat logs"
   ],
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-  "license": "https://github.com/pillarzz/RealmHound/blob/main/LICENSE"
+  "license": "https://github.com/pillarzz/RealmHound/blob/main/LICENSE",
+  "screenshot": [
+    "https://pillarzz.github.io/RealmHound/assets/features/combat-history-1.png",
+    "https://pillarzz.github.io/RealmHound/assets/features/loot-history-1.png",
+    "https://pillarzz.github.io/RealmHound/assets/features/trophy-hall-1.png"
+  ],
+  "publisher": {
+    "@type": "Organization",
+    "name": "RealmHound",
+    "url": "https://pillarzz.github.io/RealmHound/",
+    "sameAs": "https://github.com/pillarzz/RealmHound"
+  }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Is RealmHound free?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. RealmHound is free and open source under the MIT License, with no account, subscription or ads. Every release is published on GitHub Releases."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which platforms does RealmHound support?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "RealmHound runs on Windows 10 and 11 (64-bit) and on macOS 11 or newer, for both Apple Silicon and Intel Macs."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does RealmHound need Npcap on Windows?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. Packet capture on Windows requires Npcap, installed with WinPcap compatibility mode. macOS ships libpcap, so there is nothing extra to install, but capture needs read access to /dev/bpf*, granted once through Wireshark's ChmodBPF helper."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does RealmHound modify the game or inject packets?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. RealmHound only passively captures network traffic. It does not modify game data, inject packets, or reveal anything hidden from your client; it organises the data you already receive and have already observed."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is RealmHound a DPS meter?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "RealmHound records combat history and DPS for boss fights and attributes damage to individual sources, alongside loot history, trophy collections, quests, missions, character stats and a theoretical DPS calculator."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Is RealmHound open source?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Yes. RealmHound is MIT licensed and the full source code is available at github.com/pillarzz/RealmHound."
+      }
+    }
+  ]
 }
 </script>
 <style>
@@ -66,6 +136,7 @@
   .wrap { width: min(72rem, 100%); margin: 0 auto; padding: 0 1.25rem; }
   .hero { padding: 4.5rem 0 2.75rem; text-align: center; }
   .eyebrow { margin: 0 0 .5rem; color: var(--accent); font-size: .8rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+  h1 .h1-sub { display: block; margin-top: .4rem; font-size: clamp(1rem, 2.6vw, 1.45rem); font-weight: 600; letter-spacing: -.01em; color: var(--muted); }
   h1 { margin: 0; font-size: clamp(2.6rem, 7vw, 4.6rem); line-height: 1.05; letter-spacing: -.04em; }
   .intro { max-width: 56rem; margin: 1.2rem auto 0; color: var(--muted); font-size: 1.08rem; }
   .intro p { margin: .7rem 0; }
@@ -95,6 +166,8 @@
   .shot-portrait { max-width: 42rem; }
   .panel { background: linear-gradient(180deg, var(--panel), var(--panel-2)); border: 1px solid var(--line); border-radius: .9rem; padding: 1.5rem; margin-top: 2rem; }
   .panel h2 { font-size: 1.45rem; }
+  .panel h3 { margin: 1.5rem 0 .35rem; font-size: 1.05rem; }
+  .panel h3:first-of-type { margin-top: .9rem; }
   footer { padding: 2rem 0 3rem; border-top: 1px solid var(--line); color: #858c97; font-size: .9rem; }
   footer p { max-width: 55rem; }
   @media (max-width: 760px) {
@@ -107,9 +180,9 @@
 <header class="hero">
   <div class="wrap">
     <p class="eyebrow">Realm of the Mad God analytics</p>
-    <h1>RealmHound</h1>
+    <h1>RealmHound <span class="h1-sub">RotMG packet capture, DPS tracker and loot analytics</span></h1>
     <div class="intro">
-      <p>RealmHound is a high performance packet sniffer for Realm of the Mad God. Its purpose is to help you access and make sense of your in-game data, and to improve your experience by presenting information you already have in a clearer, more usable way.</p>
+      <p>RealmHound is a high performance packet sniffer and analytics companion for <strong>Realm of the Mad God</strong> (RotMG) on Windows and macOS. Its purpose is to help you access and make sense of your in-game data, and to improve your experience by presenting information you already have in a clearer, more usable way.</p>
       <p>It doesn't reveal anything hidden from you in game; it simply organises and presents your own account's data and the activity you've already observed. Many of these features are best experienced fullscreen, so if you have two monitors we highly recommend running RealmHound on the second one.</p>
     </div>
     <p class="actions">
@@ -293,6 +366,22 @@
           The <a href="research/damage-sources-status.md">Markdown source</a> is also available.
         </li>
       </ul>
+    </div>
+  <section id="faq">
+    <div class="panel">
+      <h2>Frequently asked questions</h2>
+      <h3>Is RealmHound free?</h3>
+      <p>Yes. RealmHound is free and open source under the MIT License, with no account, subscription or ads. Every release is published on <a href="https://github.com/pillarzz/RealmHound/releases/latest">GitHub Releases</a>.</p>
+      <h3>Which platforms does RealmHound support?</h3>
+      <p>RealmHound runs on Windows 10 and 11 (64-bit) and on macOS 11 or newer, for both Apple Silicon and Intel Macs.</p>
+      <h3>Does RealmHound need Npcap on Windows?</h3>
+      <p>Yes. Packet capture on Windows requires <a href="https://npcap.com/#download">Npcap</a>, installed with WinPcap compatibility mode. macOS ships libpcap, so there is nothing extra to install, but capture needs read access to <code>/dev/bpf*</code>, granted once through Wireshark's ChmodBPF helper.</p>
+      <h3>Does RealmHound modify the game or inject packets?</h3>
+      <p>No. RealmHound only passively captures network traffic. It does not modify game data, inject packets, or reveal anything hidden from your client; it organises the data you already receive and have already observed.</p>
+      <h3>Is RealmHound a DPS meter?</h3>
+      <p>RealmHound records combat history and DPS for boss fights and attributes damage to individual sources, alongside loot history, trophy collections, quests, missions, character stats and a theoretical DPS calculator.</p>
+      <h3>Is RealmHound open source?</h3>
+      <p>Yes. RealmHound is MIT licensed and the full source code is available at <a href="https://github.com/pillarzz/RealmHound">github.com/pillarzz/RealmHound</a>.</p>
     </div>
   </section>
 </main>
