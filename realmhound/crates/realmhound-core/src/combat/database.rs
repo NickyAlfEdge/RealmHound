@@ -14,8 +14,14 @@ use super::types::{
     ParticipantEndStatus, PatternContribution, PetInfo, SummonContribution, WeaponContribution,
 };
 
+#[path = "legacy_repairs.rs"]
+mod legacy_repairs;
+#[path = "maintenance.rs"]
+mod maintenance;
+pub use maintenance::RepairBatch;
+
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: i32 = 68;
+pub const SCHEMA_VERSION: i32 = 70;
 
 /// Highest combat-history schema version this build can validate and open. Used
 /// by flat-layout migration to reject databases written by a newer build.
@@ -504,10 +510,8 @@ impl CombatDatabase {
     }
 
     /// Open or create the combat database (writer connection), pairing it with a
-    /// loot-history database so migrations that correlate against recorded loot
-    /// (the v50 Legacy Lair of Draconis completion backfill) can read it. Pass
-    /// `None` for maintenance writers that have no paired loot DB; loot-dependent
-    /// migrations then defer to a later paired open.
+    /// loot-history database. Recurring historical corrections run in deferred
+    /// maintenance; schema-version migrations still run while opening.
     pub fn open_writer_with_loot(path: &Path, loot_path: Option<&Path>) -> SqlResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -562,45 +566,20 @@ impl CombatDatabase {
         Ok(())
     }
 
-    fn initialize(&mut self, loot_path: Option<&Path>) -> SqlResult<()> {
+    fn initialize(&mut self, _loot_path: Option<&Path>) -> SqlResult<()> {
         let version: i32 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap_or(0);
         if version == 0 {
             self.create_tables()?;
+            self.conn.execute_batch(maintenance::PROGRESS_SCHEMA)?;
+            self.conn.execute_batch(maintenance::SCHEMA)?;
             self.conn
                 .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
         } else if version < SCHEMA_VERSION {
             self.migrate(version)?;
         }
-        // Retroactively fold trustworthy fights recorded before their encounter
-        // was added to the curated registry.
-        self.backfill_encounter_runs()?;
-        // Legacy Lair of Draconis dragons self-destruct into loot balloon chests,
-        // so their fights are never scored as kills. When paired with the loot DB,
-        // mark such dragons complete from the chest bags they dropped. Idempotent
-        // and best-effort, so it runs every open until the loot DB is available.
-        self.complete_legacy_lod_dragons_from_loot(loot_path)?;
-        // A main boss's guaranteed bag proves it died this instance even when its
-        // kill was never observed (the local player left the fight before the
-        // killing blow, party-scaled HP + burst death, or the local player joining
-        // late), so repair fights stored as Escaped from those bags. Idempotent and
-        // best-effort, like the LoD pass above.
-        self.complete_bosses_from_loot(loot_path)?;
-        // Legacy Lair of Draconis' Ivory Wyvern portal only drops once all four
-        // dragons are defeated, so an Ivory Wyvern fight proves the preceding
-        // Lair run was a full clear. Complete such runs from that evidence.
-        self.backfill_legacy_lod_from_ivory()?;
-        // A captured death broadcast is authoritative, but it can arrive after the
-        // fight containing the death was already written (a burst of deaths at the
-        // end of a clear). Apply the stored broadcasts to those rows here, both
-        // live (see `insert_death_broadcast`) and for anything a previous session
-        // observed but could not apply.
-        self.repair_remote_deaths()?;
-        // The local player's own row: a fight completed after it was written still
-        // carries the nexus its unfinished state earned it.
-        self.repair_local_nexus_on_completed_fights()?;
         Ok(())
     }
 
@@ -617,7 +596,7 @@ impl CombatDatabase {
     /// departure it recorded therefore did not happen.
     ///
     /// Local rows only: a remote participant can genuinely nexus out of a fight
-    /// the group still cleared. Idempotent, and cheap enough to run on every open.
+    /// the group still cleared. Idempotent; deferred maintenance repairs old rows.
     pub fn repair_local_nexus_on_completed_fights(&mut self) -> SqlResult<usize> {
         // Databases predating the status column (and the synthetic schemas the
         // migration tests build) hold no statuses to repair.
@@ -641,6 +620,7 @@ impl CombatDatabase {
     /// Idempotent: only ungrouped curated-member fights with the same trustworthy
     /// evidence required by the v5 migration are touched. A large time gap starts
     /// a fresh run so a recycled seed across sessions cannot merge unrelated clears.
+    #[cfg(test)]
     fn backfill_encounter_runs(&mut self) -> SqlResult<()> {
         // Beyond this gap, two same-seed fights are treated as separate runs.
         const RUN_GAP_MS: i64 = 30 * 60 * 1000;
@@ -768,8 +748,126 @@ impl CombatDatabase {
         Ok(())
     }
 
-    /// Apply incremental migrations from `from_version` to the current schema.
+    /// Upgrade the schema without running historical data corrections.
     fn migrate(&mut self, from_version: i32) -> SqlResult<()> {
+        self.register_legacy_combat_repairs(from_version)?;
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS encounter_runs (
+                run_id TEXT PRIMARY KEY, encounter_id TEXT NOT NULL, dungeon TEXT NOT NULL,
+                started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL, killed INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS stat_awards (
+                card_key TEXT PRIMARY KEY, char_id INTEGER NOT NULL,
+                lone INTEGER NOT NULL DEFAULT 0, last INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS dungeon_time_totals (
+                dungeon TEXT PRIMARY KEY, total_time_ms INTEGER NOT NULL DEFAULT 0,
+                completions INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS death_broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, player TEXT NOT NULL,
+                killer TEXT NOT NULL DEFAULT '', occurred_at INTEGER NOT NULL);",
+        )?;
+        for (table, column, definition) in [
+            (
+                "encounter_runs",
+                "live_origin",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fights", "local_char_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "encounter_id", "TEXT"),
+            ("fights", "encounter_run_id", "TEXT"),
+            ("fights", "boss_group", "TEXT"),
+            ("fights", "local_close_calls", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "aux_member_count", "INTEGER"),
+            ("fights", "dungeon_entered_at", "INTEGER"),
+            ("fights", "reached_zero", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "joined_late", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "spirits", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "leisurely", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "shatters_hm", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "petless", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "spectral_hm", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "boss_uptime_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("fights", "boosts", "TEXT"),
+            ("fights", "abilities", "TEXT"),
+            ("fights", "mods", "TEXT"),
+            ("fight_participants", "enchants", "TEXT"),
+            (
+                "fight_participants",
+                "skin_id",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fight_participants", "tex1", "INTEGER NOT NULL DEFAULT 0"),
+            ("fight_participants", "tex2", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "fight_participants",
+                "end_status",
+                "TEXT NOT NULL DEFAULT 'present'",
+            ),
+            (
+                "fight_participants",
+                "grave_type",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "fight_participants",
+                "pet_type",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fight_participants", "pet_abilities", "TEXT"),
+            ("fight_participants", "damage_taken", "INTEGER"),
+            ("fight_participants", "damage_taken_provenance", "TEXT"),
+            ("fight_participants", "guarded_damage", "INTEGER"),
+            ("fight_participants", "guarded_hits", "INTEGER"),
+            ("fight_participants", "damage_blocked", "INTEGER"),
+            ("fight_participants", "damage_taken_hits", "INTEGER"),
+            (
+                "fight_participants",
+                "summon_damage",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "fight_participants",
+                "summon_hits",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fight_participants", "summons", "TEXT"),
+            ("fight_participants", "weapons", "TEXT"),
+            (
+                "fight_participants",
+                "packet_damage",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "fight_participants",
+                "packet_hits",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("stat_awards", "most", "INTEGER NOT NULL DEFAULT 0"),
+            (
+                "death_broadcasts",
+                "processed",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "death_broadcasts",
+                "next_attempt_at",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+        ] {
+            if !self.column_exists(table, column)? {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+                ))?;
+            }
+        }
+        self.create_tables()?;
+        self.conn.execute_batch(maintenance::SCHEMA)?;
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn migrate_legacy_reference(&mut self, from_version: i32) -> SqlResult<()> {
         if from_version < 2 {
             // v1 -> v2: add the stable local character id (0 for pre-existing rows).
             let tx = self.conn.transaction()?;
@@ -1653,16 +1751,21 @@ impl CombatDatabase {
             )?;
             tx.commit()?;
         }
-        if from_version < 68 {
-            // v67 -> v68: dungeon modifier tokens active for the fight's map
-            // instance, captured from MapInfo. NULL for rows recorded before
-            // mods were tracked; an empty string means a genuinely modless run.
-            let mut batch = String::new();
-            if !self.column_exists("fights", "mods")? {
-                batch.push_str("ALTER TABLE fights ADD COLUMN mods TEXT;");
+        if from_version < 70 {
+            let has_retry_time = self.column_exists("death_broadcasts", "next_attempt_at")?;
+            let has_mods = self.column_exists("fights", "mods")?;
+            let tx = self.conn.transaction()?;
+            if !has_mods {
+                tx.execute_batch("ALTER TABLE fights ADD COLUMN mods TEXT;")?;
             }
-            batch.push_str("PRAGMA user_version = 68;");
-            self.conn.execute_batch(&batch)?;
+            if !has_retry_time {
+                tx.execute_batch(
+                    "ALTER TABLE death_broadcasts ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            tx.execute_batch(maintenance::SCHEMA)?;
+            tx.execute_batch("PRAGMA user_version = 70")?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -1672,6 +1775,7 @@ impl CombatDatabase {
     /// (no curated encounter) contribute individually. Realm / hubs are excluded.
     /// Legacy runs measured time from first boss engagement rather than dungeon
     /// entry, so these totals are a lower bound -- still far better than zeros.
+    #[cfg(test)]
     fn backfill_dungeon_time_totals(&self) -> SqlResult<()> {
         // dungeon -> (total_time_ms, completions)
         let mut totals: HashMap<String, (i64, i64)> = HashMap::new();
@@ -1743,6 +1847,7 @@ impl CombatDatabase {
     /// touches currently-standalone fights (`encounter_run_id IS NULL`) that map
     /// to a realm-grouped encounter outside a groupable dungeon, keyed by
     /// (character, map seed, encounter) with a time-gap split.
+    #[cfg(test)]
     fn regroup_realm_encounters(&mut self) -> SqlResult<()> {
         const RUN_GAP_MS: i64 = 30 * 60 * 1000;
 
@@ -1964,6 +2069,7 @@ impl CombatDatabase {
     /// (character, dungeon, map seed) instance when one exists within a time-gap
     /// window; otherwise leftovers of one instance form their own run. Only
     /// touches `encounter_run_id IS NULL` rows so it is idempotent.
+    #[cfg(test)]
     fn regroup_dungeon_instances(&mut self) -> SqlResult<()> {
         const RUN_GAP_MS: i64 = 30 * 60 * 1000;
 
@@ -2157,6 +2263,7 @@ impl CombatDatabase {
     /// Populate the `boss_group` column for rows where it is NULL, classifying
     /// each from its persisted dungeon name, boss object type, and boss name.
     /// Idempotent: only untouched (NULL) rows are updated.
+    #[cfg(test)]
     fn backfill_boss_groups(&mut self) -> SqlResult<()> {
         let rows: Vec<(i64, String, i32, String)> = {
             let mut stmt = self.conn.prepare(
@@ -2185,6 +2292,7 @@ impl CombatDatabase {
     /// and update rows whose classification changed. Used when the group
     /// taxonomy changes (v7 -> v8: Biome Minibosses split into Heroes of Oryx
     /// tiers). Unlike [`backfill_boss_groups`] this touches non-NULL rows too.
+    #[cfg(test)]
     fn reclassify_boss_groups(&mut self) -> SqlResult<()> {
         let rows: Vec<(i64, String, i32, String, Option<String>)> = {
             let mut stmt = self.conn.prepare(
@@ -2217,6 +2325,7 @@ impl CombatDatabase {
     /// in `types`, then drop any encounter run left with no phases. Used to purge
     /// objects that were tracked as fights before being curated out of the boss
     /// set (e.g. Challenge Gate, MV Easy Dropper).
+    #[cfg(test)]
     fn purge_fights_by_type(&mut self, types: &[i32]) -> SqlResult<()> {
         if types.is_empty() {
             return Ok(());
@@ -2264,6 +2373,7 @@ impl CombatDatabase {
     /// Best-effort and idempotent: it only flips still-escaped dragon fights, so it
     /// can run on every open. When the paired loot DB is absent or unreadable it is
     /// a no-op, letting a later paired open repair the history instead.
+    #[cfg(test)]
     fn complete_legacy_lod_dragons_from_loot(&mut self, loot_path: Option<&Path>) -> SqlResult<()> {
         let Some(path) = loot_path else {
             return Ok(());
@@ -2362,6 +2472,7 @@ impl CombatDatabase {
     /// the closest still-escaped fight of the bag's attributed boss type in the
     /// same instance. Idempotent, so it runs on every open; the schema-version bump
     /// is what forces one pass over existing history.
+    #[cfg(test)]
     fn complete_bosses_from_loot(&mut self, loot_path: Option<&Path>) -> SqlResult<()> {
         let Some(path) = loot_path else {
             return Ok(());
@@ -2486,6 +2597,7 @@ impl CombatDatabase {
         tx.commit()?;
         Ok(())
     }
+    #[cfg(test)]
     fn backfill_legacy_lod_from_ivory(&mut self) -> SqlResult<()> {
         let ivories: Vec<(i64, i32)> = {
             let mut stmt = self.conn.prepare(
@@ -2601,6 +2713,7 @@ impl CombatDatabase {
     /// keep whatever grouping they already had (curated or standalone) rather
     /// than risk a bad merge. `encounter_runs` is rebuilt from the final fight
     /// assignments so no orphan rows survive.
+    #[cfg(test)]
     fn migrate_generic_grouping(&mut self) -> SqlResult<()> {
         const RUN_GAP_MS: i64 = 30 * 60 * 1000;
 
@@ -2791,7 +2904,8 @@ impl CombatDatabase {
                 dungeon TEXT NOT NULL,
                 started_at INTEGER NOT NULL,
                 ended_at INTEGER NOT NULL,
-                killed INTEGER NOT NULL DEFAULT 0
+                killed INTEGER NOT NULL DEFAULT 0,
+                live_origin INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS fight_participants (
@@ -2842,7 +2956,8 @@ impl CombatDatabase {
                 player TEXT NOT NULL,
                 killer TEXT NOT NULL DEFAULT '',
                 occurred_at INTEGER NOT NULL,
-                processed INTEGER NOT NULL DEFAULT 0
+                processed INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_fights_started ON fights(started_at);
@@ -2905,7 +3020,8 @@ impl CombatDatabase {
         const CATCHUP_MS: i64 = 15 * 60 * 1000;
         /// How many unprocessed broadcasts one pass may inspect. At startup a
         /// backlog is drained in bounded batches instead of one unbounded scan.
-        const BATCH: i64 = 500;
+        const BATCH: i64 = 16;
+        const RETRY_MS: i64 = 1000;
         /// Applied broadcasts are kept for diagnosis, then pruned.
         const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
@@ -2913,10 +3029,12 @@ impl CombatDatabase {
         let broadcasts: Vec<(i64, String, i64)> = {
             let mut stmt = self.conn.prepare(
                 "SELECT id, player, occurred_at FROM death_broadcasts
-                 WHERE processed = 0
-                 ORDER BY occurred_at ASC, id ASC LIMIT ?1",
+                 WHERE processed = 0 AND next_attempt_at<=?1
+                 ORDER BY next_attempt_at, occurred_at, id LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let rows = stmt.query_map(params![now, BATCH], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
             rows.collect::<SqlResult<Vec<_>>>()?
         };
 
@@ -2959,13 +3077,20 @@ impl CombatDatabase {
                     "UPDATE death_broadcasts SET processed = 1 WHERE id = ?1",
                     params![id],
                 )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE death_broadcasts SET next_attempt_at=?2 WHERE id=?1",
+                    params![id, now.saturating_add(RETRY_MS)],
+                )?;
             }
         }
 
         // Bounded retention: the raw rows are for diagnosis, not a permanent log.
         self.conn.execute(
-            "DELETE FROM death_broadcasts WHERE processed = 1 AND occurred_at < ?1",
-            params![now.saturating_sub(RETENTION_MS)],
+            "DELETE FROM death_broadcasts WHERE id IN (
+                 SELECT id FROM death_broadcasts WHERE processed=1 AND occurred_at<?1
+                 ORDER BY occurred_at, id LIMIT ?2)",
+            params![now.saturating_sub(RETENTION_MS), BATCH],
         )?;
         Ok(repaired)
     }
@@ -3071,8 +3196,8 @@ impl CombatDatabase {
         // inserted first (curated ids live only on the individual fight rows).
         if let (Some(_enc_id), Some(run_id)) = (&fight.encounter_id, &fight.encounter_run_id) {
             tx.execute(
-                r#"INSERT INTO encounter_runs (run_id, encounter_id, dungeon, started_at, ended_at, killed)
-                   VALUES (?1, 'dungeon_run', ?2, ?3, ?4, ?5)
+                r#"INSERT INTO encounter_runs (run_id, encounter_id, dungeon, started_at, ended_at, killed, live_origin)
+                   VALUES (?1, 'dungeon_run', ?2, ?3, ?4, ?5, 1)
                    ON CONFLICT(run_id) DO UPDATE SET
                        started_at = MIN(started_at, excluded.started_at),
                        ended_at   = MAX(ended_at, excluded.ended_at),
@@ -3514,7 +3639,7 @@ impl CombatDatabase {
             ));
         }
 
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut affected_char_ids = HashSet::new();
         for (key, current_owner, previous_owner, lone, last, most) in updates {
             tx.execute(
@@ -4641,22 +4766,42 @@ impl CombatDatabase {
         boss_type: i32,
         timestamp: i64,
     ) -> SqlResult<Option<FightSelection>> {
+        self.mark_boss_killed_by_loot_before(map_seed, boss_type, timestamp, None)
+    }
+
+    fn mark_boss_killed_by_loot_before(
+        &mut self,
+        map_seed: i32,
+        boss_type: i32,
+        timestamp: i64,
+        cutoff: Option<i64>,
+    ) -> SqlResult<Option<FightSelection>> {
         if map_seed == 0 || boss_type <= 0 {
             return Ok(None);
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
+        if tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM applied_loot_proofs
+             WHERE map_seed=?1 AND boss_type=?2 AND timestamp=?3)",
+            params![map_seed, boss_type, timestamp],
+            |r| r.get::<_, bool>(0),
+        )? {
+            tx.commit()?;
+            return Ok(None);
+        }
         let target: Option<(i64, Option<String>)> = tx
             .query_row(
                 "SELECT id, encounter_run_id FROM fights
                  WHERE killed = 0 AND map_seed = ?1 AND boss_object_type = ?2
-                   AND started_at <= ?3 AND ended_at >= ?4
+                   AND started_at <= ?3 AND ended_at >= ?4 AND (?6 IS NULL OR id<=?6)
                  ORDER BY ABS(ended_at - ?5) LIMIT 1",
                 params![
                     map_seed,
                     boss_type,
                     timestamp + LOOT_LINK_PRE_MS,
                     timestamp - LOOT_LINK_POST_MS,
-                    timestamp
+                    timestamp,
+                    cutoff
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4666,6 +4811,14 @@ impl CombatDatabase {
             return Ok(None);
         };
         tx.execute("UPDATE fights SET killed = 1 WHERE id = ?1", params![id])?;
+        tx.execute(
+            "INSERT INTO applied_loot_proofs(map_seed, boss_type, timestamp) VALUES (?1, ?2, ?3)",
+            params![map_seed, boss_type, timestamp],
+        )?;
+        tx.execute(
+            "DELETE FROM pending_loot_proofs WHERE map_seed=?1 AND boss_type=?2 AND timestamp=?3",
+            params![map_seed, boss_type, timestamp],
+        )?;
         // The bag proves the boss died with the local player in the instance, so a
         // nexus recorded against this fight was a departure they did not make (see
         // `repair_local_nexus_on_completed_fights`). Done here rather than only on
@@ -6716,6 +6869,662 @@ mod tests {
     };
 
     #[test]
+    fn legacy_combat_repairs_are_deferred_bounded_atomic_and_resumable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        for n in 0..70 {
+            let mut fight = sample_fight();
+            fight.boss_object_type = crate::assets::SHATTERS_QUEEN_TYPE;
+            fight.boss_name = "Shatters A22".into();
+            fight.started_at = n * 1000;
+            fight.ended_at = n * 1000 + 500;
+            db.insert_fight(&fight).unwrap();
+        }
+        db.conn.execute_batch("PRAGMA user_version=53").unwrap();
+        db.initialize(None).unwrap();
+        let renamed = |db: &CombatDatabase| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fights WHERE boss_name='The Shattered Queen'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(renamed(&db), 0, "schema upgrades must not repair history");
+        db.conn.execute_batch(
+            "CREATE TRIGGER fail_legacy BEFORE UPDATE ON fights BEGIN SELECT RAISE(FAIL,'test repair failure'); END;"
+        ).unwrap();
+        assert!(db.historical_repair_batch(None).is_err());
+        assert_eq!(renamed(&db), 0);
+        assert_eq!(db.conn.query_row(
+            "SELECT cursor FROM historical_repairs WHERE repair_id='legacy-combat-054-label'",
+            [], |r|r.get::<_,i64>(0),
+        ).unwrap(),0);
+        db.conn.execute_batch("DROP TRIGGER fail_legacy").unwrap();
+        db.historical_repair_batch(None).unwrap();
+        assert_eq!(renamed(&db), 64);
+        let mut late = sample_fight();
+        late.boss_object_type = crate::assets::SHATTERS_QUEEN_TYPE;
+        late.boss_name = "Shatters A22".into();
+        db.insert_fight(&late).unwrap();
+        drop(db);
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        assert_eq!(
+            renamed(&db),
+            70,
+            "late writes are outside the migration cutoff"
+        );
+        finish_recurring_repairs(&mut db, None);
+        assert_eq!(renamed(&db), 70);
+    }
+
+    #[test]
+    fn legacy_combat_repairs_match_the_previous_migration_results() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut reference = CombatDatabase::open_in_memory().unwrap();
+        for n in 0..70 {
+            let mut fight = escaped_fight("Snake Pit", 123, 7);
+            fight.local_char_id = 1;
+            fight.started_at = n * 1000;
+            fight.ended_at = n * 1000 + 500;
+            if n == 0 || n == 64 {
+                fight.encounter_id = Some("dungeon_run".into());
+                fight.encounter_run_id = Some(format!("live-{n}"));
+            }
+            db.insert_fight(&fight).unwrap();
+            reference.insert_fight(&fight).unwrap();
+        }
+        reference.migrate_legacy_reference(4).unwrap();
+        finish_recurring_repairs(&mut reference, None);
+        db.migrate(4).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        let headers = |db: &CombatDatabase| {
+            db.conn.prepare(
+                "SELECT id,encounter_id,encounter_run_id,dungeon,boss_name,boss_group FROM fights ORDER BY id"
+            ).unwrap().query_map([],|r|Ok((
+                r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,
+                r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,
+            ))).unwrap().collect::<SqlResult<Vec<_>>>().unwrap()
+        };
+        assert_eq!(headers(&db), headers(&reference));
+        let totals = |db: &CombatDatabase| {
+            db.dungeon_time_totals()
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.dungeon, r.total_time_ms, r.completions))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(totals(&db), totals(&reference));
+    }
+
+    #[test]
+    fn regrouping_retires_old_awards_but_history_deletion_keeps_them() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        for n in 0..2 {
+            let mut fight = flawless_fight(
+                "Fungal Cavern",
+                45712,
+                vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+            );
+            fight.local_char_id = 1;
+            fight.map_seed = 7;
+            fight.started_at = n * 1000;
+            fight.ended_at = n * 1000 + 500;
+            db.insert_fight(&fight).unwrap();
+        }
+        assert_eq!(db.reconcile_stat_awards().unwrap().get(&1).unwrap().0, 2);
+        db.migrate(19).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        let totals = db.persisted_combat_totals(&[1]).unwrap();
+        assert_eq!(totals.stat_awards.get(&1).unwrap().0, 1);
+        db.clear_all().unwrap();
+        finish_recurring_repairs(&mut db, None);
+        assert_eq!(
+            db.persisted_combat_totals(&[1]).unwrap().stat_awards,
+            totals.stat_awards
+        );
+    }
+
+    #[test]
+    fn legacy_repair_registration_survives_schema_failure_without_moving_cutoffs() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        db.insert_fight(&sample_fight()).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_fights_loot_link;
+             CREATE TABLE idx_fights_loot_link(blocker INTEGER);
+             PRAGMA user_version=53;",
+            )
+            .unwrap();
+        assert!(db.migrate(53).is_err());
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            53
+        );
+        let cutoff = |db: &CombatDatabase| {
+            db.conn.query_row(
+            "SELECT cutoff FROM historical_repairs WHERE repair_id='legacy-combat-054-label'",
+            [],|r|r.get::<_,i64>(0),
+        ).unwrap()
+        };
+        assert_eq!(cutoff(&db), 1);
+        db.insert_fight(&sample_fight()).unwrap();
+        db.conn
+            .execute_batch("DROP TABLE idx_fights_loot_link")
+            .unwrap();
+        db.migrate(53).unwrap();
+        assert_eq!(
+            cutoff(&db),
+            1,
+            "replaying schema work cannot expand registered repairs"
+        );
+    }
+
+    #[test]
+    fn legacy_run_cutoff_rejects_a_new_orphan_even_when_sqlite_reuses_its_rowid() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut old = sample_fight();
+        old.encounter_id = Some("dungeon_run".into());
+        old.encounter_run_id = Some("old-run".into());
+        db.insert_fight(&old).unwrap();
+        db.conn
+            .execute("UPDATE encounter_runs SET live_origin=0", [])
+            .unwrap();
+        let old_rowid: i64 = db
+            .conn
+            .query_row("SELECT rowid FROM encounter_runs", [], |r| r.get(0))
+            .unwrap();
+        db.migrate(42).unwrap();
+        db.conn
+            .execute_batch(
+                "DELETE FROM fight_participants; DELETE FROM fights; DELETE FROM encounter_runs;",
+            )
+            .unwrap();
+        old.encounter_run_id = Some("new-live-run".into());
+        db.insert_fight(&old).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row("SELECT rowid FROM encounter_runs", [], |r| r
+                    .get::<_, i64>(0),)
+                .unwrap(),
+            old_rowid
+        );
+        db.conn
+            .execute_batch("DELETE FROM fight_participants; DELETE FROM fights;")
+            .unwrap();
+        finish_recurring_repairs(&mut db, None);
+        assert!(db.dungeon_time_totals().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT run_id FROM encounter_runs", [], |r| r
+                    .get::<_, String>(0),)
+                .unwrap(),
+            "new-live-run",
+            "legacy pruning cannot delete a newly orphaned live run"
+        );
+    }
+
+    #[test]
+    fn legacy_time_seed_precedes_later_purges_and_preserves_live_totals() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut old = sample_fight();
+        old.dungeon = "Legacy The Shatters".into();
+        old.boss_object_type = 52513;
+        old.encounter_id = Some("dungeon_run".into());
+        old.encounter_run_id = Some("old-run".into());
+        old.started_at = 1000;
+        old.ended_at = 6000;
+        old.killed = true;
+        db.insert_fight(&old).unwrap();
+        db.migrate(42).unwrap();
+        db.add_dungeon_time("Legacy The Shatters", 10_000, true)
+            .unwrap();
+        let mut live = old.clone();
+        live.boss_object_type = 52560;
+        live.encounter_run_id = Some("live-run".into());
+        live.started_at = 10_000;
+        live.ended_at = 20_000;
+        let live_id = db.insert_fight(&live).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        let total = db
+            .dungeon_time_totals()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dungeon == "Legacy The Shatters")
+            .unwrap();
+        assert_eq!(total.total_time_ms, 15_000);
+        assert_eq!(total.completions, 2);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM fights", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT id FROM fights", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            live_id
+        );
+        finish_recurring_repairs(&mut db, None);
+        assert_eq!(
+            db.dungeon_time_totals()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.dungeon == "Legacy The Shatters")
+                .unwrap()
+                .total_time_ms,
+            15_000
+        );
+    }
+
+    struct RepairTestAssets {
+        directory: tempfile::TempDir,
+        previous_directory: Option<std::path::PathBuf>,
+    }
+
+    impl RepairTestAssets {
+        fn load_if_needed() -> Option<Self> {
+            let manager = crate::assets::get_asset_manager();
+            if manager.is_loaded() {
+                return None;
+            }
+            let fixture = Self {
+                directory: tempfile::tempdir().unwrap(),
+                previous_directory: manager.assets_dir(),
+            };
+            std::fs::write(
+                fixture.directory.path().join("ObjectID.list"),
+                concat!(
+                    "100;The Forgotten King;Character;;;;ENEMY,BOSS;The Forgotten King\n",
+                    "45712;Crystal Worm Mother;Character;;;;ENEMY,BOSS;Crystal Worm Mother\n",
+                    "20789;MV Fishing Loot 1;Character;;;;ENEMY;MV Fishing Loot 1\n",
+                ),
+            )
+            .unwrap();
+            manager.set_assets_dir(fixture.directory.path());
+            assert!(manager.try_load(), "{:?}", manager.last_error());
+            Some(fixture)
+        }
+    }
+
+    impl Drop for RepairTestAssets {
+        fn drop(&mut self) {
+            crate::assets::get_asset_manager().set_assets_dir(
+                self.previous_directory
+                    .clone()
+                    .unwrap_or_else(|| self.directory.path().join("unloaded")),
+            );
+        }
+    }
+
+    fn finish_recurring_repairs(db: &mut CombatDatabase, loot_path: Option<&Path>) {
+        let temp = tempfile::tempdir().unwrap();
+        let empty_loot = temp.path().join("loot.db");
+        let _loot = crate::loot::LootDatabase::open_writer(&empty_loot, None).unwrap();
+        let path = loot_path.unwrap_or(&empty_loot);
+        let _ = a_boss_mark_id();
+        let _assets = RepairTestAssets::load_if_needed();
+        for _ in 0..10_000 {
+            let batch = db.historical_repair_batch(Some(path)).unwrap();
+            if !batch.pending {
+                return;
+            }
+        }
+        panic!("recurring repairs failed to finish");
+    }
+
+    #[test]
+    fn recurring_repairs_resume_with_a_frozen_cutoff_and_keep_run_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        for n in (0..70).rev() {
+            let mut fight = escaped_fight("Snake Pit", 123, 7);
+            fight.local_char_id = 1;
+            fight.started_at = n * 1000;
+            fight.ended_at = n * 1000 + 500;
+            db.insert_fight(&fight).unwrap();
+        }
+        db.historical_repair_batch(None).unwrap();
+        let before: (i64, i64) = db.conn.query_row(
+            "SELECT cutoff, cursor FROM historical_repairs WHERE repair_id='encounter-grouping-v1'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(before.0, 70);
+        let mut late = escaped_fight("Snake Pit", 123, 8);
+        late.local_char_id = 1;
+        let late_id = db.insert_fight(&late).unwrap();
+        drop(db);
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        finish_recurring_repairs(&mut db, None);
+        let groups: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights WHERE id<=70",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(groups, 1, "a run crosses batch and process boundaries");
+        let late_group: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT encounter_run_id FROM fights WHERE id=?1",
+                [late_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            late_group, None,
+            "new history is outside the historical cutoff"
+        );
+        let checkpoints: Vec<(String, i64, i64)> = db
+            .conn
+            .prepare(
+                "SELECT repair_id, cutoff, cursor FROM historical_repairs
+             WHERE repair_id<>'live-loot-proofs-v1' ORDER BY repair_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<SqlResult<_>>()
+            .unwrap();
+        finish_recurring_repairs(&mut db, None);
+        let after: Vec<(String, i64, i64)> = db
+            .conn
+            .prepare(
+                "SELECT repair_id, cutoff, cursor FROM historical_repairs
+             WHERE repair_id<>'live-loot-proofs-v1' ORDER BY repair_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<SqlResult<_>>()
+            .unwrap();
+        assert_eq!(after, checkpoints, "completed repairs never replay");
+    }
+
+    #[test]
+    fn recurring_grouping_keeps_the_maximum_run_end_across_batches_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        let mut reference = CombatDatabase::open_in_memory().unwrap();
+        for n in 0..65 {
+            let mut fight = escaped_fight("Snake Pit", 123, 7);
+            fight.local_char_id = 1;
+            fight.started_at = if n == 64 { 2_000_000 } else { n * 1000 };
+            fight.ended_at = if n == 0 {
+                1_000_000
+            } else {
+                fight.started_at + 500
+            };
+            db.insert_fight(&fight).unwrap();
+            reference.insert_fight(&fight).unwrap();
+        }
+        reference.backfill_encounter_runs().unwrap();
+        let expected_groups: i64 = reference
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(expected_groups, 1);
+        db.historical_repair_batch(None).unwrap();
+        let carried_end: i64 = db
+            .conn
+            .query_row("SELECT last_ended FROM historical_repair_groups", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(carried_end, 1_000_000);
+        drop(db);
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        db.historical_repair_batch(None).unwrap();
+        let groups: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(DISTINCT encounter_run_id) FROM fights",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            groups, expected_groups,
+            "overlapping phases must not shorten a run"
+        );
+        let run_end: i64 = db
+            .conn
+            .query_row("SELECT ended_at FROM encounter_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(run_end, 2_000_500);
+    }
+
+    #[test]
+    fn recurring_repairs_roll_back_changes_and_checkpoints_together() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = escaped_fight("Snake Pit", 123, 7);
+        fight.local_char_id = 1;
+        let id = db.insert_fight(&fight).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_repair BEFORE UPDATE ON fights BEGIN
+             SELECT RAISE(FAIL, 'injected repair failure'); END;",
+            )
+            .unwrap();
+        assert!(db.historical_repair_batch(None).is_err());
+        assert!(db.conn.is_autocommit());
+        for table in [
+            "historical_repairs",
+            "encounter_runs",
+            "historical_repair_groups",
+        ] {
+            let count: i64 = db
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} must roll back");
+        }
+        assert!(db
+            .conn
+            .query_row(
+                "SELECT encounter_run_id IS NULL FROM fights WHERE id=?1",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap());
+        db.conn.execute_batch("DROP TRIGGER fail_repair").unwrap();
+        finish_recurring_repairs(&mut db, None);
+        assert!(db
+            .conn
+            .query_row(
+                "SELECT encounter_run_id IS NOT NULL FROM fights WHERE id=?1",
+                [id],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn recurring_repairs_yield_immediately_on_writer_contention() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        db.insert_fight(&sample_fight()).unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let result = db.historical_repair_batch(None);
+        let elapsed = started.elapsed();
+        other.execute_batch("ROLLBACK").unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        assert!(db.conn.is_autocommit());
+        let timeout: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            timeout, 5_000,
+            "normal persistence retains its busy timeout"
+        );
+        db.historical_repair_batch(None).unwrap();
+    }
+
+    #[test]
+    fn recurring_repairs_wait_for_paired_history_without_consuming_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("loot.db");
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let id = db
+            .insert_fight(&escaped_fight("Lair of Shaitan", 28058, 7))
+            .unwrap();
+        for _ in 0..10 {
+            db.historical_repair_batch(Some(&missing)).unwrap();
+        }
+        assert!(!missing.exists());
+        let consumed: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM historical_repairs WHERE repair_id LIKE '%loot-completion%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, 0);
+        assert_eq!(killed_flag(&db, id), 0);
+        write_loot_db_with_drop(&missing, 7, 28058, 65_000, &[17]);
+        finish_recurring_repairs(&mut db, Some(&missing));
+        assert_eq!(killed_flag(&db, id), 1);
+    }
+
+    #[test]
+    fn recurring_repairs_match_previous_grouping_and_completion_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let loot = temp.path().join("loot.db");
+        write_loot_db_with_drop(&loot, 7, 30034, 65_000, &[]);
+        let mut reference = CombatDatabase::open_in_memory().unwrap();
+        let mut deferred = CombatDatabase::open_in_memory().unwrap();
+        for seed in [0, 7, 8, -9] {
+            for (start, char_id) in [(1_000, 1), (10_000, 1), (3_000_000, 1), (1_000, 2)] {
+                let mut fight = escaped_by_nexus_fight("Legacy Lair of Draconis", 30019, seed);
+                fight.local_char_id = char_id;
+                fight.started_at = start;
+                fight.ended_at = start + 30_000;
+                reference.insert_fight(&fight).unwrap();
+                deferred.insert_fight(&fight).unwrap();
+            }
+        }
+        reference.backfill_encounter_runs().unwrap();
+        reference
+            .complete_legacy_lod_dragons_from_loot(Some(&loot))
+            .unwrap();
+        reference.complete_bosses_from_loot(Some(&loot)).unwrap();
+        reference.backfill_legacy_lod_from_ivory().unwrap();
+        reference.repair_local_nexus_on_completed_fights().unwrap();
+        finish_recurring_repairs(&mut deferred, Some(&loot));
+        for id in 1..=16 {
+            let header = |db: &CombatDatabase| {
+                db.conn
+                    .query_row(
+                        "SELECT encounter_run_id, killed FROM fights WHERE id=?1",
+                        [id],
+                        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, bool>(1)?)),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(header(&reference), header(&deferred));
+            assert_eq!(
+                participant_status(&reference, id, "Me"),
+                participant_status(&deferred, id, "Me")
+            );
+        }
+    }
+
+    #[test]
+    fn live_loot_recovery_catches_up_without_replaying_a_completed_proof() {
+        if a_boss_mark_id().is_none() {
+            eprintln!("skipping: game assets not available");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let loot = temp.path().join("loot.db");
+        write_loot_db_with_drop(&loot, 0, 0, 0, &[]);
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        finish_recurring_repairs(&mut db, Some(&loot));
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut far = escaped_fight("Lair of Shaitan", 28058, 7);
+        far.started_at = now - 300_000;
+        far.ended_at = now - 200_000;
+        let far_id = db.insert_fight(&far).unwrap();
+        let mut near = far.clone();
+        near.started_at = now - 60_000;
+        near.ended_at = now - 1_000;
+        let near_id = db.insert_fight(&near).unwrap();
+        Connection::open(&loot).unwrap().execute(
+            "INSERT INTO loot_drops(id, map_seed, mob_type, timestamp) VALUES (2, 7, 28058, ?1)",
+            [now],
+        ).unwrap();
+        db.historical_repair_batch(Some(&loot)).unwrap();
+        assert_eq!(killed_flag(&db, near_id), 1);
+        assert_eq!(killed_flag(&db, far_id), 0);
+        drop(db);
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        for _ in 0..3 {
+            db.historical_repair_batch(Some(&loot)).unwrap();
+        }
+        assert_eq!(
+            killed_flag(&db, far_id),
+            0,
+            "one bag must not complete another fragment on resume"
+        );
+        Connection::open(&loot).unwrap().execute(
+            "INSERT INTO loot_drops(id, map_seed, mob_type, timestamp) VALUES (3, 8, 28058, ?1)",
+            [now],
+        ).unwrap();
+        db.historical_repair_batch(Some(&loot)).unwrap();
+        drop(db);
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        near.map_seed = 8;
+        let late_id = db.insert_fight(&near).unwrap();
+        db.historical_repair_batch(Some(&loot)).unwrap();
+        assert_eq!(
+            killed_flag(&db, late_id),
+            1,
+            "late fight uses durable pending proof"
+        );
+    }
+
+    #[test]
+    fn combat_counter_ledgers_survive_history_deletion_and_cache_replay() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        let mut fight = flawless_fight(
+            "Fungal Cavern",
+            45712,
+            vec![secret_local_part(80_000, ParticipantEndStatus::Present)],
+        );
+        fight.local_close_calls = 3;
+        let id = db.insert_fight(&fight).unwrap();
+        db.reconcile_stat_awards_for_selections(&[FightSelection::Single(id)])
+            .unwrap();
+        db.delete_selection(&FightSelection::Single(id)).unwrap();
+        let batch = db.persisted_combat_totals(&[1, 42]).unwrap();
+        assert_eq!(batch.stat_awards[&1], (1, 0, 0));
+        assert_eq!(batch.stat_awards[&42], (0, 0, 0));
+        assert_eq!(batch.close_calls[&1], 3);
+        assert_eq!(db.persisted_combat_totals(&[1]).unwrap().close_calls[&1], 3);
+    }
+
+    #[test]
     fn weapon_pattern_breakdown_roundtrips_and_legacy_rows_still_parse() {
         let weapons = vec![WeaponContribution {
             weapon_id: 3073,
@@ -6943,6 +7752,162 @@ mod tests {
                 .expect("fight")
                 .dungeon_modifiers,
             vec!["CHEF"]
+        );
+    }
+
+    #[test]
+    fn schema70_upgrades_main_and_pr_databases_without_resetting_repairs() {
+        let checkpoints = |db: &CombatDatabase| {
+            db.conn
+                .prepare(
+                    "SELECT repair_id,cutoff,cursor,seed_cursor,time_cursor,text_cursor,complete
+                     FROM historical_repairs ORDER BY repair_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, bool>(6)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<SqlResult<Vec<_>>>()
+                .unwrap()
+        };
+        for version in [67, 68, 69] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("combat.db");
+            let mut db = CombatDatabase::open_writer(&path).unwrap();
+            let mut fight = sample_fight();
+            fight.dungeon_modifiers = vec!["CHEF".into(), "REWARDING".into()];
+            let original = db.insert_fight(&fight).unwrap();
+            assert_eq!(original, 1);
+            if version < 69 {
+                db.conn
+                    .execute_batch(
+                        "DROP TRIGGER queue_inserted_stat_card;
+                         DROP TRIGGER queue_updated_stat_card;
+                         DROP TRIGGER queue_updated_stat_participant;
+                         DROP TABLE historical_repairs;
+                         DROP TABLE historical_repair_groups;
+                         DROP TABLE pending_stat_cards;
+                         DROP TABLE pending_stat_card_retirements;
+                         DROP TABLE applied_loot_proofs;
+                         DROP TABLE pending_loot_proofs;
+                         DROP TABLE fight_close_calls;
+                         DROP TABLE legacy_combat_groups;
+                         DROP TABLE legacy_combat_run_spans;
+                         DROP INDEX idx_death_broadcasts_retry;
+                         ALTER TABLE death_broadcasts DROP COLUMN next_attempt_at;
+                         ALTER TABLE encounter_runs DROP COLUMN live_origin;",
+                    )
+                    .unwrap();
+            } else {
+                db.conn
+                    .execute_batch(
+                        "INSERT INTO historical_repairs
+                         (repair_id,cutoff,cursor,seed_cursor,time_cursor,text_cursor,complete)
+                     VALUES
+                         ('encounter-grouping-v1',1,0,7,61000,'saved-run',0),
+                         ('legacy-combat-044-classify',1,1,7,61000,'',1),
+                         ('live-loot-proofs-v1',0,57,-2147483649,-9223372036854775808,'',0);
+                     INSERT INTO historical_repair_groups
+                         (encounter,char_id,dungeon,map_seed,run_id,last_ended)
+                     VALUES('dungeon_run',1,'Mad Lab',42,'saved-run',61000);",
+                    )
+                    .unwrap();
+            }
+            db.insert_fight(&fight).unwrap();
+            if version != 68 {
+                db.conn
+                    .execute_batch("ALTER TABLE fights DROP COLUMN mods")
+                    .unwrap();
+            }
+            db.conn
+                .execute_batch(&format!("PRAGMA user_version={version}"))
+                .unwrap();
+            let saved = if version == 69 {
+                checkpoints(&db)
+            } else {
+                Vec::new()
+            };
+            db.close().unwrap();
+
+            for reopen in 0..2 {
+                let mut db = CombatDatabase::open_writer(&path).unwrap();
+                assert_eq!(
+                    db.conn
+                        .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                        .unwrap(),
+                    70,
+                    "upgrading v{version}, reopen {reopen}",
+                );
+                assert!(db.column_exists("fights", "mods").unwrap());
+                assert!(db
+                    .column_exists("death_broadcasts", "next_attempt_at")
+                    .unwrap());
+                assert_eq!(db.fight_count().unwrap(), 2 + reopen);
+                let loaded = db.fight_detail(original).unwrap().unwrap();
+                assert_eq!(loaded.boss_name, fight.boss_name);
+                assert_eq!(
+                    loaded.dungeon_modifiers,
+                    if version == 68 {
+                        fight.dungeon_modifiers.clone()
+                    } else {
+                        Vec::new()
+                    },
+                );
+                assert_eq!(
+                    checkpoints(&db),
+                    saved,
+                    "v{version} repair checkpoints changed"
+                );
+                assert_eq!(
+                    db.conn
+                        .query_row("SELECT COUNT(*) FROM historical_repair_groups", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap(),
+                    i64::from(version == 69),
+                );
+                if reopen == 0 {
+                    let id = db.insert_fight(&fight).unwrap();
+                    assert_eq!(
+                        db.fight_detail(id).unwrap().unwrap().dungeon_modifiers,
+                        fight.dungeon_modifiers
+                    );
+                }
+                db.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn schema70_fresh_database_has_modifiers_and_maintenance_without_legacy_jobs() {
+        let db = CombatDatabase::open_in_memory().unwrap();
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            70,
+        );
+        assert!(db.column_exists("fights", "mods").unwrap());
+        assert!(db
+            .column_exists("death_broadcasts", "next_attempt_at")
+            .unwrap());
+        assert_eq!(db.fight_count().unwrap(), 0);
+        assert!(!db.has_legacy_repairs().unwrap());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM historical_repairs", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
         );
     }
 
@@ -7709,10 +8674,97 @@ mod tests {
     }
 
     #[test]
-    fn stat_sql_pages_and_selections_at_large_database_size() {
+    fn legacy_combat_repairs_at_large_database_size() {
+        let _ = a_boss_mark_id();
+        if !crate::assets::get_asset_manager().is_loaded() {
+            eprintln!("skipping asset-dependent large legacy repair comparison");
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("combat.db");
-        let db = CombatDatabase::open_writer(&path).unwrap();
+        let db = large_combat_fixture(&path);
+        db.conn.execute_batch("PRAGMA user_version=4").unwrap();
+        db.close().unwrap();
+        let reference_path = temp.path().join("reference.db");
+        std::fs::copy(&path, &reference_path).unwrap();
+        let mut reference = CombatDatabase {
+            conn: Connection::open(&reference_path).unwrap(),
+        };
+        let started = std::time::Instant::now();
+        reference.migrate_legacy_reference(4).unwrap();
+        println!("Former legacy Combat migration: {:?}", started.elapsed());
+        let initial_size = std::fs::metadata(&path).unwrap().len();
+        let started = std::time::Instant::now();
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        println!("Deferred legacy schema-only open: {:?}", started.elapsed());
+        let mut batches = 0;
+        let mut slowest = std::time::Duration::ZERO;
+        let started = std::time::Instant::now();
+        loop {
+            let step = std::time::Instant::now();
+            db.historical_repair_batch(None).unwrap();
+            slowest = slowest.max(step.elapsed());
+            batches += 1;
+            assert!(batches < 10_000);
+            let pending:bool=db.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM historical_repairs WHERE repair_id LIKE 'legacy-combat-%' AND complete=0)
+                 OR EXISTS(SELECT 1 FROM legacy_combat_groups)
+                 OR EXISTS(SELECT 1 FROM legacy_combat_run_spans)",
+                [],|r|r.get(0),
+            ).unwrap();
+            if !pending {
+                break;
+            }
+        }
+        println!(
+            "Deferred legacy repairs: {batches} batches, work={:?}, slowest={slowest:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_stat_card_retirements",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "unawarded fights must not generate a per-fight retirement queue"
+        );
+        let headers = |db: &CombatDatabase| {
+            db.conn.prepare(
+            "SELECT id,encounter_id,encounter_run_id,dungeon,boss_name,boss_group FROM fights ORDER BY id"
+        ).unwrap().query_map([],|r|Ok((
+            r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,
+            r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,
+        ))).unwrap().collect::<SqlResult<Vec<_>>>().unwrap()
+        };
+        assert_eq!(headers(&db), headers(&reference));
+        let totals = |db: &CombatDatabase| {
+            db.dungeon_time_totals()
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.dungeon, r.total_time_ms, r.completions))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(totals(&db), totals(&reference));
+        db.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        reference
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        println!(
+            "Same-schema legacy fixture: before={:.2} MiB, former repair={:.2} MiB, deferred repair={:.2} MiB",
+            initial_size as f64/1_048_576.0,
+            std::fs::metadata(&reference_path).unwrap().len() as f64/1_048_576.0,
+            std::fs::metadata(&path).unwrap().len() as f64/1_048_576.0,
+        );
+    }
+
+    fn large_combat_fixture(path: &Path) -> CombatDatabase {
+        let db = CombatDatabase::open_writer(path).unwrap();
         db.conn
             .execute_batch(
                 "BEGIN;
@@ -7749,6 +8801,14 @@ mod tests {
              PRAGMA wal_checkpoint(TRUNCATE);",
             )
             .unwrap();
+        db
+    }
+
+    #[test]
+    fn stat_sql_pages_and_selections_at_large_database_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let db = large_combat_fixture(&path);
         let reader = CombatDatabase::open_reader_at(&path).unwrap();
         let mut expected: Vec<(FightSelection, i64)> = (1..=2000)
             .filter(|n| n % 251 == 0)
@@ -7862,6 +8922,64 @@ mod tests {
                 }
             }
         }
+        drop(reader);
+        drop(db);
+        let _ = a_boss_mark_id();
+        if !crate::assets::get_asset_manager().is_loaded() {
+            eprintln!("skipping asset-dependent historical repair comparison");
+            return;
+        }
+        let reference_path = temp.path().join("reference.db");
+        std::fs::copy(&path, &reference_path).unwrap();
+        let mut reference = CombatDatabase::open_writer(&reference_path).unwrap();
+        let started = std::time::Instant::now();
+        reference.backfill_encounter_runs().unwrap();
+        let grouping = started.elapsed();
+        let started = std::time::Instant::now();
+        let reference_awards = reference.reconcile_stat_awards().unwrap();
+        let awards = started.elapsed();
+        let started = std::time::Instant::now();
+        let reference_close_calls = reference.reconcile_close_calls().unwrap();
+        println!(
+            "Former startup: grouping={grouping:?}, awards={awards:?}, close_calls={:?}",
+            started.elapsed()
+        );
+        let started = std::time::Instant::now();
+        let mut deferred = CombatDatabase::open_writer(&path).unwrap();
+        println!(
+            "Schema-current writer open without historical work: {:?}",
+            started.elapsed()
+        );
+        let loot = temp.path().join("empty_loot.db");
+        let _loot = crate::loot::LootDatabase::open_writer(&loot, None).unwrap();
+        let started = std::time::Instant::now();
+        let mut slowest = std::time::Duration::ZERO;
+        let mut batches = 0;
+        loop {
+            let batch_start = std::time::Instant::now();
+            let batch = deferred.historical_repair_batch(Some(&loot)).unwrap();
+            slowest = slowest.max(batch_start.elapsed());
+            batches += 1;
+            assert!(batches < 10_000);
+            if !batch.pending {
+                break;
+            }
+        }
+        println!(
+            "Deferred historical repair: {batches} batches, work={:?}, slowest={slowest:?}",
+            started.elapsed()
+        );
+        deferred
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        println!(
+            "Repaired combat DB: {:.2} MiB",
+            std::fs::metadata(&path).unwrap().len() as f64 / 1_048_576.0
+        );
+        let restored = deferred.persisted_combat_totals(&[1]).unwrap();
+        assert_eq!(restored.stat_awards, reference_awards);
+        assert_eq!(restored.close_calls, reference_close_calls);
     }
 
     #[test]
@@ -8784,7 +9902,7 @@ mod tests {
     }
 
     #[test]
-    fn lod_chest_loot_completes_matching_dragon_on_open() {
+    fn lod_chest_loot_completes_matching_dragon_after_deferred_repair() {
         let temp = tempfile::tempdir().unwrap();
         let combat_path = temp.path().join("combat_history.db");
         let loot_path = temp.path().join("loot_history.db");
@@ -8793,7 +9911,8 @@ mod tests {
         {
             let conn = Connection::open(&loot_path).unwrap();
             conn.execute_batch(
-                "CREATE TABLE loot_drops (map_seed INTEGER, mob_type INTEGER, timestamp INTEGER);
+                "CREATE TABLE loot_drops (id INTEGER PRIMARY KEY, map_seed INTEGER, mob_type INTEGER, timestamp INTEGER);
+                 CREATE TABLE loot_items(drop_id INTEGER, item_id INTEGER);
                  INSERT INTO loot_drops (map_seed, mob_type, timestamp) VALUES (7, 30034, 65000);",
             )
             .unwrap();
@@ -8815,9 +9934,16 @@ mod tests {
             db.insert_fight(&other).unwrap();
         }
 
-        // Re-open paired with the loot DB: the backfill completes only the dragon
+        // Deferred maintenance completes only the dragon
         // whose chest bag was recorded in the same instance.
-        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        let mut db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        assert_eq!(
+            db.conn
+                .query_row("SELECT SUM(killed) FROM fights", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        finish_recurring_repairs(&mut db, Some(&loot_path));
         let killed_seed7: i64 = db
             .conn
             .query_row("SELECT killed FROM fights WHERE map_seed = 7", [], |r| {
@@ -8844,7 +9970,8 @@ mod tests {
         {
             let conn = Connection::open(&loot_path).unwrap();
             conn.execute_batch(
-                "CREATE TABLE loot_drops (map_seed INTEGER, mob_type INTEGER, timestamp INTEGER);
+                "CREATE TABLE loot_drops (id INTEGER PRIMARY KEY, map_seed INTEGER, mob_type INTEGER, timestamp INTEGER);
+                 CREATE TABLE loot_items(drop_id INTEGER, item_id INTEGER);
                  INSERT INTO loot_drops (map_seed, mob_type, timestamp) VALUES (7, 30034, 400000);",
             )
             .unwrap();
@@ -8872,7 +9999,8 @@ mod tests {
             near_id = db.insert_fight(&near).unwrap();
         }
 
-        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        let mut db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        finish_recurring_repairs(&mut db, Some(&loot_path));
         let killed_far: i64 = db
             .conn
             .query_row("SELECT killed FROM fights WHERE id = ?1", [far_id], |r| {
@@ -9016,10 +10144,10 @@ mod tests {
 
     /// A fight completed by a path that does not touch its participants (a Legacy
     /// LoD chest bag, or a bag applied by a later session) is repaired when the
-    /// database is next opened, so cards recorded before this repair existed are
+    /// deferred maintenance runs, so cards recorded before this repair existed are
     /// corrected too.
     #[test]
-    fn opening_the_database_clears_a_local_nexus_on_a_completed_fight() {
+    fn deferred_repair_clears_a_local_nexus_on_a_completed_fight() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("combat_history.db");
         let id;
@@ -9033,7 +10161,9 @@ mod tests {
                 .unwrap();
         }
 
-        let db = CombatDatabase::open_writer(&path).unwrap();
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        assert_eq!(participant_status(&db, id, "Me"), "nexused");
+        finish_recurring_repairs(&mut db, None);
         assert_eq!(
             participant_status(&db, id, "Me"),
             "present",
@@ -9170,7 +10300,7 @@ mod tests {
     /// already stored as Escaped is completed from the Head's bag in the loot DB.
     /// Needs no game assets, since the boss list is curated in the registry.
     #[test]
-    fn bag_proves_kill_repairs_the_escaped_boss_on_open() {
+    fn bag_proves_kill_repairs_the_escaped_boss_after_deferred_repair() {
         const HEAD: i32 = 28058;
         let temp = tempfile::tempdir().unwrap();
         let combat_path = temp.path().join("combat_history.db");
@@ -9191,7 +10321,9 @@ mod tests {
             assert_eq!(killed_flag(&db, hit_id), 0);
         }
 
-        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        let mut db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        assert_eq!(killed_flag(&db, hit_id), 0);
+        finish_recurring_repairs(&mut db, Some(&loot_path));
         assert_eq!(
             killed_flag(&db, hit_id),
             1,
@@ -9212,7 +10344,7 @@ mod tests {
     /// out of sight is stored Escaped (its removal reads as "left view"), which is
     /// the case this repairs.
     #[test]
-    fn a_boss_attributed_bag_completes_its_escaped_fight_on_open() {
+    fn a_boss_attributed_bag_completes_its_escaped_fight_after_deferred_repair() {
         // Ice Citadel's Esben-style shape, with the Realm's Crystal Worm Father: a
         // catalogued MINIBOSS whose bag holds no Mark.
         const CWF: i32 = 22_138;
@@ -9250,7 +10382,9 @@ mod tests {
             assert_eq!(killed_flag(&db, hit_id), 0);
         }
 
-        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        let mut db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        assert_eq!(killed_flag(&db, hit_id), 0);
+        finish_recurring_repairs(&mut db, Some(&loot_path));
         assert_eq!(
             killed_flag(&db, hit_id),
             1,
@@ -9266,7 +10400,7 @@ mod tests {
     }
 
     #[test]
-    fn mark_loot_completes_the_escaped_boss_on_open() {
+    fn mark_loot_completes_the_escaped_boss_after_deferred_repair() {
         let Some(mark) = a_boss_mark_id() else {
             eprintln!("skipping: game assets not available");
             return;
@@ -9289,9 +10423,11 @@ mod tests {
             assert_eq!(killed_flag(&db, hit_id), 0);
         }
 
-        // Re-opening paired with the loot DB repairs the run the Mark proves was
+        // Deferred maintenance repairs the run the Mark proves was
         // killed, and only that run.
-        let db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        let mut db = CombatDatabase::open_writer_with_loot(&combat_path, Some(&loot_path)).unwrap();
+        assert_eq!(killed_flag(&db, hit_id), 0);
+        finish_recurring_repairs(&mut db, Some(&loot_path));
         assert_eq!(killed_flag(&db, hit_id), 1, "the Mark completes its boss");
         let killed_in_other_instance: i64 = db
             .conn
@@ -9412,7 +10548,7 @@ mod tests {
     }
 
     #[test]
-    fn ivory_backfill_completes_on_open_and_isolates_by_character() {
+    fn ivory_backfill_completes_after_deferred_repair_and_isolates_by_character() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("combat_history.db");
         {
@@ -9454,7 +10590,8 @@ mod tests {
                 "live hook cannot complete a dragon inserted after its Ivory"
             );
         }
-        let db = CombatDatabase::open_writer(&path).unwrap();
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let cleared: i64 = db
             .conn
             .query_row("SELECT killed FROM fights WHERE map_seed = 7", [], |r| {
@@ -9469,7 +10606,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cleared, 1,
-            "on-open backfill completes the character's Lair run"
+            "deferred backfill completes the character's Lair run"
         );
         assert_eq!(
             untouched, 0,
@@ -9974,6 +11111,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         let version: i32 = db
             .conn
@@ -10798,6 +11936,10 @@ mod tests {
         fight.ended_at = now + 5_000;
         fight.participants[0].end_status = ParticipantEndStatus::Nexused;
         db.insert_fight(&fight).unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0, "retry is deferred");
+        db.conn
+            .execute("UPDATE death_broadcasts SET next_attempt_at=0", [])
+            .unwrap();
         assert_eq!(db.repair_remote_deaths().unwrap(), 1);
         let processed: i64 = db
             .conn
@@ -10805,6 +11947,56 @@ mod tests {
             .unwrap();
         assert_eq!(processed, 1, "an applied broadcast is retired");
         assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+    }
+
+    #[test]
+    fn death_broadcast_retry_misses_do_not_starve_newer_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("combat.db");
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        for n in 0..16 {
+            db.insert_death_broadcast(&format!("Missing{n}"), "a Spider", now)
+                .unwrap();
+        }
+        let mut fight = fight_with_players("Mad Lab", now - 5_000, &["Found"]);
+        fight.ended_at = now + 5_000;
+        fight.participants[0].end_status = ParticipantEndStatus::Nexused;
+        db.insert_fight(&fight).unwrap();
+        db.insert_death_broadcast("Found", "a Spider", now + 1)
+            .unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+        drop(db);
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        assert_eq!(db.repair_remote_deaths().unwrap(), 1);
+        let misses: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM death_broadcasts WHERE processed=0 AND next_attempt_at>0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(misses, 16, "unmatched broadcasts remain eligible for retry");
+        let mut stmt = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM death_broadcasts
+                 WHERE processed=0 AND next_attempt_at<=?1
+                 ORDER BY next_attempt_at, occurred_at, id LIMIT 16",
+            )
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map([now], |r| r.get(3))
+            .unwrap()
+            .collect::<SqlResult<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|s| s.contains("idx_death_broadcasts_retry")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|s| s.contains("TEMP B-TREE")), "{plan:?}");
     }
 
     #[test]
@@ -10851,6 +12043,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "nexused");
+    }
+
+    #[test]
+    fn death_broadcast_retry_schedule_is_added_to_existing_databases() {
+        let mut db = CombatDatabase::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_death_broadcasts_retry;
+                 ALTER TABLE death_broadcasts DROP COLUMN next_attempt_at;
+                 PRAGMA user_version = 67;",
+            )
+            .unwrap();
+        db.insert_death_broadcast(
+            "Late",
+            "a Spider",
+            chrono::Utc::now().timestamp_millis() - 16 * 60 * 1000,
+        )
+        .unwrap();
+        db.initialize(None).unwrap();
+        assert!(db
+            .column_exists("death_broadcasts", "next_attempt_at")
+            .unwrap());
+        assert_eq!(db.repair_remote_deaths().unwrap(), 0);
+        let processed: i64 = db
+            .conn
+            .query_row("SELECT processed FROM death_broadcasts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            processed, 1,
+            "old broadcasts remain recoverable after migration"
+        );
     }
 
     #[test]
@@ -10909,7 +12132,7 @@ mod tests {
     }
 
     #[test]
-    fn death_broadcast_repair_runs_on_open() {
+    fn death_broadcast_repair_runs_during_deferred_maintenance() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("combat_history.db");
         {
@@ -10931,7 +12154,8 @@ mod tests {
                 .unwrap();
             assert_eq!(before, "nexused");
         }
-        let db = CombatDatabase::open_writer(&path).unwrap();
+        let mut db = CombatDatabase::open_writer(&path).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let after: String = db
             .conn
             .query_row(
@@ -10940,7 +12164,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(after, "died", "the on-open pass applies stored broadcasts");
+        assert_eq!(
+            after, "died",
+            "deferred maintenance applies stored broadcasts"
+        );
     }
 
     /// Build a standalone fight with an explicit set of participant IGNs.
@@ -11539,6 +12766,7 @@ mod tests {
         db.conn.execute_batch("PRAGMA user_version = 5").unwrap();
 
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         assert_eq!(
             db.conn
@@ -12172,6 +13400,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12243,6 +13472,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         // The two distinct live instances are NOT merged.
         let runs: i64 = db
@@ -12286,6 +13516,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12342,6 +13573,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12450,6 +13682,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12469,6 +13702,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Moonlight Village run recorded before the fix: a Challenge Gate and
         // MV Easy Dropper (now curated non-bosses), a dancer, and Fishing Loot.
         db.conn
@@ -12509,6 +13743,7 @@ mod tests {
         // Re-run migrations from v23.
         db.conn.execute_batch("PRAGMA user_version = 23").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12581,6 +13816,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Lich King run recorded before the fix: the real boss plus Lich
         // King Grave adds (34587) that were tracked as their own fights, one of
         // which defines the run's earliest start and latest end.
@@ -12621,6 +13857,7 @@ mod tests {
         // Re-run migrations from v24.
         db.conn.execute_batch("PRAGMA user_version = 24").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12689,6 +13926,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Realm visit recorded before the fix: the real Adult Baneserpent
         // body (34456, killed) plus a spurious head segment (34459) that shares
         // the DisplayId "Adult Baneserpent" but was fought without the body in
@@ -12727,6 +13965,7 @@ mod tests {
         // Re-run migrations from v28.
         db.conn.execute_batch("PRAGMA user_version = 28").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12770,6 +14009,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Spectral Penitentiary run recorded before the fix: a CellBranch
         // tutorial object (24456) and an Administration Turret (24061) tracked as
         // spurious cards, plus the real Murcian Overseer boss (23508, killed).
@@ -12808,6 +14048,7 @@ mod tests {
         // Re-run migrations from v37.
         db.conn.execute_batch("PRAGMA user_version = 37").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12869,6 +14110,7 @@ mod tests {
                 started_at INTEGER, ended_at INTEGER, killed INTEGER
             );
             CREATE TABLE fight_participants (fight_id INTEGER, object_id INTEGER);
+            CREATE TABLE stat_awards(card_key TEXT PRIMARY KEY, char_id INTEGER, lone INTEGER, last INTEGER, most INTEGER);
             PRAGMA user_version = 38;
             "#,
             )
@@ -12876,6 +14118,7 @@ mod tests {
         assert!(!db.column_exists("fights", "aux_member_count").unwrap());
 
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         let version: i32 = db
             .conn
@@ -12894,6 +14137,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A database written before the canonical-dungeon table covered the
         // Season 31 reskins stored their realm-spawned Oryx's Castle bosses under
         // the raw realm map name.
@@ -12915,6 +14159,7 @@ mod tests {
         // Re-run migrations from v58.
         db.conn.execute_batch("PRAGMA user_version = 58").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -12967,7 +14212,7 @@ mod tests {
             )
             .unwrap();
 
-        db.initialize(None).unwrap();
+        db.backfill_encounter_runs().unwrap();
 
         let runs: i64 = db
             .conn
@@ -12993,7 +14238,7 @@ mod tests {
             "#,
             )
             .unwrap();
-        db.initialize(None).unwrap();
+        db.backfill_encounter_runs().unwrap();
         let runs: i64 = db
             .conn
             .query_row(
@@ -13012,6 +14257,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         db.conn
             .execute_batch(
                 r#"
@@ -13028,6 +14274,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 59").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
 
         let chamber: i64 = db
             .conn
@@ -13055,6 +14302,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A database that reached v39 during earlier testing still holds an
         // Administration Turret (24061) row because the v38 purge gained that type
         // only after this database had already advanced past v38.
@@ -13075,6 +14323,7 @@ mod tests {
         // Re-run migrations from v39.
         db.conn.execute_batch("PRAGMA user_version = 39").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13107,6 +14356,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Spectral Penitentiary run recorded before the fix: a branch Door
         // Switch (23840), a colored Torture floor switch (44357) and a Gretch
         // gravestone (23708) all logged as spurious cards via the HP fallback,
@@ -13149,6 +14399,7 @@ mod tests {
         // Re-run migrations from v40.
         db.conn.execute_batch("PRAGMA user_version = 40").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13205,6 +14456,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Rat Extermination visit recorded before the fix: the real Mammoth
         // City Rat (18007) plus event-scaled minion rats (18000, 18047) that were
         // logged as their own spam cards.
@@ -13243,6 +14495,7 @@ mod tests {
         // Re-run migrations from v30.
         db.conn.execute_batch("PRAGMA user_version = 30").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13286,6 +14539,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Lost Halls run recorded before the fix, with the old segment names.
         db.conn
             .execute_batch(
@@ -13304,6 +14558,7 @@ mod tests {
         // Re-run migrations from v31.
         db.conn.execute_batch("PRAGMA user_version = 31").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13334,6 +14589,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // Legacy MBC cards recorded before the taunt-driven split:
         //  - run A: a collapsed full-kill whose split never fired, local player
         //    SURVIVED (end_status 'present'), no Post-survival sibling -> relabel.
@@ -13370,6 +14626,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 45").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13420,6 +14677,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Legacy The Shatters run: three real bosses (Forgotten Sentinel 52556,
         // Twilight Archmage 52557, the King 52560), a kept aux bird (Blizzard
         // 52564) and trash (Royal Guardian 52558). A Legacy Woodland Labyrinth
@@ -13458,6 +14716,7 @@ mod tests {
         // Re-run migrations from v46.
         db.conn.execute_batch("PRAGMA user_version = 46").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13505,6 +14764,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Moonlight Village fight recorded before Challenge Mode was tracked:
         // the row predates the column, so it has to default to "not petless".
         db.conn
@@ -13522,6 +14782,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 54").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13547,6 +14808,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Spectral Penitentiary run recorded before hard mode was tracked: the
         // row predates the column, so it has to default to "not hard mode".
         db.conn
@@ -13564,6 +14826,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 55").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13628,6 +14891,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A hard-mode Shatters run recorded while the queen's object still fell
         // back to its internal catalog name.
         db.conn
@@ -13646,6 +14910,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 53").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13679,6 +14944,7 @@ mod tests {
             conn: Connection::open_in_memory().unwrap(),
         };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         // A Bilgewater's Galleon run: the tracked boss (20475) plus a Galleon
         // Admiral add (34465) that must be purged.
         db.conn
@@ -13697,6 +14963,7 @@ mod tests {
 
         db.conn.execute_batch("PRAGMA user_version = 49").unwrap();
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -13766,6 +15033,7 @@ mod tests {
 
         let mut db = CombatDatabase { conn };
         db.initialize(None).unwrap();
+        finish_recurring_repairs(&mut db, None);
         let version: i32 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
