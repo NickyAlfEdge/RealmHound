@@ -776,7 +776,10 @@ fn paint_padlock(painter: &egui::Painter, center: egui::Pos2, color: Color32, lo
     if locked {
         shackle.push(egui::pos2(hinge_x + RADIUS, body.top()));
     }
-    painter.add(egui::Shape::line(shackle, egui::Stroke::new(1.3_f32, color)));
+    painter.add(egui::Shape::line(
+        shackle,
+        egui::Stroke::new(1.3_f32, color),
+    ));
 }
 
 /// Show `text` for a hovered overlay widget, anchored to the window's left edge
