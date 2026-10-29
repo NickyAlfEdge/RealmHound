@@ -74,6 +74,7 @@ use app::{RealmHoundApp, PKG_NAME, VERSION};
 
 /// Windows keeps the empty icon so eframe does not blur its multi-size .ico and
 /// macOS uses the bundle icon, so only Linux decodes it for the window.
+#[cfg(not(windows))]
 fn window_icon() -> egui::IconData {
     #[cfg(target_os = "linux")]
     {
@@ -147,7 +148,7 @@ fn main() -> Result<()> {
         preview.window.maximized,
     );
 
-    let viewport = egui::ViewportBuilder::default()
+    let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(window_size)
         .with_min_inner_size([800.0, 600.0])
         .with_title("RealmHound")
@@ -163,10 +164,14 @@ fn main() -> Result<()> {
     // taskbars). Windows then uses the crisp multi-size .ico embedded as a
     // resource by build.rs, picking the correct frame per DPI.
     #[cfg(windows)]
-    viewport = viewport.with_icon(egui::IconData::default());
+    {
+        viewport = viewport.with_icon(egui::IconData::default());
+    }
 
     #[cfg(not(windows))]
-    viewport = viewport.with_icon(window_icon());
+    {
+        viewport = viewport.with_icon(window_icon());
+    }
 
     if let Some((x, y)) = window_pos {
         #[cfg(windows)]
@@ -184,6 +189,10 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport,
+        // On a Wayland session, run on XWayland so overlays can sit over the
+        // Proton (X11) game client; `REALMHOUND_WAYLAND=1` opts out.
+        #[cfg(target_os = "linux")]
+        event_loop_builder: overlay::platform::event_loop_hook(),
         ..Default::default()
     };
 

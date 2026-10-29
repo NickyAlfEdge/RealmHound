@@ -11,7 +11,11 @@
 //!   collection behavior to show over a fullscreen game client.
 //! - **Windows**: the overlay must never steal focus from the game nor appear in
 //!   Alt-Tab, which means `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` on the extended
-//!   style.
+//!   style. That same style stops the system move loop winit drags with, so
+//!   Windows moves and resizes overlays itself (see [`begin_drag`]).
+//! - **Linux (X11/XWayland)**: the window manager has to be told to keep the
+//!   overlay above a fullscreen Proton client and out of the taskbar, and a
+//!   click-through overlay needs the X server for the pointer position.
 //!
 //! Windows are located by their title, exactly as the viewport sets it, so no
 //! handle plumbing through eframe is needed. That title carries a per-window
@@ -19,13 +23,26 @@
 //! windowing layer has already abandoned; see [`dismiss_stale`].
 //!
 //! Every entry point is best-effort and infallible: a platform without an
-//! implementation (Linux/BSD) runs the stubs below and the overlay still works
-//! as a normal always-on-top window.
+//! implementation (native Wayland, BSD) runs the stubs below and the overlay
+//! still works as a normal always-on-top window.
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(windows)]
 mod windows;
+
+#[cfg(target_os = "linux")]
+pub use linux::event_loop_hook;
+
+/// What a title-bar or grip drag does to the overlay window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragKind {
+    Move,
+    /// Resize from the bottom-right corner.
+    Resize,
+}
 
 /// Apply the always-on-top / all-Spaces / never-steal-focus promotion to the
 /// overlay window titled `title`.
@@ -38,10 +55,12 @@ pub fn promote(title: &str) {
     macos::promote(title);
     #[cfg(windows)]
     windows::promote(title);
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    linux::promote(title);
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
-        // Linux/BSD: winit's always-on-top window level is all we can portably
-        // ask for across X11 and the various Wayland compositors.
+        // BSD: winit's always-on-top window level is all we can portably ask
+        // for.
         let _ = title;
     }
 }
@@ -67,7 +86,15 @@ pub fn order_front(title: &str, was_hidden: bool) -> bool {
         windows::order_front(title);
         false
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    {
+        // Like Windows: a window manager drops "above" order whenever a
+        // fullscreen client takes focus, and a restack request is cheap.
+        let _ = was_hidden;
+        linux::order_front(title);
+        false
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
         let _ = (title, was_hidden);
         false
@@ -112,15 +139,60 @@ pub fn cursor_position(pixels_per_point: f32) -> Option<(f32, f32)> {
     {
         windows::cursor_position(pixels_per_point)
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::cursor_position(pixels_per_point)
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
         let _ = pixels_per_point;
         None
     }
 }
 
+/// Start moving or resizing the overlay under the pointer natively.
+///
+/// Returns `false` when the platform leaves it to the windowing layer, in
+/// which case the caller sends `StartDrag` / `BeginResize` as usual. Once this
+/// returns `true`, call [`continue_drag`] every frame until it returns `false`.
+/// `min_w` / `min_h` bound a resize, in logical points.
+pub fn begin_drag(kind: DragKind, min_w: f32, min_h: f32, pixels_per_point: f32) -> bool {
+    #[cfg(windows)]
+    {
+        // Win32 works in physical pixels.
+        let scale = pixels_per_point.max(1.0);
+        windows::begin_drag(kind, min_w * scale, min_h * scale)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (kind, min_w, min_h, pixels_per_point);
+        false
+    }
+}
+
+/// Track the pointer for a drag [`begin_drag`] started. Returns `true` while
+/// the drag is still going, so the caller keeps frames coming.
+pub fn continue_drag() -> bool {
+    #[cfg(windows)]
+    {
+        windows::continue_drag()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Whether this platform has a native overlay implementation. Surfaced in the
-/// settings UI so Linux users know the overlay is a plain window there.
-pub const fn is_supported() -> bool {
-    cfg!(any(target_os = "macos", windows))
+/// settings UI so users on native Wayland (or BSD) know the overlay is a plain
+/// window there.
+pub fn is_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::uses_x11()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(target_os = "macos", windows))
+    }
 }

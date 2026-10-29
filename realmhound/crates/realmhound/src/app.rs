@@ -7842,6 +7842,19 @@ impl RealmHoundApp {
                 .weak()
                 .italics(),
             );
+            #[cfg(target_os = "linux")]
+            {
+                ui.label(
+                    RichText::new(
+                        "RealmHound is running natively on Wayland (REALMHOUND_WAYLAND=1 or \
+                         no XWayland), which cannot keep a window above the game. Start it \
+                         without REALMHOUND_WAYLAND to run on XWayland, where the overlays \
+                         stay over the Proton client.",
+                    )
+                    .weak()
+                    .italics(),
+                );
+            }
         }
         #[cfg(target_os = "macos")]
         {

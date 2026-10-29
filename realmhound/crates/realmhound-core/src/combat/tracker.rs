@@ -1788,6 +1788,16 @@ impl CombatTracker {
             .map(|(&aid, accum)| self.build_participant(aid, accum, fight.joined_late))
             .collect();
         collapse_unresolved(&mut participants);
+        if ended && fight.killed {
+            // Combat History drops unresolved damage before trimming; keep the
+            // Unknown row on screen but out of the trim so players match it.
+            let (mut resolved, unresolved): (Vec<_>, Vec<_>) = participants
+                .into_iter()
+                .partition(|p| p.is_local || p.provenance != DamageProvenance::Unresolved);
+            trim_plausible_overkill(fight, &mut resolved);
+            resolved.extend(unresolved);
+            participants = resolved;
+        }
         participants.sort_by(|a, b| b.damage.cmp(&a.damage).then(b.hits.cmp(&a.hits)));
 
         let boss = self.objects.get(&boss_id);
@@ -6993,6 +7003,104 @@ mod tests {
         // must not evict or overwrite the kill's row.
         t.on_tick(10_000_000);
         assert!(boss(&t, 10_000_000).ended, "stale trash overwrote the kill");
+    }
+
+    /// A Mad Lab boss with a 100k pool and two remote attackers, ready to fight.
+    fn overlay_kill_tracker() -> CombatTracker {
+        let mut t = CombatTracker::new();
+        t.on_map_change("Mad Lab", 1, 0, &[]);
+        t.on_player_loaded(1000, 1);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![stat(StatType::MaxHP, 100_000), stat(StatType::HP, 100_000)],
+            ),
+            0,
+        );
+        for (id, name) in [(600, "Bob"), (601, "Al")] {
+            t.on_object_spawn(
+                id,
+                0x0321,
+                &status_at(id, 1.0, 1.0, vec![name_stat(name)]),
+                10,
+            );
+        }
+        t
+    }
+
+    fn frozen_overlay_total(t: &CombatTracker) -> i64 {
+        let fight = t
+            .live_snapshots(60_000)
+            .into_iter()
+            .find(|f| f.boss_object_id == 500)
+            .expect("the boss is listed");
+        assert!(fight.ended, "the kill is frozen");
+        fight.total_damage()
+    }
+
+    #[test]
+    fn live_overlay_trims_death_tick_overkill_on_a_kill() {
+        // The final volley overshoots a 100k pool by 10k; the frozen overlay row
+        // must match what Combat History saves, not the raw overshoot.
+        let mut t = overlay_kill_tracker();
+        t.on_damage(500, 600, 70_000, 20);
+        t.on_damage(500, 601, 40_000, 21);
+        assert_eq!(
+            t.live_snapshots(25)[0].total_damage(),
+            110_000,
+            "a fight in progress keeps its raw figures"
+        );
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+        t.on_object_removed(500, 40);
+        assert_eq!(frozen_overlay_total(&t), 100_000);
+    }
+
+    #[test]
+    fn live_overlay_counts_boss_healing_in_its_kill_pool() {
+        // The boss heals 60k back mid-fight, so 160k is the real pool and the
+        // final volley overshoots it by 10k. That overshoot is trimmed to the
+        // healed pool, not to the boss's 100k max, which would halve everyone.
+        let mut t = overlay_kill_tracker();
+        t.on_damage(500, 600, 60_000, 20);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 40_000)]), 21);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 100_000)]), 22);
+        t.on_damage(500, 600, 55_000, 30);
+        t.on_damage(500, 601, 55_000, 31);
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 32);
+        t.on_object_removed(500, 40);
+        assert_eq!(frozen_overlay_total(&t), 160_000);
+    }
+
+    #[test]
+    fn live_overlay_kill_trim_leaves_out_unresolved_damage() {
+        // Combat History drops unresolved damage before trimming, so 100k of
+        // player damage on a 100k pool is not trimmed at all. The overlay keeps
+        // its Unknown row on screen but must not scale the players to share
+        // the pool with it.
+        let mut t = overlay_kill_tracker();
+        t.on_damage(500, 600, 60_000, 20);
+        t.on_damage(500, 601, 40_000, 21);
+        t.on_damage(500, 777, 10_000, 22); // never resolves to a named player
+        t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 30);
+        t.on_object_removed(500, 40);
+
+        let fight = t
+            .live_snapshots(60_000)
+            .into_iter()
+            .find(|f| f.boss_object_id == 500)
+            .expect("the boss is listed");
+        let damage = |name: &str| {
+            fight
+                .participants
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.damage)
+        };
+        assert_eq!(damage("Bob"), Some(60_000));
+        assert_eq!(damage("Al"), Some(40_000));
+        assert_eq!(damage("Unknown"), Some(10_000));
     }
 
     #[test]

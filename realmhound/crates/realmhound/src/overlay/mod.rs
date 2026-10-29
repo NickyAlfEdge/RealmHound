@@ -155,6 +155,11 @@ struct WindowRuntime {
     minimized: Option<bool>,
     /// Last resizable state pushed to the backend, for the same reason.
     resizable: Option<bool>,
+    /// A pass-through or resizable change went out last frame. winit applies
+    /// either by rewriting the window's whole native style, which drops the
+    /// tweaks [`platform::promote`] added, so they are re-applied next frame
+    /// rather than up to [`PROMOTE_INTERVAL`] later.
+    restyled: bool,
     /// Whether the window reported itself covered on the previous promote tick.
     /// [`platform::order_front`] is edge-triggered on it.
     hidden: bool,
@@ -171,6 +176,7 @@ impl WindowRuntime {
             passthrough: None,
             minimized: None,
             resizable: None,
+            restyled: false,
             hidden: false,
             last_promoted: None,
         }
@@ -193,6 +199,7 @@ impl WindowRuntime {
         self.passthrough = None;
         self.minimized = None;
         self.resizable = None;
+        self.restyled = false;
         self.hidden = false;
         self.last_promoted = None;
     }
@@ -232,9 +239,11 @@ impl WindowRuntime {
 
     /// Push a pass-through change and re-assert the native promotion on a timer.
     fn sync_native(&mut self, ctx: &egui::Context, cfg: &OverlayWindowSettings, passthrough: bool) {
+        let restyled = std::mem::take(&mut self.restyled);
         if self.passthrough != Some(passthrough) {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
             self.passthrough = Some(passthrough);
+            self.restyled = true;
         }
         if self.minimized != Some(cfg.minimized) {
             // The minimum has to move first, or it would clamp the collapse.
@@ -257,10 +266,12 @@ impl WindowRuntime {
         if self.resizable != Some(!cfg.locked) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(!cfg.locked));
             self.resizable = Some(!cfg.locked);
+            self.restyled = true;
         }
-        let due = self
-            .last_promoted
-            .is_none_or(|at| at.elapsed() >= PROMOTE_INTERVAL);
+        let due = restyled
+            || self
+                .last_promoted
+                .is_none_or(|at| at.elapsed() >= PROMOTE_INTERVAL);
         if due {
             // Retire leftovers first: raising the live window afterwards leaves
             // it on top even if the stale one was in front a moment ago.
@@ -540,6 +551,10 @@ fn show_window(
             // to be polled rather than waited for.
             ctx.request_repaint_after(CHROME_POLL_INTERVAL);
         }
+        if platform::continue_drag() {
+            // A natively driven move/resize follows the pointer frame by frame.
+            ctx.request_repaint();
+        }
 
         // Viewport commands target whichever viewport is current, so this has to
         // run inside the callback: from outside it would reconfigure the main
@@ -680,7 +695,7 @@ fn chrome(
             let bar = ui.available_rect_before_wrap();
             let response = ui.interact(bar, ui.id().with("overlay_drag"), egui::Sense::drag());
             if response.drag_started() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                begin_drag(ui.ctx(), platform::DragKind::Move);
             }
         }
 
@@ -872,10 +887,7 @@ fn resize_grip(ui: &mut egui::Ui, locked: bool) {
     );
     let response = ui.interact(rect, ui.id().with("overlay_grip"), egui::Sense::drag());
     if response.drag_started() {
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::BeginResize(
-                egui::viewport::ResizeDirection::SouthEast,
-            ));
+        begin_drag(ui.ctx(), platform::DragKind::Resize);
     }
     let painter = ui.painter();
     let color = Color32::from_gray(110);
@@ -889,6 +901,20 @@ fn resize_grip(ui: &mut egui::Ui, locked: bool) {
             egui::Stroke::new(1.0_f32, color),
         );
     }
+}
+
+/// Start moving or resizing the current overlay window, natively where the
+/// platform needs it and through the windowing layer everywhere else.
+fn begin_drag(ctx: &egui::Context, kind: platform::DragKind) {
+    if platform::begin_drag(kind, MIN_W, MIN_H, ctx.pixels_per_point()) {
+        return;
+    }
+    ctx.send_viewport_cmd(match kind {
+        platform::DragKind::Move => egui::ViewportCommand::StartDrag,
+        platform::DragKind::Resize => {
+            egui::ViewportCommand::BeginResize(egui::viewport::ResizeDirection::SouthEast)
+        }
+    });
 }
 
 /// Convert a perceptual "how much does this hide the game" fraction into the
