@@ -641,6 +641,7 @@ pub struct RealmHoundApp {
     capture: CaptureManager,
     /// Whether raw packets are being written to a `.rhcap` file (Debug settings).
     record_raw_packets: bool,
+    maintenance_ui_frames: u8,
     /// Debug "App resolution" width input (pixels, as typed).
     debug_window_width: String,
     /// Debug "App resolution" height input (pixels, as typed).
@@ -1181,6 +1182,7 @@ impl RealmHoundApp {
 
         let mut app = Self {
             capture: CaptureManager::new(interfaces),
+            maintenance_ui_frames: 0,
             // Honour the REALMHOUND_RECORD env var so the Debug toggle reflects
             // any recording already started at capture start.
             record_raw_packets: std::env::var("REALMHOUND_RECORD")
@@ -1687,7 +1689,7 @@ impl RealmHoundApp {
             }
             UiPayload::RealmDiscovery(event) => {
                 use crate::processing::realm_discovery::{
-                    DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE,
+                    DiscoveryEvent, CRYSTAL_TYPE, JAILER_TYPE, TOTALIA_TYPE,
                 };
 
                 let notification = match &event {
@@ -1705,6 +1707,15 @@ impl RealmHoundApp {
                     | DiscoveryEvent::CrystalMessage { notify, .. } => {
                         Some((CRYSTAL_TYPE, "Mysterious Crystal", *notify, None))
                     }
+                    // Totalia has no chat announcement: her object update (sent
+                    // even far outside view) is the only trigger. Several
+                    // instances spawn together, so share one sound key to let
+                    // the audio layer coalesce them.
+                    DiscoveryEvent::Discovered {
+                        object_type: TOTALIA_TYPE,
+                        notify,
+                        ..
+                    } => Some((TOTALIA_TYPE, "Totalia the Malevolent", *notify, None)),
                     _ => None,
                 };
                 self.live_feed_panel.apply_realm_discovery(event);
@@ -10482,6 +10493,18 @@ impl RealmHoundApp {
 
 impl eframe::App for RealmHoundApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        match self.maintenance_ui_frames {
+            0 => {
+                self.maintenance_ui_frames = 1;
+                ctx.request_repaint();
+            }
+            1 => {
+                self.maintenance_ui_frames = 2;
+                self.worker
+                    .send_control(ControlMsg::StartHistoricalMaintenance);
+            }
+            _ => {}
+        }
         #[cfg(windows)]
         crate::apply_window_chrome(&*_frame);
 

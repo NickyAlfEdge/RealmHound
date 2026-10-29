@@ -1365,6 +1365,10 @@ pub struct CombatTracker {
     /// carried onto every fight finalized in this dungeon so the encounter card
     /// can measure total dungeon time from entry to the final boss death.
     dungeon_entered_at: Option<i64>,
+    /// Dungeon modifier id tokens of the current map instance. Set on map change
+    /// (after the departing map's fights are finalized) and stamped onto every
+    /// fight finalized in this instance.
+    current_modifiers: Vec<String>,
     /// Local player's object id (0 until known).
     local_object_id: i32,
     /// Mastery and seasonal challenge damage multipliers applied to the local
@@ -1638,6 +1642,7 @@ impl CombatTracker {
             current_map: String::new(),
             current_seed: 0,
             dungeon_entered_at: None,
+            current_modifiers: Vec::new(),
             local_object_id: 0,
             local_char_id: 0,
             shot_damage_bonus: crate::stats::derived::ShotDamageBonus::none(),
@@ -1883,6 +1888,7 @@ impl CombatTracker {
         map_name: &str,
         map_seed: i32,
         time_ms: i64,
+        modifiers: &[String],
     ) -> Vec<CompletedFight> {
         // The local player is leaving the current map: any fight still open here
         // ends because they left it (nexus / teleport), not because they finished
@@ -1893,6 +1899,7 @@ impl CombatTracker {
         self.local_departing = false;
         self.current_map = map_name.to_string();
         self.current_seed = map_seed;
+        self.current_modifiers = modifiers.to_vec();
         // Stamp dungeon entry time so fights finalized in this instance can report
         // total dungeon time from entry to the final boss. Set after finalizing
         // the departing map's fights so those keep the old map's entry time.
@@ -5259,6 +5266,7 @@ impl CombatTracker {
             ended_at: time_ms,
             dungeon: dungeon.clone(),
             dungeon_entered_at: self.dungeon_entered_at,
+            dungeon_modifiers: self.current_modifiers.clone(),
             map_seed: self.current_seed,
             boss_object_type: fight.boss_object_type,
             boss_name,
@@ -6913,7 +6921,7 @@ mod tests {
         // An attacker that is removed while its boss is alive records a departure
         // at its last-seen position, which later correlates to a grave there.
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 1, 0);
+        t.on_map_change("Mad Lab", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -7181,7 +7189,7 @@ mod tests {
     #[test]
     fn pet_associates_to_nearest_player_by_position() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
 
         // Boss at origin.
@@ -7257,7 +7265,7 @@ mod tests {
     #[test]
     fn recycled_pet_object_id_does_not_inherit_owner_votes() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -7315,7 +7323,7 @@ mod tests {
     #[test]
     fn pet_beyond_threshold_is_not_associated() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -7367,7 +7375,7 @@ mod tests {
     #[test]
     fn close_call_counts_once_per_dip_and_clears_above_threshold() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Full HP: no close call.
         local_hp(&mut t, 1000, Some(1000), 10);
@@ -7392,7 +7400,7 @@ mod tests {
     #[test]
     fn close_call_attributes_to_active_fight() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 42);
         local_hp(&mut t, 1000, Some(1000), 10);
         // Start a boss fight, then dip.
@@ -7417,7 +7425,7 @@ mod tests {
     #[test]
     fn close_call_before_fight_carries_onto_next_fight() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 42);
         local_hp(&mut t, 1000, Some(1000), 10);
         // Dip with no active fight: buffered for the run.
@@ -7485,12 +7493,12 @@ mod tests {
     #[test]
     fn close_call_map_change_resets_edge_state() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 42);
         local_hp(&mut t, 100, Some(1000), 20);
         assert_eq!(t.take_pending_close_calls(), 1);
         // A new instance clears the low-HP edge so the first dip there counts.
-        t.on_map_change("Realm", 2, 1000);
+        t.on_map_change("Realm", 2, 1000, &[]);
         t.on_player_loaded(1000, 42);
         local_hp(&mut t, 100, Some(1000), 1020);
         assert_eq!(t.take_pending_close_calls(), 1);
@@ -7741,7 +7749,7 @@ mod tests {
         // before it is completed. They are always present in `objects` from their
         // own view, so the map-change departure is the only nexus signal.
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -7761,7 +7769,7 @@ mod tests {
             },
         );
         t.on_local_hit(500, 10, 1000, 1000, 200);
-        let done = t.on_map_change("Nexus", 0, 500);
+        let done = t.on_map_change("Nexus", 0, 500, &[]);
         assert_eq!(done.len(), 1);
         assert!(!done[0].killed, "dancer left unfinished");
         let local = done[0]
@@ -7791,7 +7799,7 @@ mod tests {
             extra_shots: 2,
         };
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -7830,7 +7838,7 @@ mod tests {
         );
         t.on_local_hit(500, 10, 1000, 1000, 100);
         t.on_local_hit(500, 11, 1000, 1000, 100);
-        let done = t.on_map_change("Nexus", 0, 200);
+        let done = t.on_map_change("Nexus", 0, 200, &[]);
         let local = done[0]
             .participants
             .iter()
@@ -7839,6 +7847,73 @@ mod tests {
         // primary: 1000 + 100 (main) + 200 (procs) = 1300
         // secondary: 1000 + 100 (main) = 1100  (procs NOT re-credited)
         assert_eq!(local.damage, 2400);
+    }
+
+    #[test]
+    fn dungeon_modifiers_follow_their_own_map_instance() {
+        let mut t = CombatTracker::new();
+        t.on_map_change(
+            "Mad Lab",
+            42,
+            0,
+            &["CHEF".to_string(), "REWARDING".to_string()],
+        );
+        t.on_player_loaded(1000, 42);
+        t.on_object_spawn(
+            500,
+            0x10E4,
+            &status(
+                500,
+                vec![
+                    stat(StatType::MaxHP, 50_000),
+                    stat(StatType::HP, 50_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            0,
+        );
+        t.pending_shots.insert(
+            10,
+            PendingShot {
+                base_damage: 1000,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(500, 10, 1000, 1000, 10);
+
+        // Leaving finalizes the fight with the mods its own instance was rolled
+        // under, even though the new map carries a different set.
+        let done = t.on_map_change("The Nest", 7, 20, &["SLUGGISH".to_string()]);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].dungeon_modifiers, vec!["CHEF", "REWARDING"]);
+
+        // The next instance's fight carries the next map's mods.
+        t.on_player_loaded(1000, 7);
+        t.on_object_spawn(
+            501,
+            0x10E4,
+            &status(
+                501,
+                vec![
+                    stat(StatType::MaxHP, 50_000),
+                    stat(StatType::HP, 50_000),
+                    stat(StatType::Defense, 0),
+                ],
+            ),
+            20,
+        );
+        t.pending_shots.insert(
+            11,
+            PendingShot {
+                base_damage: 1000,
+                ..Default::default()
+            },
+        );
+        t.on_local_hit(501, 11, 1000, 1000, 30);
+        let done = t.on_map_change("Nexus", 0, 40, &[]);
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].dungeon_modifiers, vec!["SLUGGISH"]);
+        assert!(t.on_map_change("Nexus", 0, 50, &[]).is_empty());
     }
 
     #[test]
@@ -7857,7 +7932,7 @@ mod tests {
             stat_value_two: 0,
         };
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Boss with 0 DEF so Curse is the only damage modifier.
         t.on_object_spawn(
@@ -7883,7 +7958,7 @@ mod tests {
             },
         );
         t.on_local_hit(500, 10, 1000, 1000, 10);
-        let done = t.on_map_change("Nexus", 0, 20);
+        let done = t.on_map_change("Nexus", 0, 20, &[]);
         let local = done[0]
             .participants
             .iter()
@@ -7898,7 +7973,7 @@ mod tests {
         // change that finalizes an already-completed fight keeps them Present, not
         // nexused.
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -7920,7 +7995,7 @@ mod tests {
         t.on_local_hit(500, 11, 1000, 1000, 10);
         // Boss reaches 0 HP: the fight is flagged killed but not yet finalized.
         t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
-        let done = t.on_map_change("Nexus", 0, 30);
+        let done = t.on_map_change("Nexus", 0, 30, &[]);
         assert_eq!(done.len(), 1);
         assert!(done[0].killed, "boss was killed before the map change");
         let local = done[0]
@@ -7938,7 +8013,7 @@ mod tests {
         // loot). The completion scores the dancer as killed, so the local player is
         // recorded Present / Completed rather than Nexused.
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -7973,7 +8048,7 @@ mod tests {
         assert_eq!(local.end_status, ParticipantEndStatus::Present);
         // A later nexus adds nothing: the completion was already recorded.
         assert!(
-            t.on_map_change("Nexus", 0, 500).is_empty(),
+            t.on_map_change("Nexus", 0, 500, &[]).is_empty(),
             "no duplicate record after the nexus"
         );
     }
@@ -7981,7 +8056,7 @@ mod tests {
     #[test]
     fn late_arrival_marks_remote_partially_observed() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
 
         // Boss is first seen already damaged (200k of 300k), meaning the local
@@ -8014,7 +8089,7 @@ mod tests {
     #[test]
     fn full_hp_start_keeps_remote_observed() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
 
         // Boss seen at full HP: the local player was present from the start.
@@ -8045,7 +8120,7 @@ mod tests {
     #[test]
     fn tracks_remote_damage_and_kill() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
 
         // Boss spawns at full HP.
@@ -8103,7 +8178,7 @@ mod tests {
     #[test]
     fn participant_captures_skin_and_dyes() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
 
         t.on_object_spawn(
@@ -8153,7 +8228,7 @@ mod tests {
         // back under new object ids must be recorded as one fight, not several.
         let crab = 47387;
         let mut t = CombatTracker::new();
-        t.on_map_change("Deadwater Docks", 7, 0);
+        t.on_map_change("Deadwater Docks", 7, 0, &[]);
         t.on_player_loaded(1000, 42);
 
         // First engagement, then it wanders off (removed) still alive at 100k HP.
@@ -8221,7 +8296,7 @@ mod tests {
         // duplicate (the curated premise is a single roaming instance).
         let crab = 47387;
         let mut t = CombatTracker::new();
-        t.on_map_change("Deadwater Docks", 7, 0);
+        t.on_map_change("Deadwater Docks", 7, 0, &[]);
         t.on_player_loaded(1000, 42);
 
         t.on_object_spawn(
@@ -8257,14 +8332,14 @@ mod tests {
         assert!(done[0].killed);
         assert_eq!(done[0].total_damage(), 7000);
         // Nothing left suspended to leak at run end.
-        assert!(t.on_map_change("Nexus", 0, 400).is_empty());
+        assert!(t.on_map_change("Nexus", 0, 400, &[]).is_empty());
     }
 
     #[test]
     fn wandering_boss_that_never_returns_finalizes_once_at_run_end() {
         let crab = 47387;
         let mut t = CombatTracker::new();
-        t.on_map_change("Deadwater Docks", 7, 0);
+        t.on_map_change("Deadwater Docks", 7, 0, &[]);
         t.on_player_loaded(1000, 42);
 
         t.on_object_spawn(
@@ -8283,7 +8358,7 @@ mod tests {
         );
 
         // Leaving the dungeon flushes the suspended crab exactly once, as escaped.
-        let done = t.on_map_change("Nexus", 0, 300);
+        let done = t.on_map_change("Nexus", 0, 300, &[]);
         assert_eq!(
             done.len(),
             1,
@@ -8295,7 +8370,7 @@ mod tests {
     #[test]
     fn local_hits_are_self_pending() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 1, 0);
+        t.on_map_change("Mad Lab", 1, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -8338,7 +8413,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         assert!(t.rng_seeded);
         assert!(t.self_damage_available);
         assert!(t.pending_shots.is_empty(), "shots cleared on new instance");
@@ -8347,7 +8422,7 @@ mod tests {
     #[test]
     fn disconnect_disables_self_damage() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.pending_shots.insert(
             7,
             PendingShot {
@@ -8369,7 +8444,7 @@ mod tests {
         // must leave that shot unvalued instead of zeroing every later fight on
         // the map.
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 100)]), 5);
         t.on_local_shot(0x333, 1, 7, 10, 0.0, 0.0, 0.0, 10);
@@ -8403,7 +8478,7 @@ mod tests {
     #[test]
     fn shot_without_attack_stat_disables_self_damage() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Local player object exists but never reported an Attack stat.
         t.on_object_status(1000, &status(1000, vec![stat(StatType::Defense, 10)]), 10);
@@ -8441,7 +8516,7 @@ mod tests {
     #[test]
     fn resolved_local_hits_are_self_computed() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -8497,7 +8572,7 @@ mod tests {
     #[test]
     fn piercing_bullet_resolves_multiple_hits() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -8563,7 +8638,7 @@ mod tests {
     #[test]
     fn unresolved_local_hit_is_estimated() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -8606,7 +8681,7 @@ mod tests {
     #[test]
     fn defense_reduces_local_hit_damage() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Boss with 200 defense.
         t.on_object_spawn(
@@ -8647,7 +8722,7 @@ mod tests {
     #[test]
     fn o3_guarded_damage_tracked_separately() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Oryx's Sanctuary", 42, 0);
+        t.on_map_change("Oryx's Sanctuary", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         // O3 boss, defense 0 so resolved damage equals the rolled base.
         t.on_object_spawn(
@@ -8713,7 +8788,7 @@ mod tests {
     #[test]
     fn ignores_damage_to_non_boss() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 1, 0);
+        t.on_map_change("Mad Lab", 1, 0, &[]);
         // Small enemy below the boss HP threshold.
         t.on_object_spawn(
             700,
@@ -8733,7 +8808,7 @@ mod tests {
     #[test]
     fn map_change_finalizes_active_fight() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 1, 0);
+        t.on_map_change("Mad Lab", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -8747,7 +8822,7 @@ mod tests {
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         t.on_damage(500, 600, 1000, 10);
         t.on_local_hit(500, 7, 1000, 1000, 12); // local engaged (untagged boss needs engagement)
-        let done = t.on_map_change("Nexus", 0, 100);
+        let done = t.on_map_change("Nexus", 0, 100, &[]);
         assert_eq!(done.len(), 1);
         assert!(!done[0].killed);
         assert_eq!(done[0].total_damage(), 1000);
@@ -8756,7 +8831,7 @@ mod tests {
     #[test]
     fn removal_at_low_hp_counts_as_kill() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -8783,7 +8858,7 @@ mod tests {
         // Killing the Legion Missionary must surface its aggregated orb rows on
         // the boss card immediately, not only when the map later changes.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         // The Missionary anchor (uncatalogued high-HP boss in tests).
         t.on_object_spawn(
@@ -8827,7 +8902,7 @@ mod tests {
         // to full under the same object id before the object is removed, leaving
         // the last-seen HP misleadingly high. The minimum HP proves the kill.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lair of Draconis", 1, 0);
+        t.on_map_change("Lair of Draconis", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -8858,7 +8933,7 @@ mod tests {
         // is removed at high HP with no zero/<=10% tick, so the HP heuristic never
         // fires. A party that dealt ~all of its remaining HP still cleared it.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -8884,7 +8959,7 @@ mod tests {
         // The same train can genuinely escape (reach the end of its track) when
         // the party fails: only partial HP was dealt, so it must stay Escaped.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -8918,7 +8993,7 @@ mod tests {
         // the two engagements' damage is combined into one record (issue: realm
         // re-engagement duplicated fights).
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -8973,7 +9048,7 @@ mod tests {
         // A realm boss walked away from and never returned within the window is
         // finalized as escaped so it still surfaces in history.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9001,7 +9076,7 @@ mod tests {
         // If the server recycles a suspended boss's object id for a different
         // boss type, the stale segment is evicted (escaped) rather than merged.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9045,7 +9120,7 @@ mod tests {
         // survival phase. The near-dead -> near-full HP jump must split the fight
         // into a pre-survival and post-survival segment, each recorded separately.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9116,7 +9191,7 @@ mod tests {
         // rows must NOT flush there -- only on the true
         // post-survival kill.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9168,7 +9243,7 @@ mod tests {
         // reached full, dropping the post-survival segment. Gating on the lowest
         // HP ever seen must still split.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9221,7 +9296,7 @@ mod tests {
         // must come from the boss's live (rescaled) max HP, not the fight-start
         // value -- players die/nexus during survival, so dungeon HP-scaling drops.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9282,7 +9357,7 @@ mod tests {
         // rescaled-down MaxHP packet arriving after them must still update the
         // denominator.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9380,7 +9455,7 @@ mod tests {
         // is never observed (the old gate required it and dropped the post
         // segment entirely).
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9426,7 +9501,7 @@ mod tests {
         // The taunt split only fires for the exact survival-exit line, bound to
         // an active pre-survival fight's own object id.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9453,7 +9528,7 @@ mod tests {
         // Regression: a heal-back post-survival segment starts below max HP by
         // design. That must NOT be mistaken for the local player joining late.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9491,7 +9566,7 @@ mod tests {
         // Marble Cores (type 45116) are not their own boss fights; damage to any of
         // them across the run folds into a single "Marble Core" summary entry.
         let mut t = CombatTracker::new();
-        t.on_map_change("Lost Halls", 1, 0);
+        t.on_map_change("Lost Halls", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         // Two core objects, below the boss HP threshold so they take the aux path.
         t.on_object_spawn(
@@ -9541,7 +9616,7 @@ mod tests {
         // and their max HP summed, even though the local player damaged only one
         // and a remote only one -- four keys take no observed damage at all.
         let mut t = CombatTracker::new();
-        t.on_map_change("Spectral Penitentiary", 1, 0);
+        t.on_map_change("Spectral Penitentiary", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         for id in 700..706 {
             t.on_object_spawn(
@@ -9585,7 +9660,7 @@ mod tests {
         // "Doctor Lobotomik" row drawn with the head sprite; damage to any part
         // sums into it, and the instance count is suppressed (no "xN").
         let mut t = CombatTracker::new();
-        t.on_map_change("Spectral Penitentiary", 1, 0);
+        t.on_map_change("Spectral Penitentiary", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             700,
@@ -9642,7 +9717,7 @@ mod tests {
     #[test]
     fn removal_at_high_hp_is_not_a_kill() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9672,7 +9747,7 @@ mod tests {
     #[test]
     fn invincible_add_with_hits_but_no_damage_is_dropped() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Cursed Library", 1, 0);
+        t.on_map_change("Cursed Library", 1, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Book Bomb: caught by the MaxHP>=10000 fallback but invincible.
         t.on_object_spawn(
@@ -9694,7 +9769,7 @@ mod tests {
             },
         );
         t.on_local_hit(500, 10, 1000, 1000, 10);
-        let done = t.on_map_change("Nexus", 0, 100);
+        let done = t.on_map_change("Nexus", 0, 100, &[]);
         assert!(
             done.is_empty(),
             "invincible add with 0 damage must not persist"
@@ -9717,7 +9792,7 @@ mod tests {
             (53007, "Legion Soldier"),
         ] {
             let mut t = CombatTracker::new();
-            t.on_map_change("Realm", 1, 0);
+            t.on_map_change("Realm", 1, 0, &[]);
             t.on_player_loaded(1000, 1);
             t.on_object_spawn(
                 500,
@@ -9731,7 +9806,7 @@ mod tests {
             t.on_damage(500, 1000, 5_000, 10);
             t.on_local_hit(500, 7, 1000, 1000, 12);
             t.on_object_status(500, &status(500, vec![stat(StatType::HP, 0)]), 20);
-            let done = t.on_map_change("Nexus", 0, 100);
+            let done = t.on_map_change("Nexus", 0, 100, &[]);
             assert!(done.is_empty(), "{name} must not be tracked as a fight");
         }
     }
@@ -9743,7 +9818,7 @@ mod tests {
         // used to be dropped: its loot was attributed to it while no fight was
         // ever recorded. The curated allow-list is what promotes it.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9764,7 +9839,7 @@ mod tests {
 
         // Its Worshipper adds (0x86DA, 5.5k HP, also label-less) stay out.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             600,
@@ -9779,7 +9854,7 @@ mod tests {
         t.on_local_hit(600, 7, 1000, 1000, 12);
         t.on_object_status(600, &status(600, vec![stat(StatType::HP, 0)]), 20);
         assert!(
-            t.on_map_change("Nexus", 0, 100).is_empty(),
+            t.on_map_change("Nexus", 0, 100, &[]).is_empty(),
             "an effigy worshipper must not be tracked as a fight"
         );
     }
@@ -9790,7 +9865,7 @@ mod tests {
         // by remote players while the local player never engaged: teleport-past
         // clutter (e.g. Possessed Small Pumpkin), not our fight.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9816,7 +9891,7 @@ mod tests {
         // Same untagged high-HP enemy, but the local player engaged it (e.g.
         // Artificial Sprite God we actually fought): keep it.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9840,7 +9915,7 @@ mod tests {
         // the damage. It must be resolved from the ServerPlayerShoot damage and
         // credited to the local player, and the fight kept.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -9878,7 +9953,7 @@ mod tests {
     #[test]
     fn multi_projectile_summon_shot_registers_all_bullets() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -10016,7 +10091,7 @@ mod tests {
         // part of the weapon's total, but also gets its own line so the enchant's
         // hits and value are visible.
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 10);
         t.on_object_spawn(
@@ -10094,7 +10169,7 @@ mod tests {
         const MAIN: i32 = 2513; // Staff of the Vital Unity (T13)
         const LOOT: i32 = 2718; // Staff of Destruction (T7)
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_status(
             1000,
@@ -10153,7 +10228,7 @@ mod tests {
     #[test]
     fn a_local_attack_change_is_logged_and_sourced_to_a_local_use() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 10);
         // A consumable use immediately before the jump, so the change is sourced
@@ -10199,7 +10274,7 @@ mod tests {
         // bit 0x1000 used to surface as a phantom "Invisible" on a Wizard who has no
         // way to become invisible.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         // The object must exist first: a change is only diffed against the previous
         // snapshot, so the very update that creates it logs nothing.
@@ -10231,7 +10306,7 @@ mod tests {
         // Nothing local explains either: Weak is applied by monsters, a Damaging
         // burst by an ally's aura, so the two must not share one label.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         // Establish the object first: the update that creates it is not diffed.
         t.on_object_status(1000, &status(1000, vec![stat(StatType::Attack, 65)]), 5);
@@ -10254,7 +10329,7 @@ mod tests {
     #[test]
     fn ability_activation_is_credited_only_packet_borne_damage() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -10346,7 +10421,7 @@ mod tests {
         // packet names the item that fired it -- so its landed damage belongs to
         // that ability's row, never to the weapon the player happened to hold.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -10399,7 +10474,7 @@ mod tests {
         // weapon row named after the ability, even when the fight held no weapon
         // shot at all.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 42, 0);
+        t.on_map_change("Sprite World", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -10455,7 +10530,7 @@ mod tests {
         // projectile landing after the window still credits the activation that
         // fired it instead of falling out of the breakdown.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 42, 0);
+        t.on_map_change("Sprite World", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -10508,7 +10583,7 @@ mod tests {
             return;
         }
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 42, 0);
+        t.on_map_change("Sprite World", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_status(
             1000,
@@ -10560,7 +10635,7 @@ mod tests {
             return;
         }
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 42, 0);
+        t.on_map_change("Sprite World", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_status(
             1000,
@@ -10625,7 +10700,7 @@ mod tests {
         );
 
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 42, 0);
+        t.on_map_change("Sprite World", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_status(
             1000,
@@ -10733,7 +10808,7 @@ mod tests {
         );
 
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -10782,7 +10857,7 @@ mod tests {
         // real capture showed the fight being dropped entirely. It is curated
         // explicitly instead, name included.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 12345, 1_000);
+        t.on_map_change("Realm", 12345, 1_000, &[]);
         t.on_player_loaded(1000, 2537);
         // MaxHP deliberately omitted: the classification must not depend on it.
         t.on_object_spawn(
@@ -10808,7 +10883,7 @@ mod tests {
         // pet damage to the player) but the pet gets its own line, and nothing is
         // bucketed as the owner's weapon damage.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -10859,7 +10934,7 @@ mod tests {
         // by its skin under `pet_type`. The type comes from the spawned entity, so
         // the row is right even before its first hit resolves.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -10916,7 +10991,7 @@ mod tests {
         // A real pet is named by its skin: the type it carries is a pet skin id,
         // which is what the UI draws, not the object type it was spawned as.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -10953,7 +11028,7 @@ mod tests {
         // owner's (much larger) average: it falls back to the summon's own
         // average, so a pet-heavy fight cannot inflate the owner's figure.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -10995,7 +11070,7 @@ mod tests {
     #[test]
     fn boss_uptime_counts_only_vulnerable_time() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11027,7 +11102,7 @@ mod tests {
         // pending_server_shots: non-AP damage has the target's defense applied and
         // the hit counts as fully self-computed (not partial).
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11061,7 +11136,7 @@ mod tests {
     #[test]
     fn local_server_shot_armor_piercing_ignores_defense() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11096,7 +11171,7 @@ mod tests {
         // the two maps stay disjoint and the weapon roll (not the server value)
         // resolves the hit.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.pending_server_shots.insert(5, (300, false, 0));
         t.on_local_shot(2824, 0, 5, 10, 0.0, 0.0, 0.0, 10); // reuse id 5
@@ -11112,7 +11187,7 @@ mod tests {
         // asset in tests) must still claim its bullet ids, evicting any stale
         // entry so a recycled id can't resolve against an unrelated older shot.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.pending_shots.insert(
             5,
@@ -11141,7 +11216,7 @@ mod tests {
         // never killed (escaped), so the HP-gap reconciliation cannot apply -- only
         // the masked echo raises the figure.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11191,7 +11266,7 @@ mod tests {
         // A second player was seen, so the masked (owner-hidden) damage cannot be
         // assumed to be the local player's: the computed figure stands.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11239,7 +11314,7 @@ mod tests {
         // A single masked lump packet (e.g. a kill-credit) is not a per-hit-complete
         // stream, so it must not replace the computed figure.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11284,7 +11359,7 @@ mod tests {
         // masked row must not block it) to recover the non-direct remainder up to
         // the boss's full HP.
         let mut t = CombatTracker::new();
-        t.on_map_change("Davy Jones' Locker", 1, 0);
+        t.on_map_change("Davy Jones' Locker", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11337,7 +11412,7 @@ mod tests {
         // (server-fired ability/summon projectiles) is credited to the local
         // player so the total matches the boss HP exactly.
         let mut t = CombatTracker::new();
-        t.on_map_change("Davy Jones' Locker", 1, 0);
+        t.on_map_change("Davy Jones' Locker", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11371,7 +11446,7 @@ mod tests {
         // Even when no local hit could be valued (SelfPending), a solo full kill
         // credits the entire boss HP to the local player.
         let mut t = CombatTracker::new();
-        t.on_map_change("Davy Jones' Locker", 1, 0);
+        t.on_map_change("Davy Jones' Locker", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11402,7 +11477,7 @@ mod tests {
         // lowest observed HP is within 1% of max must still reconcile the
         // unattributed remainder to the local player.
         let mut t = CombatTracker::new();
-        t.on_map_change("Davy Jones' Locker", 1, 0);
+        t.on_map_change("Davy Jones' Locker", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11439,7 +11514,7 @@ mod tests {
         // above the 1% near-zero band, so the full-HP crediting must NOT fire and
         // the local figure stays its self-computed lower bound.
         let mut t = CombatTracker::new();
-        t.on_map_change("Davy Jones' Locker", 1, 0);
+        t.on_map_change("Davy Jones' Locker", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11531,7 +11606,7 @@ mod tests {
         // timeline, not just the damage math: only ATT/DEF/DEX/WIS/MP used to be
         // snapshotted, so a VIT potion or VIT-buffing ability was invisible.
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(1000, 0x0321, &status(1000, vec![name_stat("You")]), 0);
         t.on_object_spawn(
@@ -11577,7 +11652,7 @@ mod tests {
             ),
             20,
         );
-        let done = t.on_map_change("Nexus", 0, 40);
+        let done = t.on_map_change("Nexus", 0, 40, &[]);
         let vit: Vec<_> = done[0]
             .boosts
             .iter()
@@ -11629,7 +11704,7 @@ mod tests {
             extra_shots: 2,
         };
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(1000, 0x0321, &status(1000, vec![name_stat("You")]), 0);
         t.on_object_status(
@@ -11684,7 +11759,7 @@ mod tests {
             },
         );
         t.on_local_hit(500, 10, 1000, 1000, 100);
-        let done = t.on_map_change("Nexus", 0, 200);
+        let done = t.on_map_change("Nexus", 0, 200, &[]);
         let local = done[0]
             .participants
             .iter()
@@ -11699,7 +11774,7 @@ mod tests {
         // A second player was present (even dealing no observed damage), so the
         // run is not solo: the local figure stays its packet-derived lower bound.
         let mut t = CombatTracker::new();
-        t.on_map_change("Davy Jones' Locker", 1, 0);
+        t.on_map_change("Davy Jones' Locker", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11742,7 +11817,7 @@ mod tests {
         // The boss was already below full HP on first sight, so its start HP is
         // not the whole damage pool; reconciliation must not fire.
         let mut t = CombatTracker::new();
-        t.on_map_change("Davy Jones' Locker", 1, 0);
+        t.on_map_change("Davy Jones' Locker", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11777,7 +11852,7 @@ mod tests {
         // A boss killed via the <=10% dipped-lethal despawn (HP never observed at
         // 0) is not eligible: we cannot prove the local player removed all its HP.
         let mut t = CombatTracker::new();
-        t.on_map_change("Davy Jones' Locker", 1, 0);
+        t.on_map_change("Davy Jones' Locker", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11811,7 +11886,7 @@ mod tests {
         // an off-screen player could damage the boss with a server-fired ability
         // yet never spawn as an object we see. The gap is NOT credited locally.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11850,7 +11925,7 @@ mod tests {
         // summon entity; it must be credited to the owning player, not surfaced
         // as an Unknown/pet row.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11889,7 +11964,7 @@ mod tests {
         // A ServerPlayerShoot for a normal player's own shot reports summoner 0
         // (or itself); it must not create an ownership remap.
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_ally_shot(600, 0, 3, 1, 200, 0, 0);
         t.on_ally_shot(601, 601, 4, 1, 200, 0, 0);
@@ -11902,7 +11977,7 @@ mod tests {
     #[test]
     fn summon_ownership_cleared_on_object_removal() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_ally_shot(700, 600, 9, 1, 500, 0, 0);
         assert_eq!(t.summon_owners.get(&700), Some(&600));
@@ -11918,7 +11993,7 @@ mod tests {
         // A solo kill whose rolled damage overshoots the boss HP (the death-tick
         // volley overkills) is trimmed so the total equals the boss HP exactly.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -11959,7 +12034,7 @@ mod tests {
         // then kill. The party dealt 130k, which is exactly the pool -- without
         // counting the heal it would look like 1.3x overkill and be trimmed.
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -12024,7 +12099,7 @@ mod tests {
         );
 
         let mut t = CombatTracker::new();
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -12063,7 +12138,7 @@ mod tests {
         // be counted as healing -- but a genuine heal that follows must be, even
         // while the frozen accounting pool still holds the pre-rescale max.
         let mut t = CombatTracker::new();
-        t.on_map_change("Some Dungeon", 1, 0);
+        t.on_map_change("Some Dungeon", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -12112,7 +12187,7 @@ mod tests {
         // observers should end up with the same pool instead of freezing the
         // first-seen max.
         let mut t = CombatTracker::new();
-        t.on_map_change("Cnidarian Reef", 1, 0);
+        t.on_map_change("Cnidarian Reef", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -12186,7 +12261,7 @@ mod tests {
         // pool rescales with their arrival. The card should start from the
         // scaled current HP, not the pre-arrival numbers.
         let mut t = CombatTracker::new();
-        t.on_map_change("Some Dungeon", 1, 0);
+        t.on_map_change("Some Dungeon", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             500,
@@ -12259,7 +12334,7 @@ mod tests {
         // max HP is not the damage they absorbed -- so the party's raw damage must
         // survive finalize untouched instead of being trimmed to the boss HP.
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         t.on_object_spawn(
@@ -12300,7 +12375,7 @@ mod tests {
         // The server re-adds the same object as it re-enters view, so the tally
         // must count each id once and credit it to the live dancer fight.
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         t.on_object_spawn(
@@ -12335,7 +12410,7 @@ mod tests {
         for id in 710..712 {
             t.on_object_spawn(id, 0x5026, &spirit(id), 300);
         }
-        let done = t.on_map_change("Nexus", 0, 500);
+        let done = t.on_map_change("Nexus", 0, 500, &[]);
         let mv: Vec<_> = done
             .iter()
             .filter(|f| f.boss_object_type == 20450)
@@ -12350,7 +12425,7 @@ mod tests {
         // releases there (or any pre-fight noise) must not score; counting starts
         // only once a dancer/Umi fight has been engaged.
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         let spirit = |id: i32| status(id, vec![stat(StatType::Size, 105)]);
         for id in 700..704 {
@@ -12380,7 +12455,7 @@ mod tests {
         for id in 710..714 {
             t.on_object_spawn(id, 0x5026, &spirit(id), 200);
         }
-        let done = t.on_map_change("Nexus", 0, 500);
+        let done = t.on_map_change("Nexus", 0, 500, &[]);
         let mv: Vec<_> = done
             .iter()
             .filter(|f| f.boss_object_type == 20450)
@@ -13024,7 +13099,7 @@ mod tests {
     #[test]
     fn remote_damage_taken_is_observed_and_exact() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -13081,7 +13156,7 @@ mod tests {
         // can tell "never hit" apart from a fight recorded before the field
         // existed (a NULL row).
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -13133,7 +13208,7 @@ mod tests {
         // The local player's own damage taken never arrives in a DamagePacket, so
         // a packet targeting the local id must be ignored (no double count).
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -13175,7 +13250,7 @@ mod tests {
         // Two live boss fights: an unknown minion attacker can't be attributed to
         // one of them, so the hit is dropped rather than fanned out.
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -13216,7 +13291,7 @@ mod tests {
     #[test]
     fn local_player_hit_estimates_damage_taken() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Local player object with a known defense stat.
         t.on_object_spawn(
@@ -13267,7 +13342,7 @@ mod tests {
     #[test]
     fn armor_piercing_enemy_shot_ignores_defense() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Local player with 50 defense.
         t.on_object_spawn(
@@ -13314,7 +13389,7 @@ mod tests {
     #[test]
     fn local_damage_blocked_includes_enchant_and_armor_of_nil() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             1000,
@@ -13365,7 +13440,7 @@ mod tests {
     #[test]
     fn local_player_hit_without_valued_shot_is_partial() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 42, 0);
+        t.on_map_change("Mad Lab", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             1000,
@@ -13413,7 +13488,7 @@ mod tests {
     #[test]
     fn mv_dancer_without_completion_stays_escaped() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Sage Genji (20450): high HP so the HP fallback treats it as a boss.
         t.on_object_spawn(
@@ -13446,7 +13521,7 @@ mod tests {
             ),
             350,
         );
-        let done = t.on_map_change("Nexus", 0, 500);
+        let done = t.on_map_change("Nexus", 0, 500, &[]);
         assert_eq!(done.len(), 1);
         assert!(
             !done[0].killed,
@@ -13461,7 +13536,7 @@ mod tests {
     #[test]
     fn mv_dancer_phase_end_without_completion_stays_escaped() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -13488,7 +13563,7 @@ mod tests {
             "a dancer is suspended, never finalized on removal"
         );
         // The map changes with no completion signal: the run is Escaped.
-        let done = t.on_map_change("Nexus", 0, 500);
+        let done = t.on_map_change("Nexus", 0, 500, &[]);
         assert_eq!(done.len(), 1);
         assert!(
             !done[0].killed,
@@ -13501,7 +13576,7 @@ mod tests {
     #[test]
     fn mv_dance_concluded_text_completes_dancer() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -13527,7 +13602,7 @@ mod tests {
     #[test]
     fn mv_loot_completes_umi_only() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         // Kitsune Umi (20493) seen at full HP, only ever dips to 50%.
         t.on_object_spawn(
@@ -13553,7 +13628,7 @@ mod tests {
     #[test]
     fn mv_dance_text_does_not_complete_umi() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         let hp = || vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)];
         t.on_object_spawn(500, 20450, &status(500, hp()), 100);
@@ -13574,7 +13649,7 @@ mod tests {
                 .len(),
             1
         );
-        let done = t.on_map_change("Nexus", 0, 500);
+        let done = t.on_map_change("Nexus", 0, 500, &[]);
         let umi: Vec<_> = done
             .iter()
             .filter(|f| f.boss_object_type == 20493)
@@ -13588,7 +13663,7 @@ mod tests {
     #[test]
     fn mv_leisurely_mode_labels_the_runs_fights() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_mv_leisurely_mode();
         t.on_object_spawn(
@@ -13606,7 +13681,7 @@ mod tests {
         assert!(done[0].leisurely, "the clear is labelled Leisurely Mode");
 
         // The mode is per instance: the next run's fights are unlabelled.
-        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_map_change("Moonlight Village", 43, 1000, &[]);
         t.on_object_spawn(
             600,
             20450,
@@ -13639,7 +13714,7 @@ mod tests {
     #[test]
     fn mv_challenge_gate_hit_labels_the_runs_fights_petless() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             700,
@@ -13671,7 +13746,7 @@ mod tests {
         );
 
         // The mode is per instance: the next run's fights are unlabelled.
-        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_map_change("Moonlight Village", 43, 1000, &[]);
         t.on_object_spawn(
             600,
             20450,
@@ -13706,7 +13781,7 @@ mod tests {
         // Only one mini-boss cleared its objectives: Murcian stays regular, so
         // the run is not hard mode even though a boss was.
         let mut t = CombatTracker::new();
-        t.on_map_change("Spectral Penitentiary", 7, 0);
+        t.on_map_change("Spectral Penitentiary", 7, 0, &[]);
         t.on_player_loaded(1000, 7);
         t.on_boss_text(500, None, zole.1, 100);
         let zole_fight = finish_shatters_fight(&mut t, 500, 23659, 300_000, 150);
@@ -13720,7 +13795,7 @@ mod tests {
         // Both mini-bosses taunted: Murcian is hard mode, so is the run. A
         // repeated taunt from the same boss must not count twice.
         let mut t = CombatTracker::new();
-        t.on_map_change("Spectral Penitentiary", 7, 0);
+        t.on_map_change("Spectral Penitentiary", 7, 0, &[]);
         t.on_player_loaded(1000, 7);
         t.on_boss_text(500, None, zole.1, 100);
         t.on_boss_text(600, None, lobotomik.1, 110);
@@ -13733,7 +13808,7 @@ mod tests {
         assert!(murcian.spectral_hm, "both mini-bosses were hard mode");
 
         // The mode is per instance: the next run starts regular.
-        t.on_map_change("Spectral Penitentiary", 8, 500);
+        t.on_map_change("Spectral Penitentiary", 8, 500, &[]);
         let next = finish_shatters_fight(&mut t, 800, 23681, 400_000, 600);
         assert!(!next.spectral_hm, "a later run is not hard mode");
     }
@@ -13762,7 +13837,7 @@ mod tests {
     #[test]
     fn mv_challenge_gate_hit_by_someone_else_does_not_label_our_run() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             700,
@@ -13796,7 +13871,7 @@ mod tests {
     #[test]
     fn mv_completion_flag_clears_on_map_change() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -13814,7 +13889,7 @@ mod tests {
             1
         );
         // New run: a dancer here must not inherit the previous run's completion.
-        t.on_map_change("Moonlight Village", 43, 1000);
+        t.on_map_change("Moonlight Village", 43, 1000, &[]);
         t.on_object_spawn(
             600,
             20450,
@@ -13834,7 +13909,7 @@ mod tests {
         );
         t.on_local_hit(600, 11, 1000, 1000, 1200);
         t.on_object_status(600, &status(600, vec![stat(StatType::HP, 1)]), 1300);
-        let done = t.on_map_change("Nexus", 0, 1500);
+        let done = t.on_map_change("Nexus", 0, 1500, &[]);
         assert_eq!(done.len(), 1);
         assert!(
             !done[0].killed,
@@ -13847,7 +13922,7 @@ mod tests {
     #[test]
     fn mv_marker_does_not_duplicate_on_lingering_fire() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(
             500,
@@ -13875,7 +13950,7 @@ mod tests {
             },
         );
         t.on_local_hit(500, 11, 1000, 1000, 500);
-        let rest = t.on_map_change("Nexus", 0, 600);
+        let rest = t.on_map_change("Nexus", 0, 600, &[]);
         assert!(
             rest.is_empty(),
             "no duplicate dancer from lingering fire, got {:?}",
@@ -13889,7 +13964,7 @@ mod tests {
     #[test]
     fn mv_dancer_redetected_under_many_ids_yields_one_record() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         let hp = || vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)];
@@ -13933,7 +14008,7 @@ mod tests {
     #[test]
     fn mv_concurrent_same_type_ids_consolidate_to_one_record() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         let hp = vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)];
@@ -13971,7 +14046,7 @@ mod tests {
     #[test]
     fn mv_redetections_without_marker_yield_one_escaped_record() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Moonlight Village", 42, 0);
+        t.on_map_change("Moonlight Village", 42, 0, &[]);
         t.on_player_loaded(1000, 42);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         let hp = || vec![stat(StatType::MaxHP, 360_000), stat(StatType::HP, 360_000)];
@@ -13986,7 +14061,7 @@ mod tests {
             );
         }
         // Leave MV without completing: the single suspended fight surfaces once.
-        let done = t.on_map_change("Nexus", 0, 5000);
+        let done = t.on_map_change("Nexus", 0, 5000, &[]);
         let mv: Vec<_> = done
             .iter()
             .filter(|f| f.boss_object_type == 20450)
@@ -14037,7 +14112,7 @@ mod tests {
     #[test]
     fn shatters_stone_idol_marks_the_bridge_sentinel_hard_mode() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
 
@@ -14063,7 +14138,7 @@ mod tests {
         // evidence of anything: the Sentinel keeps its regular name and the run
         // is not hard mode.
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
 
@@ -14085,7 +14160,7 @@ mod tests {
     #[test]
     fn shatters_the_source_alone_marks_the_whole_run_hard_mode() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
 
@@ -14122,7 +14197,7 @@ mod tests {
     #[test]
     fn shatters_the_source_destroyed_in_view_marks_hard_mode() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         t.on_object_spawn(
@@ -14150,7 +14225,7 @@ mod tests {
     #[test]
     fn shatters_bridge_only_hard_mode_keeps_the_archmage_regular() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         hard_mode_idol(&mut t);
@@ -14192,7 +14267,7 @@ mod tests {
         // bosses after the bridge, so the Sentinel stays regular -- while the late
         // stage (proved by The Source) still latches.
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         // The Sentinel is in view: the bridge fight is under way.
         t.on_object_spawn(
@@ -14249,7 +14324,7 @@ mod tests {
         // stage's own evidence: the bridge stays regular when nothing proved hard
         // mode before it, but the archmage and the King are renamed.
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
 
@@ -14288,7 +14363,7 @@ mod tests {
         // A hard-mode boss speaks under its revealed name; the line is the only
         // place the client can learn it from, so it is per-boss evidence.
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         // The Sentinel speaks as Valen, so the Sentinel is hard mode...
@@ -14333,7 +14408,7 @@ mod tests {
         // The regular Sentinel speaks under its regular name, which is no
         // evidence of hard mode however the line is framed.
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_boss_text(
             700,
@@ -14362,7 +14437,7 @@ mod tests {
         // unlock evidence, but the archmage and the King speak under their
         // hard-mode names, which is what labels them.
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_boss_text(
             701,
@@ -14394,7 +14469,7 @@ mod tests {
     #[test]
     fn shatters_stone_idol_is_its_own_phase_of_the_run() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
 
@@ -14438,7 +14513,7 @@ mod tests {
     #[test]
     fn shatters_stone_idol_found_damaged_marks_hard_mode() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         // We arrive after the Idol lost part of its pool (the group already
@@ -14466,7 +14541,7 @@ mod tests {
     #[test]
     fn shatters_stone_idol_killed_in_view_marks_hard_mode() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         // The group destroys the Idol while we watch, without us landing a hit:
@@ -14499,7 +14574,7 @@ mod tests {
         // Idol that simply wandered out of view looks exactly like this, so the
         // removal must not be read as a destruction.
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(
             1000,
@@ -14540,7 +14615,7 @@ mod tests {
         // full HP before leaving view. Its own movement caused the removal, so
         // the run stays regular.
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(
             1000,
@@ -14582,7 +14657,7 @@ mod tests {
     #[test]
     fn shatters_stone_idol_leaving_view_marks_nothing() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         // The local player walks away from the Idol: the removal is a view cull,
         // so the run stays regular. This is the common case in a non-hard-mode
@@ -14625,7 +14700,7 @@ mod tests {
     #[test]
     fn shatters_stone_idol_at_lethal_hp_marks_hard_mode() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         // The group takes the Idol down to lethal HP in our view (the kill itself
@@ -14655,7 +14730,7 @@ mod tests {
     #[test]
     fn shatters_hard_mode_resets_with_the_instance() {
         let mut t = CombatTracker::new();
-        t.on_map_change("The Shatters", 777, 0);
+        t.on_map_change("The Shatters", 777, 0, &[]);
         t.on_player_loaded(1000, 777);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 0);
         hard_mode_idol(&mut t);
@@ -14670,8 +14745,8 @@ mod tests {
 
         // The next Shatters instance starts regular again: nothing proved hard
         // mode there, and the Sentinel's own evidence is what carries the mode.
-        t.on_map_change("Nexus", 0, 500);
-        t.on_map_change("The Shatters", 778, 600);
+        t.on_map_change("Nexus", 0, 500, &[]);
+        t.on_map_change("The Shatters", 778, 600, &[]);
         t.on_player_loaded(1000, 778);
         t.on_object_spawn(600, 0x0400, &status(600, vec![name_stat("Bob")]), 600);
         let regular = finish_shatters_fight(
@@ -14733,7 +14808,7 @@ mod tests {
     /// non-zero -- a pet out next to the player with the given abilities.
     fn pet_packet_tracker(pet_abilities: &[i32], pet_type: i32) -> CombatTracker {
         let mut t = CombatTracker::new();
-        t.on_map_change("Sprite World", 1, 0);
+        t.on_map_change("Sprite World", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_status(1000, &status_at(1000, 0.0, 0.0, vec![name_stat("You")]), 0);
         t.on_object_spawn(
@@ -14941,7 +15016,7 @@ mod tests {
         let mut t = CombatTracker::new();
         t.local_summons.insert(900, summon);
         t.summon_owners.insert(900, 1000);
-        t.on_map_change("Realm", 1, 0);
+        t.on_map_change("Realm", 1, 0, &[]);
         assert!(t.local_summons.is_empty(), "map change clears summons");
         assert!(t.summon_owners.is_empty(), "map change clears ownership");
 

@@ -217,6 +217,8 @@ pub enum ControlMsg {
     StartCapture(PacketReceiver),
     /// Drop the current capture source (stop draining packets).
     StopCapture,
+    /// The first UI frame has completed; automatic history maintenance may run.
+    StartHistoricalMaintenance,
     /// Flush persistent state and exit the worker loop (app shutdown).
     Shutdown,
     /// Clear the reassembler's ignored-connection set.
