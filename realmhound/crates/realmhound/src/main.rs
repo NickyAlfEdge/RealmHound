@@ -222,7 +222,7 @@ fn main() -> Result<()> {
                     )))
                 }),
             )
-            .map_err(|e| anyhow::anyhow!("Failed to run application: {}", e))?;
+            .or_else(startup_failure)?;
         }
         _ => {
             // Slow path: resolve on a background thread behind a progress screen.
@@ -246,11 +246,27 @@ fn main() -> Result<()> {
                     Ok(Box::new(RootApp::new(rx)) as Box<dyn eframe::App>)
                 }),
             )
-            .map_err(|e| anyhow::anyhow!("Failed to run application: {}", e))?;
+            .or_else(startup_failure)?;
         }
     }
 
     Ok(())
+}
+
+/// Turn an eframe startup error into `main`'s result.
+///
+/// On Linux, a Wayland session put on XWayland whose X11 backend still cannot
+/// start is retried natively on Wayland in a fresh process instead of failing.
+fn startup_failure(e: eframe::Error) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if overlay::platform::is_forced_x11_failure(&e) {
+        tracing::warn!("[OVERLAY] XWayland startup failed ({e}); relaunching on native Wayland");
+        match overlay::platform::relaunch_on_wayland() {
+            Ok(()) => return Ok(()),
+            Err(spawn) => tracing::error!("[OVERLAY] Wayland relaunch failed: {spawn}"),
+        }
+    }
+    Err(anyhow::anyhow!("Failed to run application: {}", e))
 }
 
 #[cfg(all(feature = "latency-diagnostics", windows))]

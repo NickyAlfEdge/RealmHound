@@ -75,9 +75,12 @@ fs2 = "0.4"
 libc = "0.2"
 # Overlay windows on X11/XWayland: choosing the X11 backend on a Wayland session
 # (winit is eframe's own copy) and the window-manager hints, pointer polling and
-# restacking the overlays need. Both are already in the tree through eframe.
+# restacking the overlays need. All three are already in the tree through eframe.
 winit = { version = "0.30", default-features = false, features = ["x11"] }
 x11rb = "0.13"
+# Pre-flights the same runtime-loaded X libraries winit needs, so a Wayland
+# session without a usable XWayland stays native instead of failing to start.
+x11-dl = "2.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Socket -> owning process lookup for the forge-fire relaunch safeguard,

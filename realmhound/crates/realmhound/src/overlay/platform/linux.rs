@@ -4,7 +4,11 @@
 //! client is an XWayland window. Native Wayland gives an overlay no way to stay
 //! above another app, no fixed position and no global pointer, so RealmHound
 //! runs on XWayland too unless the user opts out with `REALMHOUND_WAYLAND=1`
-//! (see [`event_loop_hook`]). Everything below is then plain X11:
+//! (see [`event_loop_hook`]). If XWayland turns out to be unusable, RealmHound
+//! falls back to native Wayland instead of failing to start: up front when the
+//! X libraries or display cannot be opened ([`uses_x11`]), and by relaunching
+//! natively if winit still cannot start on X11 ([`relaunch_on_wayland`]).
+//! Everything below is then plain X11:
 //!
 //! - winit already asks for `_NET_WM_STATE_ABOVE`, a transparent ARGB visual
 //!   and an XShape input region for click-through. [`promote`] re-asserts
@@ -19,6 +23,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use x11rb::connection::Connection;
@@ -33,6 +38,13 @@ use x11rb::rust_connection::RustConnection;
 const NET_WM_STATE_ADD: u32 = 1;
 /// `_NET_WM_STATE` source indication for a normal application.
 const SOURCE_APPLICATION: u32 = 1;
+/// Opt-out that keeps a Wayland session native. Also set on the replacement
+/// [`relaunch_on_wayland`] starts, so a fallback can never loop.
+const WAYLAND_OPT_OUT: &str = "REALMHOUND_WAYLAND";
+
+/// Set once [`event_loop_hook`] has put winit on XWayland, so a startup failure
+/// can be told apart from one native Wayland would have hit as well.
+static FORCED_X11: AtomicBool = AtomicBool::new(false);
 
 fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.is_empty())
@@ -40,16 +52,66 @@ fn env_set(name: &str) -> bool {
 
 /// Whether winit will talk to an X server for this process.
 ///
-/// True on an X11 session and, by default, on a Wayland session with XWayland
-/// available. `REALMHOUND_WAYLAND=1` keeps a Wayland session native, where the
-/// overlays fall back to plain windows.
+/// True on an X11 session and, by default, on a Wayland session with a usable
+/// XWayland. `REALMHOUND_WAYLAND=1` keeps a Wayland session native, where the
+/// overlays fall back to plain windows, and so does an XWayland that fails
+/// [`xwayland_usable`].
 pub fn uses_x11() -> bool {
     static USES_X11: OnceLock<bool> = OnceLock::new();
     *USES_X11.get_or_init(|| {
-        let wayland_requested =
-            std::env::var_os("REALMHOUND_WAYLAND").is_some_and(|value| value == "1");
-        env_set("DISPLAY") && !(env_set("WAYLAND_DISPLAY") && wayland_requested)
+        if !env_set("DISPLAY") {
+            return false;
+        }
+        if !env_set("WAYLAND_DISPLAY") {
+            // A plain X11 session: winit picks X11 on its own.
+            return true;
+        }
+        if std::env::var_os(WAYLAND_OPT_OUT).is_some_and(|value| value == "1") {
+            return false;
+        }
+        xwayland_usable()
     })
+}
+
+/// Open the X display the way winit's X11 backend will, so a session where it
+/// would fail stays on native Wayland instead of not starting at all.
+///
+/// winit loads Xlib, Xcursor, Xlib-xcb and XInput2 at runtime and then calls
+/// `XOpenDisplay`; a Wayland-only install can lack the libraries, and `DISPLAY`
+/// can be set with no XWayland behind it.
+fn xwayland_usable() -> bool {
+    use x11_dl::{xcursor::Xcursor, xinput2::XInput2, xlib::Xlib, xlib_xcb::Xlib_xcb};
+
+    let libraries = Xlib::open().and_then(|xlib| {
+        Xcursor::open()?;
+        Xlib_xcb::open()?;
+        XInput2::open()?;
+        Ok(xlib)
+    });
+    let xlib = match libraries {
+        Ok(xlib) => xlib,
+        Err(e) => {
+            tracing::warn!("[OVERLAY] X11 libraries unavailable ({e}); staying on Wayland");
+            return false;
+        }
+    };
+    // SAFETY: plain Xlib calls on a display this function opens and closes.
+    // XInitThreads comes first, exactly as winit does, because it must precede
+    // every other Xlib call in a multithreaded process; repeating it is a no-op.
+    let opened = unsafe {
+        (xlib.XInitThreads)();
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
+        if display.is_null() {
+            false
+        } else {
+            (xlib.XCloseDisplay)(display);
+            true
+        }
+    };
+    if !opened {
+        tracing::warn!("[OVERLAY] XWayland display could not be opened; staying on Wayland");
+    }
+    opened
 }
 
 /// Event-loop hook that puts winit on XWayland in a Wayland session, or `None`
@@ -65,10 +127,39 @@ pub fn event_loop_hook() -> Option<eframe::EventLoopBuilderHook> {
         "[OVERLAY] Wayland session: running on XWayland so overlays can stay above the \
          game client (set REALMHOUND_WAYLAND=1 to run natively)"
     );
+    FORCED_X11.store(true, Ordering::Relaxed);
     Some(Box::new(|builder| {
         use winit::platform::x11::EventLoopBuilderExtX11 as _;
         builder.with_x11();
     }))
+}
+
+/// Whether `err` is winit failing to start on the XWayland [`event_loop_hook`]
+/// forced, which native Wayland may still survive.
+pub fn is_forced_x11_failure(err: &eframe::Error) -> bool {
+    FORCED_X11.load(Ordering::Relaxed)
+        && matches!(
+            err,
+            eframe::Error::WinitEventLoop(winit::error::EventLoopError::Os(_))
+        )
+}
+
+/// Start a replacement RealmHound on native Wayland.
+///
+/// winit allows one event-loop attempt per process, so the retry has to be a
+/// new process. It goes through the normal relaunch path, which waits for this
+/// one to exit and release its single-instance and profile locks, and carries
+/// `REALMHOUND_WAYLAND=1` so it cannot fall back again.
+pub fn relaunch_on_wayland() -> std::io::Result<()> {
+    use realmhound_core::relaunch::{RELAUNCH_FLAG, WAIT_PID_FLAG};
+
+    std::process::Command::new(std::env::current_exe()?)
+        .arg(RELAUNCH_FLAG)
+        .arg(WAIT_PID_FLAG)
+        .arg(std::process::id().to_string())
+        .env(WAYLAND_OPT_OUT, "1")
+        .spawn()
+        .map(drop)
 }
 
 struct Atoms {

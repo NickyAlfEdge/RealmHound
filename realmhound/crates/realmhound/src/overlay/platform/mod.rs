@@ -34,7 +34,7 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::event_loop_hook;
+pub use linux::{event_loop_hook, is_forced_x11_failure, relaunch_on_wayland};
 
 /// What a title-bar or grip drag does to the overlay window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
