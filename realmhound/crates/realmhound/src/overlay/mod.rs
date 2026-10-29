@@ -1051,6 +1051,7 @@ mod tests {
             if let Some(names) = fonts.families.get_mut(&family) {
                 names.clear();
                 names.push("NotoSans".to_owned());
+                names.push("Hack".to_owned());
                 names.push("NotoEmoji".to_owned());
             }
         }

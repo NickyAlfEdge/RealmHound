@@ -905,11 +905,11 @@ fn install_fonts(ctx: &egui::Context) {
 
     fonts.font_data.insert(
         "NotoSans".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/NotoSans-Regular.ttf")).into(),
+        egui::FontData::from_static(NOTO_SANS).into(),
     );
     fonts.font_data.insert(
         "NotoEmoji".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/NotoEmoji-Regular.ttf")).into(),
+        egui::FontData::from_static(NOTO_EMOJI).into(),
     );
 
     // Noto Sans has no arrows or geometric glyphs; egui's monospace face does.
