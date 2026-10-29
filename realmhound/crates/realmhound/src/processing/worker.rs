@@ -1598,6 +1598,7 @@ mod staging_tests {
             egui::Context::default(),
             AudioSender::disconnected(),
             Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicBool::new(false)),
             account,
         )
         .unwrap();

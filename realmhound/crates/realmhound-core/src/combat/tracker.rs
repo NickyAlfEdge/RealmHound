@@ -6948,7 +6948,7 @@ mod tests {
     #[test]
     fn live_overlay_holds_kill_against_older_fights() {
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 1, 0);
+        t.on_map_change("Mad Lab", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         // A trash "boss" (HP fallback) engaged early, then left alone.
         t.on_object_spawn(
@@ -7000,7 +7000,7 @@ mod tests {
         // Drives the overlay's auto-follow: it shows whichever boss the user is
         // attacking, which a remote player's damage must not influence.
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 1, 0);
+        t.on_map_change("Mad Lab", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         for boss in [500, 700] {
             t.on_object_spawn(
@@ -7040,7 +7040,7 @@ mod tests {
         // The DPS overlay draws one tab per entry, so a second boss must *add*
         // to the list rather than replace the first one's numbers.
         let mut t = CombatTracker::new();
-        t.on_map_change("Mad Lab", 1, 0);
+        t.on_map_change("Mad Lab", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         t.on_object_spawn(
             600,
@@ -7072,7 +7072,7 @@ mod tests {
         assert!(!fights[1].ended);
 
         // Leaving the instance is the only thing that clears the overlay.
-        t.on_map_change("Nexus", 2, 200);
+        t.on_map_change("Nexus", 2, 200, &[]);
         assert!(t.live_snapshots(300).is_empty());
     }
 
@@ -7081,7 +7081,7 @@ mod tests {
         // The realm has no fixed boss roster, so the overlay must not keep
         // adding a tab per boss the way a dungeon does.
         let mut t = CombatTracker::new();
-        t.on_map_change("{s.rotmg}", 1, 0);
+        t.on_map_change("{s.rotmg}", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         for (boss, obj_type, at) in [(500, 0x5000, 10), (700, 0x5001, 60)] {
             t.on_object_spawn(
@@ -7109,7 +7109,7 @@ mod tests {
         // Two Beehemoths of the same Killer Bee Nest event: both are relevant
         // to the encounter the player is on, so neither evicts the other.
         let mut t = CombatTracker::new();
-        t.on_map_change("{s.rotmg}", 1, 0);
+        t.on_map_change("{s.rotmg}", 1, 0, &[]);
         t.on_player_loaded(1000, 1);
         for (boss, obj_type, at) in [(500, 4324, 10), (700, 4325, 60)] {
             t.on_object_spawn(

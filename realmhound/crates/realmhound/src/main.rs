@@ -147,7 +147,7 @@ fn main() -> Result<()> {
         preview.window.maximized,
     );
 
-    let mut viewport = egui::ViewportBuilder::default()
+    let viewport = egui::ViewportBuilder::default()
         .with_inner_size(window_size)
         .with_min_inner_size([800.0, 600.0])
         .with_title("RealmHound")
@@ -163,11 +163,11 @@ fn main() -> Result<()> {
     // taskbars). Windows then uses the crisp multi-size .ico embedded as a
     // resource by build.rs, picking the correct frame per DPI.
     #[cfg(windows)]
-    let viewport = viewport.with_icon(egui::IconData::default());
+    viewport = viewport.with_icon(egui::IconData::default());
 
     #[cfg(not(windows))]
-    let viewport = viewport.with_icon(window_icon());
-  
+    viewport = viewport.with_icon(window_icon());
+
     if let Some((x, y)) = window_pos {
         #[cfg(windows)]
         if x.is_finite() && y.is_finite() {
