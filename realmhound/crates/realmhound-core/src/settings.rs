@@ -3010,6 +3010,14 @@ pub enum SettingsSaveError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_path_matches_storage_root() {
+        let root = crate::storage::StorageRoot::default_local().expect("storage root");
+        assert_eq!(
+            super::Settings::settings_path(),
+            Some(root.path().join("settings.json"))
+        );
+    }
     use super::*;
 
     #[test]
